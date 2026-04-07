@@ -1,0 +1,333 @@
+# @package _global_
+
+# Distillation observation config for walk_stand_grasp task with DELAYED RGB vision
+# - Uses rgb_image_delayed which selects a specific frame from rgb_image_history based on rgb_image_delay_step
+# - Supports two modes: DETERMINISTIC (all envs use same delay) or RANDOM (each env uses different delay)
+# - Supports resampling delays on environment reset for increased robustness
+# - delay_step=1: Most recent frame (latest image)
+# - delay_step=2: Second most recent frame (2 steps ago if history_save_interval=1)
+# - delay_step=3: Third most recent frame (3 steps ago if history_save_interval=1)
+#
+# Optional parameters you can add to experiment config:
+#   history_length: 5                      # Buffer size (default: 5) - must be >= max delay_step
+#   history_save_interval: 1               # How often to save RGB frames (default: 1 = every step)
+#
+# DETERMINISTIC MODE (default):
+#   obs.rgb_image_delay_random: False      # All environments use the same delay
+#   obs.rgb_image_delay_step: 1            # Which delay step to use (1=latest, 2=second latest, etc.)
+#   obs.rgb_image_delay_resample_on_reset: False  # Keep same delay throughout (False) or resample on reset (True)
+#
+# RANDOM MODE:
+#   obs.rgb_image_delay_random: True       # Each environment gets a different delay
+#   obs.rgb_image_delay_step_min: 1        # Minimum delay step to sample (default: 1)
+#   obs.rgb_image_delay_step_max: 5        # Maximum delay step to sample (default: history_length)
+#   obs.rgb_image_delay_resample_on_reset: True   # Resample new delays every episode reset
+#
+# Note: When resample_on_reset=True, each episode will have a different delay (RANDOM) or reset to the same delay (DETERMINISTIC)
+
+obs:
+  # RGB image delay mode switch
+  rgb_image_delay_random: False  # False = deterministic (all envs same delay), True = random (each env different)
+  
+  # Resample delays on environment reset (for increased robustness during training)
+  rgb_image_delay_resample_on_reset: False  # False = keep same delay per env, True = resample on each reset
+  
+  # DETERMINISTIC MODE: delay step for all environments (used when rgb_image_delay_random=False)
+  rgb_image_delay_step: 1  # Which delay to use (1=latest, 2=second latest, etc.)
+  
+  # RANDOM MODE: delay step range for sampling (used when rgb_image_delay_random=True)
+  rgb_image_delay_step_min: 1  # Minimum delay step to sample
+  rgb_image_delay_step_max: 5  # Maximum delay step to sample
+
+  # History save interval - controls how often rgb_image is saved to history buffer
+  # Default is 1 (save every step). Can be overridden in experiment config with ${history_save_interval}
+  history_save_interval: 1  # Save RGB image every step by default
+
+  obs_dict:
+    # Student actor observations (vision-based, minimal state info)
+    actor_obs: [
+      base_ang_vel,
+      projected_gravity,
+      actions,
+      dof_pos_wo_finger,
+      dof_vel_wo_finger,
+      delta_actions,
+      b_homie_commands,
+    ]
+
+    # Vision observations for student - DELAYED RGB IMAGE
+    vision_obs: [
+      rgb_image_delayed,  # Selects frame from rgb_image_history based on rgb_image_delay_step
+    ]
+
+    # Teacher observations (state-based, same as original walk_stand_grasp)
+    teacher_obs: [
+      base_lin_vel,
+      base_ang_vel,
+      projected_gravity,
+      actions,
+      stage,
+      delta_actions,
+      dof_pos,
+      dof_vel,
+      placement_pos, # initial bottle position, will not change
+      table_pelvis_transform,
+
+      hold_fingers_tips_force,
+      hold_obj_transform, # object pos relative to root
+      hold_hand_object_transform, # object hand relative pos and ori
+      target_place_pos,
+
+      grasp_fingers_tips_force,
+      grasp_obj_transform, # object pos relative to root
+      grasp_hand_object_transform, # object hand relative pos and ori
+      target_lift_pos,      
+      b_homie_commands,
+    ]
+
+    # Ground truth object position for training object prediction
+    gt_obj_pos: [
+      target_obj_pos,
+    ]
+
+    # Critic observations (not used in distillation but kept for compatibility)
+    critic_obs: [
+      base_lin_vel,
+      base_ang_vel,
+      projected_gravity,
+      actions,
+      stage,
+      delta_actions,
+      dof_pos,
+      dof_vel,
+      placement_pos, # initial bottle position, will not change
+      table_pelvis_transform,
+
+      hold_fingers_tips_force,
+      hold_obj_transform, # object pos relative to root
+      hold_hand_object_transform, # object hand relative pos and ori
+      target_place_pos,
+
+      grasp_fingers_tips_force,
+      grasp_obj_transform, # object pos relative to root
+      grasp_hand_object_transform, # object hand relative pos and ori
+      target_lift_pos,  
+      b_homie_commands,
+    ]
+
+    # Homie observations for teacher (if needed for compatibility)
+    homie_obs: [
+      a_history_homie,
+      b_homie_commands,
+      c_homie_base_ang_vel,
+      d_homie_projected_gravity,
+      # homie_torso_ang_vel,
+      # homie_torso_projected_gravity,
+      e_homie_dof_pos,
+      f_homie_dof_vel,
+      g_homie_body_actions,
+      # homie_clock_inputs,
+    ]
+
+  # Define history observations
+  obs_auxiliary: 
+    # RGB image buffer for delayed observation (named differently from "rgb_image_history" 
+    # to prevent trainer from allocating 5-frame storage - we only store single delayed frame)
+    rgb_delay_buffer:
+      rgb_image: 5  # History handler will create a 5-frame buffer internally
+
+    history_long: {
+      base_lin_vel: 15,
+      base_ang_vel: 15,
+      projected_gravity: 15,
+      actions: 15,
+      stage: 15,
+      delta_actions: 15,
+      dof_pos: 15,
+      dof_vel: 15,
+      placement_pos: 15, # initial bottle position, will not change
+      table_pelvis_transform: 15,
+      hold_fingers_tips_force: 15,
+      hold_obj_transform: 15, # object pos relative to root
+      hold_hand_object_transform: 15, # object hand relative pos and ori
+      target_place_pos: 15,
+      grasp_fingers_tips_force: 15,
+      grasp_obj_transform: 15, # object pos relative to root
+      grasp_hand_object_transform: 15, # object hand relative pos and ori
+      target_lift_pos: 15,  
+    }
+
+    a_history_homie: {
+      b_homie_commands: 5,
+      c_homie_base_ang_vel: 5,
+      d_homie_projected_gravity: 5,
+      e_homie_dof_pos: 5,
+      f_homie_dof_vel: 5,
+      g_homie_body_actions: 5,
+    }
+
+    history_short: {
+      base_lin_vel: 1,
+      base_ang_vel: 1,
+      projected_gravity: 1,
+      actions: 1,
+      stage: 1,
+      delta_actions: 1,
+      dof_pos: 1,
+      dof_vel: 1,
+      placement_pos: 1, # initial bottle position, will not change
+      table_pelvis_transform: 1,
+      hold_fingers_tips_force: 1,
+      hold_obj_transform: 1, # object pos relative to root
+      hold_hand_object_transform: 1, # object hand relative pos and ori
+      target_place_pos: 1,
+      grasp_fingers_tips_force: 1,
+      grasp_obj_transform: 1, # object pos relative to root
+      grasp_hand_object_transform: 1, # object hand relative pos and ori
+      target_lift_pos: 1,  
+    }
+
+  homie_history_length: 5
+
+  obs_scales: {
+    base_lin_vel: 1.0,
+    base_ang_vel: 1.0,
+    projected_gravity: 1.0,
+    actions: 1.0,
+    stage: 1.0,
+    delta_actions: 1.0,
+    dof_pos: 1.0,
+    dof_vel: 0.05,
+    dof_pos_wo_finger: 1.0,
+    dof_vel_wo_finger: 0.05,
+    placement_pos: 1.0, # initial bottle position, will not change
+    table_pelvis_transform: 1.0,
+    hold_fingers_tips_force: 1.0,
+    hold_obj_transform: 1.0, # object pos relative to root
+    hold_hand_object_transform: 1.0, # object hand relative pos and ori
+    target_place_pos: 1.0,
+    grasp_fingers_tips_force: 1.0,
+    grasp_obj_transform: 1.0, # object pos relative to root
+    grasp_hand_object_transform: 1.0, # object hand relative pos and ori
+    target_lift_pos: 1.0,  
+    rgb_image: 1.0,
+    rgb_image_delayed: 1.0,
+    target_obj_pos: 1.0,
+
+    b_homie_commands: 1.0,
+    e_homie_dof_pos: 1.0,
+    f_homie_dof_vel: 0.05,
+    c_homie_base_ang_vel: 0.5,
+    d_homie_projected_gravity: 1.0,
+    # homie_torso_ang_vel: 0.5,
+    # homie_torso_projected_gravity: 1.0,
+    g_homie_body_actions: 1.0,
+    # homie_clock_inputs: 1.0,
+    a_history_homie: 1.0,
+  }
+
+  noise_scales: {
+    base_lin_vel: 0.0,
+    base_ang_vel: 0.0,
+    projected_gravity: 0.0,
+    actions: 0.0,
+    stage: 0.0,
+    delta_actions: 0.0,
+    dof_pos: 0.0,
+    dof_vel: 0.0,
+    dof_pos_wo_finger: 0.0,
+    dof_vel_wo_finger: 0.0,
+    placement_pos: 0.0, # initial bottle position, will not change
+    table_pelvis_transform: 0.0,
+    hold_fingers_tips_force: 0.0,
+    hold_obj_transform: 0.0, # object pos relative to root
+    hold_hand_object_transform: 0.0, # object hand relative pos and ori
+    target_place_pos: 0.0,
+    grasp_fingers_tips_force: 0.0,
+    grasp_obj_transform: 0.0, # object pos relative to root
+    grasp_hand_object_transform: 0.0, # object hand relative pos and ori
+    target_lift_pos: 0.0,  
+    rgb_image: 0.0,
+    rgb_image_delayed: 0.0,
+    target_obj_pos: 0.0,
+
+    b_homie_commands: 0.0,
+    e_homie_dof_pos: 0.0,
+    f_homie_dof_vel: 0.0,
+    c_homie_base_ang_vel: 0.0,
+    d_homie_projected_gravity: 0.0,
+    # homie_torso_ang_vel: 0.0,
+    # homie_torso_projected_gravity: 0.0,
+    g_homie_body_actions: 0.0,
+    # homie_clock_inputs: 0.0,
+    a_history_homie: 0.0,
+  }
+
+  add_noise_currculum: False
+  noise_initial_value: 0.05
+  noise_value_max: 1.00
+  noise_value_min: 0.00001
+  soft_dof_pos_curriculum_degree: 0.00001
+  soft_dof_pos_curriculum_level_down_threshold: 100
+  soft_dof_pos_curriculum_level_up_threshold: 900
+
+  obs_dims:
+    - base_lin_vel: 3
+    - base_ang_vel: 3
+    - projected_gravity: 3
+    - actions: ${robot.actions_dim}
+    - stage: 5
+    - delta_actions: 11
+    - dof_pos: ${robot.dof_obs_size}
+    - dof_vel: ${robot.dof_obs_size}
+    - dof_pos_wo_finger: 29
+    - dof_vel_wo_finger: 29
+    - placement_pos: 2
+    - table_pelvis_transform: 9
+    - hold_fingers_tips_force: 12
+    - hold_obj_transform: 9  # object pos relative to root
+    - hold_hand_object_transform: 9  # object hand relative pos and ori
+    - target_place_pos: 3
+    - grasp_fingers_tips_force: 12
+    - grasp_obj_transform: 9  # object pos relative to root
+    - grasp_hand_object_transform: 9  # object hand relative pos and ori
+    - target_lift_pos: 3
+    - rgb_image: ${simulator.config.cameras.camera_resolutions[0]}*${simulator.config.cameras.camera_resolutions[1]}*3
+    - rgb_image_delayed: ${simulator.config.cameras.camera_resolutions[0]}*${simulator.config.cameras.camera_resolutions[1]}*3
+    - target_obj_pos: 3
+    - b_homie_commands: 7
+    - e_homie_dof_pos: ${robot.homie_dof_obs_size}
+    - f_homie_dof_vel: ${robot.homie_dof_obs_size}
+    - c_homie_base_ang_vel: 3
+    - d_homie_projected_gravity: 3
+    - homie_torso_ang_vel: 3
+    - homie_torso_projected_gravity: 3
+    - g_homie_body_actions: ${robot.lower_body_actions_dim}
+
+  homie_command_keys: {
+    # 'loco_vel', 'height', 'rpy', 'left_arm', 'right_arm'
+    'loco_vel', 'right_arm', 'right_hand'
+    #, 'left_arm'
+  }
+
+  homie_command_default: {
+    'loco_vel': [0.0, 0.0, 0.0],
+    'height': [0.0],
+    'rpy': [0.0, 0.0, 0.0],
+    'left_arm': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    'right_arm': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    'left_hand': [0.0],
+    'right_hand': [0.0],
+  }
+
+  homie_command_index: {
+    'loco_vel': [0, 1, 2],
+    'height': [3],
+    'rpy': [4, 5, 6],
+    'left_arm': [7, 8, 9, 10, 11, 12, 13],
+    'right_arm': [14, 15, 16, 17, 18, 19, 20],
+    'left_hand': [21],
+    'right_hand': [22], # 7 + 28 = 35
+  }
+
+  homie_default_height: 0.74

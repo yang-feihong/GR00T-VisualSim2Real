@@ -1,0 +1,255 @@
+# @package _global_
+
+# Be carefult when using _raw, history
+obs:
+  obs_dict: 
+    actor_obs: [
+      base_lin_vel,
+      base_ang_vel,
+      projected_gravity,
+      actions,
+      stage,
+      delta_actions,
+      dof_pos,
+      dof_vel,
+      placement_pos, # initial bottle position, will not change
+      table_pelvis_transform,
+
+      hold_fingers_tips_force,
+      hold_obj_transform, # object pos relative to root
+      hold_hand_object_transform, # object hand relative pos and ori
+      target_place_pos,
+
+      grasp_fingers_tips_force,
+      grasp_obj_transform, # object pos relative to root
+      grasp_hand_object_transform, # object hand relative pos and ori
+      target_lift_pos,      
+      b_homie_commands,
+      # foot_force
+    ]
+
+    critic_obs: [
+      base_lin_vel,
+      base_ang_vel,
+      projected_gravity,
+      actions,
+      stage,
+      delta_actions,
+      dof_pos,
+      dof_vel,
+      placement_pos, # initial bottle position, will not change
+      table_pelvis_transform,
+
+      hold_fingers_tips_force,
+      hold_obj_transform, # object pos relative to root
+      hold_hand_object_transform, # object hand relative pos and ori
+      target_place_pos,
+
+      grasp_fingers_tips_force,
+      grasp_obj_transform, # object pos relative to root
+      grasp_hand_object_transform, # object hand relative pos and ori
+      target_lift_pos,  
+      b_homie_commands,
+      # foot_force
+    ]
+
+    homie_obs: [
+      a_history_homie,
+      b_homie_commands,
+      c_homie_base_ang_vel,
+      d_homie_projected_gravity,
+      # homie_torso_ang_vel,
+      # homie_torso_projected_gravity,
+      e_homie_dof_pos,
+      f_homie_dof_vel,
+      g_homie_body_actions,
+      # homie_clock_inputs,
+    ]
+
+  obs_auxiliary:
+    history_long: {
+      base_lin_vel: 15,
+      base_ang_vel: 15,
+      projected_gravity: 15,
+      actions: 15,
+      stage: 15,
+      delta_actions: 15,
+      dof_pos: 15,
+      dof_vel: 15,
+      placement_pos: 15, # initial bottle position, will not change
+      table_pelvis_transform: 15,
+      hold_fingers_tips_force: 15,
+      hold_obj_transform: 15, # object pos relative to root
+      hold_hand_object_transform: 15, # object hand relative pos and ori
+      target_place_pos: 15,
+      grasp_fingers_tips_force: 15,
+      grasp_obj_transform: 15, # object pos relative to root
+      grasp_hand_object_transform: 15, # object hand relative pos and ori
+      target_lift_pos: 15,  
+      # foot_force: 15,
+    }
+
+    history_short: {
+      base_lin_vel: 1,
+      base_ang_vel: 1,
+      projected_gravity: 1,
+      actions: 1,
+      stage: 1,
+      delta_actions: 1,
+      dof_pos: 1,
+      dof_vel: 1,
+      placement_pos: 1, # initial bottle position, will not change
+      table_pelvis_transform: 1,
+      hold_fingers_tips_force: 1,
+      hold_obj_transform: 1, # object pos relative to root
+      hold_hand_object_transform: 1, # object hand relative pos and ori
+      target_place_pos: 1,
+      grasp_fingers_tips_force: 1,
+      grasp_obj_transform: 1, # object pos relative to root
+      grasp_hand_object_transform: 1, # object hand relative pos and ori
+      target_lift_pos: 1,  
+      # foot_force: 1,
+    }
+
+    a_history_homie: {
+      b_homie_commands: 5,
+      c_homie_base_ang_vel: 5,
+      d_homie_projected_gravity: 5,
+      # homie_torso_ang_vel: 5,
+      # homie_torso_projected_gravity: 5,
+      e_homie_dof_pos: 5,
+      f_homie_dof_vel: 5,
+      g_homie_body_actions: 5,
+      # homie_clock_inputs: 5,
+    }
+  
+  homie_history_length: 5
+
+  obs_scales: {
+    base_lin_vel: 1.0,
+    base_ang_vel: 1.0,
+    projected_gravity: 1.0,
+    actions: 1.0,
+    stage: 1.0,
+    delta_actions: 1.0,
+    dof_pos: 1.0,
+    dof_vel: 0.05,
+    placement_pos: 1.0, # initial bottle position, will not change
+    table_pelvis_transform: 1.0,
+    hold_fingers_tips_force: 1.0,
+    hold_obj_transform: 1.0, # object pos relative to root
+    hold_hand_object_transform: 1.0, # object hand relative pos and ori
+    target_place_pos: 1.0,
+    grasp_fingers_tips_force: 1.0,
+    grasp_obj_transform: 1.0, # object pos relative to root
+    grasp_hand_object_transform: 1.0, # object hand relative pos and ori
+    target_lift_pos: 1.0,  
+    # foot_force: 1.0,
+    b_homie_commands: 1.0,
+    e_homie_dof_pos: 1.0,
+    f_homie_dof_vel: 0.05,
+    c_homie_base_ang_vel: 0.5,
+    d_homie_projected_gravity: 1.0,
+    # homie_torso_ang_vel: 0.5,
+    # homie_torso_projected_gravity: 1.0,
+    g_homie_body_actions: 1.0,
+    # homie_clock_inputs: 1.0,
+    a_history_homie: 1.0,
+  }
+
+  noise_scales: {
+    base_lin_vel: 0.0,
+    base_ang_vel: 0.0,
+    projected_gravity: 0.0,
+    actions: 0.0,
+    stage: 0.0,
+    delta_actions: 0.0,
+    dof_pos: 0.0,
+    dof_vel: 0.0,
+    placement_pos: 0.0, # initial bottle position, will not change
+    table_pelvis_transform: 0.0,
+    hold_fingers_tips_force: 0.0,
+    hold_obj_transform: 0.0, # object pos relative to root
+    hold_hand_object_transform: 0.0, # object hand relative pos and ori
+    target_place_pos: 0.0,
+    grasp_fingers_tips_force: 0.0,
+    grasp_obj_transform: 0.0, # object pos relative to root
+    grasp_hand_object_transform: 0.0, # object hand relative pos and ori
+    target_lift_pos: 0.0,  
+    # foot_force: 0.0,
+    b_homie_commands: 0.0,
+    e_homie_dof_pos: 0.0,
+    f_homie_dof_vel: 0.0,
+    c_homie_base_ang_vel: 0.0,
+    d_homie_projected_gravity: 0.0,
+    # homie_torso_ang_vel: 0.0,
+    # homie_torso_projected_gravity: 0.0,
+    g_homie_body_actions: 0.0,
+    # homie_clock_inputs: 0.0,
+    a_history_homie: 0.0,
+  }
+
+  add_noise_currculum: False
+  noise_initial_value: 0.05
+  noise_value_max: 1.00
+  noise_value_min: 0.00001
+  soft_dof_pos_curriculum_degree: 0.00001
+  soft_dof_pos_curriculum_level_down_threshold: 100
+  soft_dof_pos_curriculum_level_up_threshold: 900
+
+  obs_dims:
+    - base_lin_vel: 3
+    - base_ang_vel: 3
+    - projected_gravity: 3
+    - actions: ${robot.actions_dim}
+    - stage: 5
+    - delta_actions: 11
+    - dof_pos: ${robot.dof_obs_size}
+    - dof_vel: ${robot.dof_obs_size}
+    - placement_pos: 2
+    - table_pelvis_transform: 9
+    - hold_fingers_tips_force: 12
+    - hold_obj_transform: 9  # object pos relative to root
+    - hold_hand_object_transform: 9  # object hand relative pos and ori
+    - target_place_pos: 3
+    - grasp_fingers_tips_force: 12
+    - grasp_obj_transform: 9  # object pos relative to root
+    - grasp_hand_object_transform: 9  # object hand relative pos and ori
+    - target_lift_pos: 3
+    # - foot_force: 2
+    - b_homie_commands: 7
+    - e_homie_dof_pos: ${robot.homie_dof_obs_size}
+    - f_homie_dof_vel: ${robot.homie_dof_obs_size}
+    - c_homie_base_ang_vel: 3
+    - d_homie_projected_gravity: 3
+    - homie_torso_ang_vel: 3
+    - homie_torso_projected_gravity: 3
+    - g_homie_body_actions: ${robot.lower_body_actions_dim}
+
+  homie_command_keys: {
+    # 'loco_vel', 'height', 'rpy', 'left_arm', 'right_arm'
+    'loco_vel', 'right_arm', 'right_hand'
+    #, 'left_arm'
+  }
+
+  homie_command_default: {
+    'loco_vel': [0.0, 0.0, 0.0],
+    'height': [0.0],
+    'rpy': [0.0, 0.0, 0.0],
+    'left_arm': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    'right_arm': [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    'left_hand': [0.0],
+    'right_hand': [0.0],
+  }
+
+  homie_command_index: {
+    'loco_vel': [0, 1, 2],
+    'height': [3],
+    'rpy': [4, 5, 6],
+    'left_arm': [7, 8, 9, 10, 11, 12, 13],
+    'right_arm': [14, 15, 16, 17, 18, 19, 20],
+    'left_hand': [21],
+    'right_hand': [22], # 7 + 28 = 35
+  }
+
+  homie_default_height: 0.74

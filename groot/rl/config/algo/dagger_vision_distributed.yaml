@@ -1,0 +1,100 @@
+# @package _global_
+
+defaults:
+  - trl@algo.trl: ppo
+  - eval@algo.config.eval: base
+  - _self_
+
+
+algo:
+  config:
+    num_learning_epochs: 1
+    num_mini_batches: 4
+    clip_param: 0.2
+    gamma: 0.99
+    lam: 0.95
+    value_loss_coef: 1.0
+    dagger_bc_loss_type: l2
+    dagger_bc_loss_coef: 1.0
+    entropy_coef: 0.01
+    actor_learning_rate: 1.e-3 # 5e-4 # 1.e-3
+    critic_learning_rate: 1.e-3 # 5e-4 # 1.e-3
+    max_grad_norm: 1.0
+    use_clipped_value_loss: True
+    schedule: "adaptive"
+    desired_kl: 0.01
+
+    num_steps_per_env: 1
+    save_interval: 100
+
+    load_optimizer: True
+
+    init_noise_std: 0.001
+
+    num_learning_iterations: 1000000
+    init_at_random_ep_len: True
+    eval_callbacks: null
+
+    global_rank: 0
+    world_size: 1
+
+    use_new_actor_critic: True
+    use_padding_mask: False
+    ppo_shuffle_every_epoch: True
+    sync_advantage_normalization: True
+    use_dagger: True
+
+    module_dim:
+      vision_feature_dim: 16
+
+    module_dict:
+      encoder:
+        input_dim: [ vision_obs ]
+        output_dim: [ vision_feature_dim ]
+        layer_config:
+          type: CNN
+          channel_dims: [16, 32, 32]
+          activation: ELU
+          norm_config:
+            use_batch_norm: True
+          layers:
+            - type: conv
+              kernel_size: 3
+              stride: 1
+              padding: 1
+            - type: pool
+              kernel_size: 2
+              stride: 2
+            - type: conv
+              kernel_size: 3
+              stride: 1
+              padding: 1
+            - type: pool
+              kernel_size: 2
+              stride: 2
+            - type: conv
+              kernel_size: 3
+              stride: 1
+              padding: 1
+
+      actor:
+        input_dim: [ actor_obs, vision_feature_dim ]
+        output_dim: [ robot_action_dim ]
+        layer_config:
+          type: MLP
+          hidden_dims: [512, 256, 128]
+          activation: ELU
+
+      teacher_actor:
+        input_dim: [ teacher_obs ]
+        output_dim: [ robot_action_dim ]
+        layer_config:
+          type: MLP
+          hidden_dims: [512, 256, 128]
+          activation: ELU
+
+    network_load_dict:
+      teacher_actor: 
+        path: logs/IsaacSimStairsDebug/20250415_231223-G1_23dof_stairs_loco_with_map-locomotion-g1_12dof/model_10000.pt
+    
+    train_with_evaluating_env: false

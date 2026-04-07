@@ -1,0 +1,10 @@
+Command executed:
+python roboverse/eval_agent.py +checkpoint=TairanTestbed_0109_eval_g129dof_anneal_23dof_checkpoints_20250113_1731/TairanTestbed0109_APT_video_APT_level1/20250109_215658-TairanTestbed_G129dofANNEAL23dof_dm_APT_video_APT_level1_MinimalFriction-0.62_RfiTrue_RESUME-motion_tracking-g1_29dof_anneal_23dof/model_47000.pt +device=cuda:2 +headless=True +simulator=isaacgym +opt=eval_analysis_plot_motion_tracking_metrics +env.config.termination.terminate_by_gravity=True +env.config.termination.terminate_when_motion_far=True +env.config.noise_to_initial_level=0 +domain_rand.push_robots=False +domain_rand.randomize_link_mass=False +domain_rand.randomize_pd_gain=False +domain_rand.randomize_friction=False +domain_rand.randomize_torque_rfi=False +domain_rand.randomize_ctrl_delay=False
+
+Metrics:
+success_rate: 1.0
+mpjpe_g: 117.666
+mpjpe_l: 73.723
+mpjpe_pa: 52.814
+accel_dist: 2.456
+vel_dist: 6.378

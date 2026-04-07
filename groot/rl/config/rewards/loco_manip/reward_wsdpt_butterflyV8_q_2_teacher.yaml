@@ -1,0 +1,195 @@
+# @package _global_
+
+# defaults:
+#   - reward_base
+
+rewards:
+  set_reward: Tairan
+  set_reward_date: 20251002
+  only_positive_rewards: False
+  reward_scales:
+      termination: -2000.0
+      penalty_upfront_heading: -10000.0
+      penalty_bottle_in_middle: -1.0 
+      # penalty_contact_with_table: -0.1
+      # penalty_contact_body_with_table: -0.1
+
+      penalty_delta_action_rate: -0.01
+      penalty_dof_vel: -0.5 # -1.0
+      penalty_dof_acc: -3.0e-6
+      penalty_torques: -0.001
+      penalty_output_smoothness: -9.0
+
+      penalty_finger_primitive_limit: -20.0
+      penalty_command_large_linvel_x: -20.0
+      penalty_command_large_linvel_y: -20.0
+      penalty_command_large_angvel: -20.0
+      penalty_command_large_upper_body_actions: -10.0
+
+      penalty_zero_linvel_x_y: -10.0
+
+
+      task_robot_distance_to_box: 2.0 
+      penalty_upper_body_actions: -1.0   
+      penalty_keep_hand_closed: 9.0
+
+      # hand_predrop_pos_distance: 1.0
+      penalty_hand_predrop_pos_distance: -10000.0
+      
+      hand_object_distance: 20 # 50 # 1.0
+      grasp_based_on_obj_finger_dir: 5.0
+      grasp_force: 1.0
+      lift_goal_distance: 10 # 50
+      lift_z: 200 # always on 
+
+      # bottle_preplace_distance: 1.0 # Tairan: seems buggy
+      release_bottle: -1.0
+
+      # penalty_standing_still_abs: -2.0
+
+      task_turn_around: 15 # 2.0
+      holding_object: 1.0
+
+      penalty_bottle_lean_during_pick: -1000.0  
+      penalty_bottle_non_z_up_velocity_during_pick: -500.0
+      # new rewards on right arm qpos tracking
+      right_arm_qpos_tracking_hold_object: 5.0
+      right_arm_qpos_tracking_front_object: 25.0
+      penalty_fast_right_arm_qvel: -80.0
+
+      # new zero velocity positive command
+      zero_XY_Ang_velocity_command_during_drop_and_pick: 0.0 # 5.0
+      zero_XY_velocity_command_during_tuning: 0.0 # 7.5
+      zero_Ang_velocity_command_during_tuning: 0.0 # 10.0
+
+      finger_qvel_during_right_arm_qvel: 15.0
+
+      # finger_qvel_during_base_vel: 10.0
+      # arm_qvel_during_base_vel: 10.0
+
+      penalty_finger_qvel_during_single_foot_contact: -315.0
+      penalty_arm_qvel_during_single_foot_contact: -1300.0
+      
+      penalty_standing_still_abs: -0.0
+      penalty_standing_still_square: -0.0
+      penalty_standing_still_exp: 0.0
+
+      # penalty_zero_XY_Ang_Ddp_ABS: 0.0 #-120.0 # During drop and pick
+      # penalty_zero_XY_Ddpt_ABS: -10.0 #-40.0 # During drop and pick and turn
+      # penalty_zero_Ang_At_ABS: -20.0 #-40.0 # Afterturn
+
+      penalty_zero_XY_Ang_Ddp_ABS: -12.0 # During drop and pick
+      penalty_zero_XY_Ddpt_ABS: -4.0 # During drop and pick and turn
+      penalty_zero_Ang_At_ABS: -4.0 # Afterturn
+
+      track_xy_after_turning: 15.0
+
+      # num_foot_contacts: 1.0
+
+      penalty_bottle_move_table_contact: -1000
+
+      penalty_bottle_relative_move: -3000.0
+
+
+
+  reward_limit: 
+    soft_dof_pos_limit: 0.9
+    soft_dof_vel_limit: 0.9
+    soft_torque_limit: 0.825
+
+    reward_limits_curriculum:
+      soft_dof_pos_curriculum: False
+      soft_dof_pos_initial_limit: 1.15
+      soft_dof_pos_max_limit: 1.15
+      soft_dof_pos_min_limit: 0.95
+      soft_dof_pos_curriculum_degree: 0.00000025
+      soft_dof_pos_curriculum_level_down_threshold: 40
+      soft_dof_pos_curriculum_level_up_threshold: 42
+
+      soft_dof_vel_curriculum: False
+      soft_dof_vel_initial_limit: 1.15
+      soft_dof_vel_max_limit: 1.25
+      soft_dof_vel_min_limit: 0.95
+      soft_dof_vel_curriculum_degree: 0.00000025
+      soft_dof_vel_curriculum_level_down_threshold: 40
+      soft_dof_vel_curriculum_level_up_threshold: 42
+
+      soft_torque_curriculum: False
+      soft_torque_initial_limit: 1.15
+      soft_torque_max_limit: 1.25
+      soft_torque_min_limit: 0.85
+      soft_torque_curriculum_degree: 0.00000025
+      soft_torque_curriculum_level_down_threshold: 40
+      soft_torque_curriculum_level_up_threshold: 42
+
+  reward_penalty_curriculum: False
+  reward_initial_penalty_scale : 0.11
+  reward_min_penalty_scale: 0.1
+  reward_max_penalty_scale: 1.0
+  # reward_penalty_level_down_threshold: 400
+  # reward_penalty_level_up_threshold: 450
+  reward_penalty_level_down_threshold: 200
+  reward_penalty_level_up_threshold: 300
+  reward_penalty_degree: 0.000012
+  num_compute_average_epl: 10000
+
+  # distance
+  walk_stand_threshold_distance: 0.45
+
+  # Coefficients for reward functions
+  robot_distance_to_box_exp_coeff: -4.0
+  holding_object_distance_exp_coeff: -4.0
+  bottle_preplace_distance_exp_coeff: -4.0
+  standing_still_exp_coeff: -4.0
+  hand_distance_to_object_exp_coeff: -10.0
+  lift_distance_to_goal_exp_coeff: -10.0
+  positive_hand_closed_exp_coeff: -4.0
+  finger_primitive_value: 0.5
+  hand_predrop_pos_distance_exp_coeff: -4.0
+  penalty_keep_hand_closed_exp_coeff: -4.0
+
+  standing_still_reward_std: 0.15
+  walk_to_table_reward_std: 0.25
+  finger_dof_pos_l1_std: 0.3
+  tracking_grasp_target_std: 0.3
+  tracking_lift_target_dist_std: 0.2
+  lift_z_threshold: 0.1
+
+
+  homie_linvel_x_threshold: 0.4
+  homie_linvel_y_threshold: 0.4
+  homie_angvel_threshold: 0.8
+  homie_lower_height_threshold: 0.2
+  homie_upper_height_threshold: 0.8
+  homie_lower_roll_threshold: -0.5
+  homie_upper_roll_threshold: 0.5
+  homie_lower_pitch_threshold: -0.5
+  homie_upper_pitch_threshold: 0.5
+  homie_lower_yaw_threshold: -0.5
+  homie_upper_yaw_threshold: 0.5
+
+  homie_upper_body_actions_threshold: 6.28 # 2*pi * 0.25 is effective range for upper body qpos targets
+
+  right_arm_qpos_idx: [22, 23, 24, 25, 26, 27, 28]
+  right_arm_qpos_target_hold_object: [-1.0, -0.25, 0.0, 0.75, 0.0, 0.0, 0.0]
+  right_arm_qpos_target_front_object: [-0.4, -0.4, 0.0, -0.6, 0.0, 0.0, 0.0]
+  right_arm_qpos_tracking_hold_object_exp_coeff: -4.0
+  right_arm_qpos_tracking_front_object_exp_coeff: -4.0
+
+  zero_XY_Ang_velocity_command_during_drop_and_pick_exp_coeff: -5.0
+  zero_XY_velocity_command_during_tuning_exp_coeff: -5.0
+  zero_Ang_velocity_command_during_tuning_exp_coeff: -5.0
+
+  finger_qvel_during_right_arm_qvel_exp_coeff: -6.0
+  finger_qvel_during_base_vel_exp_coeff: -6.0
+  arm_qvel_during_base_vel_exp_coeff: -6.0
+
+  track_xy_after_turning_exp_coeff: -1.0
+
+
+  reward_penalty_reward_names : [
+    # "penalty_zero_XY_Ang_Ddp_ABS",
+    # "penalty_zero_XY_Ddpt_ABS",
+    # "penalty_zero_Ang_At_ABS",
+    # "penalty_fast_right_arm_qvel"
+  ]

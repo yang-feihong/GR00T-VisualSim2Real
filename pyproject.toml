@@ -1,0 +1,97 @@
+[build-system]
+requires = ["setuptools>=67", "wheel", "pip"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "groot"
+dynamic = ["version"]
+readme = "README.md"
+classifiers = [
+    "Intended Audience :: Science/Research",
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+authors = [
+    {name = "NVIDIA Gear Lab"}
+]
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "scipy",
+    "numpy",
+    "matplotlib",
+    "hydra-core",
+    "omegaconf",
+    "loguru",
+    "onnxruntime",
+    "wandb",
+    "trl==0.17.0",
+    "transformers",
+    "accelerate",
+    "pyyaml",
+    "opencv-python",
+    "torchvision",
+    "pandas",
+    "termcolor",
+    "tensordict",
+    "rich",
+    "imageio",
+    "plotly",
+    "tqdm",
+    "gymnasium",
+    "datasets",
+    "typing_extensions",
+]
+license = {file = "LICENSE"}
+
+[project.optional-dependencies]
+dev = [
+    "pytest==7.4.0",
+    "ruff",
+    "black",
+    "isort",
+    "pre-commit",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["groot*"]
+exclude = [
+    "*.tests",
+    "*.tests.*",
+    "tests.*",
+    "tests",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.package-data]
+groot = ["py.typed", "**/*.json", "**/*.yaml"]
+
+[tool.setuptools.dynamic]
+version = {attr = "groot.version.VERSION"}
+
+[tool.black]
+line-length = 100
+include = '\.pyi?$'
+
+[tool.isort]
+profile = "black"
+line_length = 100
+multi_line_output = 3
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[tool.pytest.ini_options]
+testpaths = "tests/"

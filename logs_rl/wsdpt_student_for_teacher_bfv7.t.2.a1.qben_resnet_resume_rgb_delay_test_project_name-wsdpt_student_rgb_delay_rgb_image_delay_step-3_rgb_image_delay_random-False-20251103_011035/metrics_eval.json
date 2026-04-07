@@ -1,0 +1,14 @@
+{
+    "collected_episodes": 1,
+    "goal_reached_rate": 0.0,
+    "episode_length": 55.0,
+    "reward": -177.77285766601562,
+    "eval_dof_vel": 0.3620092570781708,
+    "eval_arm_dof_vel": 0.2100106179714203,
+    "eval_finger_dof_vel": 0.09292220324277878,
+    "class_bottle_success_rate": 0.0,
+    "class_bottle_reward": -177.77285766601562,
+    "class_bottle_length": 55.0,
+    "class_bottle_episodes": 1,
+    "eval_time": 5.04866623878479
+}

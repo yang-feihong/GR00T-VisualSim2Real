@@ -1,0 +1,307 @@
+# @package _global_
+
+defaults:
+  - /algo: dagger_vision_distributed
+  - /env: walk_stand_place_grasp_turn_homie
+  - /simulator: isaacsim
+  - /domain_rand: wsdpt_student
+  - /rewards: loco_manip/reward_wsdpt_butterflyV5_teacher
+  - /robot: g1/g1_43dof
+  - /terrain: terrain_locomotion_plane
+  - /obs: loco_manip/obs_walk_stand_place_grasp_turn_homie_distill_rgb_delay
+  - /opt: wandb
+  - override /trainer: trl_distill_obj_pred_homie_api
+
+exp_base: ${hydra:runtime.choices.exp}
+exp_var: test
+experiment_name: walk_stand_place_grasp_turn_STUDENT_${exp_var}
+experiment_dir: ${base_dir}/${project_name}/${experiment_name}-${timestamp}
+
+
+simulator:
+  config:
+    cameras:
+      enable_cameras: true
+      camera_types:
+        - rgb: true 
+        - depth: false
+      camera_resolutions: [108, 192]
+    scene:
+      replicate_physics: False  # Match teacher config
+      env_spacing: 10.0         # Match teacher config
+    sim:
+      physx:
+        num_position_iterations: 8  # Match teacher config
+        num_velocity_iterations: 4  # Match teacher config
+
+enable_cameras: true
+headless: True
+
+num_envs: 1024  
+project_name: STUDENT_walk_stand_place_grasp_turn_homie
+
+domain_rand:
+  randomize_goal_and_obj_positions: False
+  randomize_init_pos: False
+
+  randomize_initial_dof_pos: False
+  initial_dof_pos_range: [-0.05, 0.05]  
+  initial_dof_pos_distribution: "uniform"
+  
+  randomize_initial_dof_vel: False
+  initial_dof_vel_range: [-0.1, 0.1]    
+  initial_dof_vel_distribution: "uniform"
+  
+  # DOF Position Randomization Curriculum
+  dof_pos_randomization_curriculum: False
+  dof_pos_randomization_initial_range: [-0.05, 0.05]
+  dof_pos_randomization_max_range: [-0.1, 0.1]
+  dof_pos_randomization_min_range: [-0.005, 0.005]
+  
+  # DOF Velocity Randomization Curriculum  
+  dof_vel_randomization_curriculum: False
+  dof_vel_randomization_initial_range: [-0.05, 0.05]
+  dof_vel_randomization_max_range: [-0.1, 0.1]
+  dof_vel_randomization_min_range: [-0.02, 0.02]
+
+  dof_pos_vel_randomization_level_down_threshold: 75
+  dof_pos_vel_randomization_level_up_threshold: 175
+  dof_pos_vel_randomization_curriculum_degree: 0.00001
+  
+  extrinsics_randomization:
+    enabled: True
+    position_noise_range: # unit: meter, will be converted to [-value, value]
+      x: 0.01  # [-0.02, 0.02]
+      y: 0.05  # [-0.02, 0.02]
+      z: 0.01  # [-0.02, 0.02]
+    rotation_noise_range: # unit: radians, will be converted to [-value, value]
+      roll: 0.05   # ±0.05 radians (~2.9 degrees) for roll (X-axis), will be [-0.05, 0.05]
+      pitch: 0.1   # ±0.1 radians (~5.7 degrees) for pitch (Y-axis), will be [-0.1, 0.1]
+      yaw: 0.05    # ±0.05 radians (~2.9 degrees) for yaw (Z-axis), will be [-0.05, 0.05] 
+
+    curriculum:
+      enabled: False
+      position_noise_init_range: [-0.005, 0.005]
+      position_noise_max_range: [-0.02, 0.02]
+      position_noise_min_range: [-0.002, 0.002]
+
+      # Rotation curriculum can use either:
+      # 1. Legacy single range format (applied to pitch only):
+      #    rotation_noise_init_range: [-0.05, 0.05]
+      # 2. New per-axis format (roll, pitch, yaw):
+      rotation_noise_init_range:
+        roll: 0.025
+        pitch: 0.05
+        yaw: 0.025
+      rotation_noise_max_range:
+        roll: 0.05
+        pitch: 0.1
+        yaw: 0.05
+      rotation_noise_min_range:
+        roll: 0.01
+        pitch: 0.02
+        yaw: 0.01
+
+      extrinsics_noise_level_down_threshold: 25
+      extrinsics_noise_level_up_threshold: 70
+      extrinsics_noise_curriculum_degree: 0.001
+
+
+# teacher_actor_path: logs_rl/wsdpt_sd_teacher_tairan_DL_33demos_Sweep_CloseHand_qbenV/loco_manip/walk_stand_place_grasp_turn_homie_test_project_name-wsdpt_sd_teacher_tairan_DL_33demos_Sweep_CloseHand_qbenV_penalty_dof_vel--1.0_penalty_output_smoothness--9_hand_predrop_pos_distance-3.0_hand_object_distance-50_penalty_keep_hand_closed-9-20251014_232828/model_step_006300.pt
+# teacher_actor_path: logs_rl/wsdpt_zerostage/walk_stand_place_grasp_turn_homie_baseline_project_name-wsdpt_zerostage_penalty_fast_right_arm_qvel--40.0_penalty_zero_XY_Ang_Ddp_ABS--120_penalty_zero_XY_Ddpt_ABS--40-20251024_191440/model_step_010700.pt
+# teacher_actor_path: logs_rl/wsdpt_BFv2_teacher_sweep_1Node_resume/loco_manip/walk_stand_place_grasp_turn_homie_RESUME_test_project_name-wsdpt_BFv2_teacher_sweep_1Node_resume_150demos_penalty_upfront_heading--1000_penalty_fast_right_arm_qvel--80_terminate_by_finger_qvel_during_right_arm_qvel-False-20251027_022157/model_step_020000.pt    
+
+# v4v2 teacher
+# teacher_actor_path: logs_rl/wsdpt_BFv4v2_teacher_150demos/loco_manip/walk_stand_place_grasp_turn_homie_tairanRESUME_test_project_name-wsdpt_BFv4v2_teacher_150demos_penalty_finger_qvel_during_single_foot_contact--315_penalty_arm_qvel_during_single_foot_contact--750_penalty_bottle_move_table_contact--1250-20251028_165520/model_step_024400.pt
+
+# v5 teacher 
+# teacher_actor_path: logs_rl/wsdpt_BFv5_teacher_150demos/loco_manip/walk_stand_place_grasp_turn_homie_push_10_project_name-wsdpt_relative_push_penalty_bottle_relative_move--2000.0_wsdpt_push-True-20251030_081815/model_step_038100.pt
+
+# v6 teacher (including push)
+# teacher_actor_path: logs_rl/wsdpt_BFv6_teacher_220demos/loco_manip/walk_stand_place_grasp_turn_homie_includingpush_project_name-wsdpt_predrop_Penalty_penalty_hand_predrop_pos_distance--10000.0-20251031_004756/model_step_040200.pt
+
+# v7.7 teacher
+# teacher_actor_path: logs_rl/wsdpt_teacher_v7.7/loco_manip/walk_stand_place_grasp_turn_homie_btfv7_nopush_nopredrop_fi_project_name-wsdpt_teacher_bufferflyv7_finger_relative_penalty_finger_qvel_during_single_foot_contact--3250.0_wsdpt_push-True_penalty_bottle_lean_during_pick--100.0-20251101_074926/model_step_039100.pt
+
+# v8.q.8 teacher
+# teacher_actor_path: logs_rl/wsdpt_teacher_bfv8q8/loco_manip/walk_stand_place_grasp_turn_homie_predrop_project_name-wsdpt_teacher_BTFv8q8_qben_exppredrop_leanz_hand_predrop_pos_distance-10.0_penalty_bottle_lean_during_pick--5000.0_penalty_bottle_non_z_up_velocity_during_pick--1000.0-20251104_210449/model_step_045100.pt
+
+
+# v8.q.8.002 teacher
+# teacher_actor_path: logs_rl/bfv8.q.2_teacher/002/walk_stand_place_grasp_turn_homie_predrop_project_name-wsdpt_teacher_BTFv8q8_qben_exppredrop_leanz_hand_predrop_pos_distance-10.0_penalty_bottle_lean_during_pick--5000.0_penalty_bottle_non_z_up_velocity_during_pick--500.0-20251104_210449/model_step_046200.pt
+teacher_actor_path: logs_rl/walk_stand_place_grasp_turn_homie_predrop_project_name-wsdpt_teacher_BTFv8q9_qben_exppredrop_leanz_hand_predrop_pos_distance-10.0_penalty_bottle_lean_during_pick--3500.0_penalty_bottle_non_z_up_velocity_during_pick--1000.0-20251105_004910/model_step_044500.pt
+
+
+# checkpoint: logs_rl/wsdpt_student_rgb_delay/loco_manip/wsdpt_student_for_teacher_bfv7.t.2.a1.qben_resnet_resume_rgb_delay_test_project_name-wsdpt_student_rgb_delay_rgb_image_delay_step-2_rgb_image_delay_random-False-20251103_011035/model_step_023200.pt
+
+
+
+
+callbacks:
+  model_save:
+    save_frequency: 200
+  read_eval_locomanip:
+    _target_: groot.rl.trl.callbacks.read_eval_locomanip_callback.ReadEvalLocomanipCallback
+    eval_dir: ${experiment_dir}/eval
+    check_interval: 1
+
+# Environment configuration with object prediction visualization settings
+env:
+  config:
+    # Object prediction visualization settings
+    enable_obj_pred_visualization: false  # Set to false to disable visualization
+    obj_pred_vis_frequency: 1           # Visualize every N training steps
+    obj_pred_vis_max_envs: 20            # Maximum number of environments to visualize
+    obj_pred_vis_eval_frequency: 1       # Visualize every N steps during evaluation
+    show_rgb_image: False
+    enforce_vis: False
+    enforce_no_vis: True
+    max_episode_length_s: 8  # Adjusted for grasp task which may take longer
+
+    termination:
+      terminate_after_finish_turning_for_student: True
+
+algo:
+  config:
+    # Match teacher config hyperparameters
+    entropy_coef: 0.01
+    use_new_actor_critic: True
+    num_steps_per_env: 1
+    num_mini_batches: 4
+    use_padding_mask: False
+    ppo_shuffle_every_epoch: True
+    sync_advantage_normalization: True
+    actor_learning_rate: 2e-4
+    critic_learning_rate: 2e-5
+    homie_walk_model_path: ./models/model_walk.pt
+    homie_stand_model_path: ./models/model_stand.pt
+    opt_homie: False
+    homie_switch_threshold: 0.5
+  
+    # Noise settings for distillation
+    init_noise_std: 0.001
+    max_noise_std: 0.001
+    clamp_noise_std: True
+    freeze_noise_std: True  # Keep noise frozen during distillation
+    
+    # PPO hyperparameters to match teacher
+    gamma: 0.998  # Match teacher gamma
+    lam: 0.97
+
+    init_at_random_ep_len: True
+    rollout_with_teacher_num_steps: 0
+    enforce_teacher_rollout: True
+    ratio_teacher_rollout: 0.5
+
+
+    # Cosine learning rate scheduler configuration
+    use_cosine_scheduler: false
+    cosine_scheduler_warmup_steps: 500      # Warmup for 500 steps
+    cosine_scheduler_final_lr: 1e-6         # Final learning rate
+
+    network_load_dict:
+      teacher_actor:
+        path: ${teacher_actor_path}
+
+    # Object prediction loss coefficient
+    obj_pred_loss_coef: 0.0
+    obj_pred_loss_type: "l2"
+
+    module_dim:
+      vision_feature_dim: 128
+
+    actor:
+      _target_: groot.rl.trl.modules.vision_actor_critic_modules_obj_pred.VisionActorObjPred
+      running_mean_std: False
+      backbone:
+        vision_module:
+          _target_: groot.rl.agents.modules.modules.BaseModule
+          process_output_dim: True
+          module_config_dict:
+            input_dim: [vision_obs]
+            output_dim: [vision_feature_dim]
+            layer_config:
+              type: ResNet
+              resnet_type: resnet18  # Options: resnet18, resnet34, resnet50, resnet101, resnet152
+              pretrained: true       # Use ImageNet pretrained weights
+              trainable: true       # Set to false to freeze ResNet parameters, true to make them trainable
+        mlp_module:
+          _target_: groot.rl.agents.modules.modules.BaseModule
+          process_output_dim: True
+          module_config_dict:
+            input_dim: [actor_obs, vision_feature_dim]
+            output_dim: [-1]
+            layer_config:
+              type: MLP
+              hidden_dims: [512, 256, 128]  # Match teacher architecture
+              activation: SiLU
+        obj_pred_mlp:
+          _target_: groot.rl.agents.modules.modules.BaseModule
+          process_output_dim: True
+          module_config_dict:
+            input_dim: [vision_feature_dim]
+            output_dim: [3]  # 3D object position
+            layer_config:
+              type: MLP
+              hidden_dims: [256, 128, 64]
+              activation: SiLU
+    teacher_actor:
+      _target_: groot.rl.trl.modules.actor_critic_modules.Actor
+      running_mean_std: True
+      backbone:
+        _target_: groot.rl.agents.modules.modules.BaseModule
+        process_output_dim: True
+        module_config_dict:
+          input_dim: [teacher_obs]
+          output_dim: [-1]
+          layer_config:
+            type: MLP
+            hidden_dims: [512, 256, 128]  # Match teacher architecture
+            activation: SiLU
+
+robot:
+  terminate_after_contacts_on : ["knee"]
+  asset:
+    self_collisions: 0
+  use_primitive: True
+  finger_primitive:
+    primitive_action_map:
+      left:
+        pos_1: [
+          -0.8976, -0.8976, -0.0, # index_0, middle_0, thumb_0
+          -0.99731429, -0.99731429, 0.5984, # index_1, middle_1, thumb_1
+          0.99731429, # thumb_2
+        ]
+        pos_0: [
+          -0.0, -0.0, -0.0,
+          -0.0, -0.0, -0.0,
+          -0.0
+        ]
+        mode: "discrete"
+      right:
+        # used in stand_grasp
+        # pos_0: [
+        #   0.0, -0.5984, -0.99731429, # thumb_0, 1, 2
+        #   0.8976, 0.99731429,   # middle_0, 1
+        #   0.8976, 0.99731429   # index_0, 1
+        # ]
+        pos_1: [
+          0.8976, 0.8976, 0.0, # index_0, middle_0, thumb_0
+          0.99731429, 0.99731429, -0.5984, # index_1, middle_1, thumb_1
+          -0.99731429, # thumb_2
+        ]
+        pos_0: [
+          0.0, 0.0, 0.0,
+          0.0, 0.0, 0.0,
+          0.0
+        ]
+        pos_init: [
+          0.5, 0.5, 0.0,
+          0.5, 0.5, -0.2,
+          -0.2
+        ]
+        mode: "discrete"
+
+  actions_dim: 31 # 15 + 14 + 2
+  check_action_dim: False
+
