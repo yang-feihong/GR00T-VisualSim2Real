@@ -1,154 +1,291 @@
-# __NVIDIA_OSS__ Standard Repo Template
+<div align="center">
 
-This README file is from the NVIDIA_OSS standard repo template of [PLC-OSS-Template](https://github.com/NVIDIA-GitHub-Management/PLC-OSS-Template?tab=readme-ov-file). It provides a list of files in the PLC-OSS-Template and guidelines on how to use (clone and customize) them.
-
-**Upon completing the customization for the project repo, the repo admin should replace this README template with the project specific README file.**
-
-- Files (org-wide templates in the NVIDIA .github org repo; per-repo overrides allowed) in [PLC-OSS-Template](https://github.com/NVIDIA-GitHub-Management/PLC-OSS-Template?tab=readme-ov-file)
-
-   - Root 
-     - README.md skeleton (CTA + Quickstart + Support/Security/Governance links) 
-     - LICENSE (Apache 2.0 by default)
-        - For other licenses, see the [Confluence page](https://confluence.nvidia.com/pages/viewpage.action?pageId=788418816) for other licenses
-        - CLA.md file (delete if not using MIT or BSD licenses)
-     - CODE_OF_CONDUCT.md 
-     - SECURITY.md (vuln reporting path) 
-     - CONTRIBUTING.md (base; repo can add specifics)
-     - SUPPORT.md (Support levels/channels)
-     - GOVERNANCE.md (baseline; repo may extend)
-     - CITATION.md (for projects that need citation)
-
-   - .github/ 
-     - ISSUE_TEMPLATE/ (<https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/configuring-issue-templates-for-your-repository>)
-       - bug.yml, feature.yml, task.yml, config.yml 
-     - PULL_REQUEST_TEMPLATE.md (<https://docs.github.com/en/communities/using-templates-to-encourage-useful-issues-and-pull-requests/creating-a-pull-request-template-for-your-repository>)
-     - workflows/
-     - Note: workflow-templates/ for starter workflows should live in the org-level .github repo, not per-repo
-
-   - Repo-specific (not org-template, maintained by the team)
-     - CODEOWNERS (place at .github/CODEOWNERS or repo root)
-     - CHANGELOG.md (or RELEASE.md) 
-     - ROADMAP.md 
-     - MAINTAINERS.md 
-     - NOTICE or THIRD_PARTY_NOTICES / THIRD_PARTY_LICENSES (dependency specific)
-     - Build/package files (CMake, pyproject, Dockerfile, etc.)
-
-   - Recommended structure and hygiene
-     - docs/
-     - examples/
-     - tests/
-     - scripts/
-     - Container/dev env: Dockerfile, docker/, .devcontainer/ (optional)
-     - Build/package (language-specific):
-       - Python: pyproject.toml, setup.cfg/setup.py, requirements.txt, environment.yml
-       - C++: CMakeLists.txt, cmake/, vcpkg.json
-     - Repo hygiene: .gitignore, .gitattributes, .editorconfig, .pre-commit-config.yaml, .clang-format
+# GR00T-VisualSim2Real
 
 
-## Usage of [PLC-OSS-Template](https://github.com/NVIDIA-GitHub-Management/PLC-OSS-Template?tab=readme-ov-file) for NEW NVIDIA OSS repos
-
-1. Clone the [PLC-OSS-Template](https://github.com/NVIDIA-GitHub-Management/PLC-OSS-Template?tab=readme-ov-file)
-2. Find/replace all in the clone of `___PROJECT___` and `__PROJECT_NAME__` with the name of the specific project.
-3. Inspect all files to make sure all replacements work and update text as needed
-
-
-**What you can reuse immediately**
-- CODE_OF_CONDUCT.md
-- SECURITY.md
-- CONTRIBUTING.md (base)
-- .github/ISSUE_TEMPLATE/.yml (bug/feature/task + config.yml)
-- .github/PULL_REQUEST_TEMPLATE.md
-- Reusable workflows 
-
-**What you must customize per repo**
-- README.md: copy the skeleton and fill in product-specific details (Quickstart, Requirements, Usage, Support level, links)
-- LICENSE: check file is correct, update year, consult Confluence for alternatives https://confluence.nvidia.com/pages/viewpage.action?pageId=788418816, add CLA.md only if your license/process requires it
-- CODEOWNERS: replace <TEAM> with your GitHub team handle(s). Place at .github/CODEOWNERS (or repo root)
-- MAINTAINERS.md: list maintainers names/roles, escalation path
-- CHANGELOG.md (or RELEASE.md): track releases/changes
-- SUPPORT.md: Update for your project
-- ROADMAP.md (optional): upcoming milestones
-- NOTICE / THIRD_PARTY_NOTICES (if you ship third‑party content)
-- Build/package files (CMake/pyproject/Dockerfile/etc.), tests/, docs/, examples/, scripts/ as appropriate
-- Workflows: Edit if you need custom behavior 
+<table>
+  <tr>
+    <td align="center" valign="top" width="50%">
+      <h3>Visual Sim-to-Real at Scale for<br>Humanoid Loco-Manipulation</h3>
+      <a href="https://arxiv.org/abs/2511.15200"><img src="https://img.shields.io/badge/arXiv-2511.15200-b31b1b.svg" alt="VIRAL Paper"></a>
+      <a href="https://viral-humanoid.github.io/"><img src="https://img.shields.io/badge/Project-Page-blue.svg" alt="VIRAL Project Page"></a>
+      <a href="https://gitlab-master.nvidia.com/ziwang/VIRAL/-/tree/main"><img src="https://img.shields.io/badge/Code-viral-lightgrey.svg" alt="VIRAL Code"></a>
+      <br><br>
+      <img src="./docs/viral-for-preview-v2-576P-ezgif.com-video-to-gif-converter.gif" width="100%">
+    </td>
+    <td align="center" valign="top" width="50%">
+      <h3>Opening the Sim-to-Real Door for<br>Humanoid Pixel-to-Action Policy Transfer</h3>
+      <a href="https://arxiv.org/abs/2512.01061"><img src="https://img.shields.io/badge/arXiv-2511.15200-b31b1b.svg" alt="DoorMan Paper"></a>
+      <a href="https://doorman-humanoid.github.io/"><img src="https://img.shields.io/badge/Project-Page-blue.svg" alt="DoorMan Project Page"></a>
+      <a href="https://gitlab-master.nvidia.com/ziwang/VIRAL/-/tree/doorman"><img src="https://img.shields.io/badge/Code-doorman-lightgrey.svg" alt="DoorMan Code"></a>
+      <br><br>
+      <img src="./docs/doorman-teaser-576P-ezgif.com-video-to-gif-converter.gif" width="100%">
+    </td>
+  </tr>
+</table>
 
 
-4. Change git origin to point to new repo and push
-5. Remove the line break below and everything above it
+</div>
 
-## Usage for existing NVIDIA OSS repos
+<br/>
 
-1. Follow the steps above, but add the files to your existing repo and merge
+## Overview
+This repository contains the application code for **VIRAL** (Visual Sim-to-Real for Humanoid Loco-Manipulation) and **DoorMan**. The system enables humanoid robots (e.g., Unitree G1) to perform complex tasks like opening heavy doors in the real world through a teacher-student simulation framework.
 
-<!-- REMOVE THE LINE BELOW AND EVERYTHING ABOVE -->
------------------------------------------
-# [Project Title]
-One-sentence value proposition for users. Who is it for, and why it matters. 
+This repository contains the official code for:
 
-# Overview
-What the project does? Why the project is useful?
-Provide a brief overview, highlighting key features or problem-solving capabilities.
+- **VIRAL**: *Visual Sim-to-Real at Scale for Humanoid Loco-Manipulation*
+  &nbsp; [Paper](https://arxiv.org/abs/2511.15200) &nbsp;|&nbsp; [Project](https://viral-humanoid.github.io/) &nbsp;|&nbsp; [Code](https://gitlab-master.nvidia.com/ziwang/VIRAL/-/tree/main)
+- **DoorMan**: *Opening the Sim-to-Real Door for Humanoid Pixel-to-Action Policy Transfer*
+  &nbsp; [Paper](https://arxiv.org/abs/2512.01061) &nbsp;|&nbsp; [Project](https://doorman-humanoid.github.io/) &nbsp;|&nbsp; [Code](https://gitlab-master.nvidia.com/ziwang/VIRAL/-/tree/doorman)
 
-# Getting Started
-Guide users on how they can get started with the project. This should include basic installation step, quick-start examples 
+---
+
+
+# VIRAL: Visual Sim-to-Real at Scale for Humanoid Loco-Manipulation
+
+A reinforcement learning framework for humanoid robot loco-manipulation on the **Unitree G1** robot. The codebase supports:
+
+- **Teacher Training** -- PPO-based policy training with privileged state observations
+- **Student Training** -- Vision-based policy distillation (DAgger) from a trained teacher using RGB camera input
+- **Evaluation** -- Evaluate trained teacher or student checkpoints, with optional ONNX export for deployment
+
+Built on [Isaac Lab](https://isaac-sim.github.io/IsaacLab/) (Isaac Sim 5.1), [TRL](https://github.com/huggingface/trl), and [Hydra](https://hydra.cc/) for configuration management.
+
+## Table of Contents
+
+- [Prerequisites](#prerequisites)
+- [Installation](#installation)
+- [Usage](#usage)
+  - [Teacher Training (PPO)](#teacher-training-ppo)
+  - [Teacher Evaluation](#teacher-evaluation)
+  - [Student Training (DAgger)](#student-training-dagger-distillation)
+  - [Student Evaluation](#student-evaluation)
+- [Configuration](#configuration)
+- [ONNX Export](#onnx-export)
+- [Project Structure](#project-structure)
+- [License](#license)
+- [Citation](#citation)
+
+## Prerequisites
+
+- Ubuntu 22.04
+- NVIDIA GPU with driver >= 535
+- [Isaac Sim 5.1](https://docs.omniverse.nvidia.com/isaacsim/latest/installation/install_workstation.html)
+- [Isaac Lab](https://isaac-sim.github.io/IsaacLab/)
+- Conda or Mamba
+
+## Installation
+
+### 1. Create conda environment
+
 ```bash
-# Option A: Package manager (pip/conda/npm/etc.)
-<copy-paste install>
-
-# Option B: Container
-docker run <image> <args>
-
-# Verify (hello world)
-<one-liner or ~10-line example>
+conda create -n viral python=3.11 -y
+conda activate viral
 ```
-# Requirements
-Include a list of pre-requisites. 
-- OS/Arch: <summary or link to full matrix>
-- Runtime/Compiler: <versions>
-- GPU/Drivers (if applicable): CUDA <ver>, driver <ver>, etc.
 
-# Usage
+### 2. Install Isaac Sim 5.1
+
 ```bash
-# Minimal runnable snippet (≤20 lines)
-<code>
+pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
+
+pip install isaacsim==5.1.0.0 isaacsim-rl==5.1.0.0
 ```
-- More examples/tutorials: <link>
-- API reference: <link>
 
-# Performance (Optional)
-Summary of benchmarks; link to detailed results and hardware used.
+### 3. Install Isaac Lab
 
-## Releases & Roadmap 
-- Releases/Changelog: <link>
-- (Optional) Next milestones or link to `ROADMAP.md`.
-  
-# Contribution Guidelines
-- Start here: `CONTRIBUTING.md`
-- Code of Conduct: `CODE_OF_CONDUCT.md`
-- Development quickstart (build/test):
+Clone or download [Isaac Lab](https://github.com/isaac-sim/IsaacLab) and install:
+
 ```bash
-<clone> && <deps> && <build/test>
+pip install setuptools poetry-core flatdict
+
+pip install --no-build-isolation -e <path-to-IsaacLab>/source/isaaclab
+pip install --no-build-isolation -e <path-to-IsaacLab>/source/isaaclab_assets \
+    -e <path-to-IsaacLab>/source/isaaclab_tasks \
+    -e "<path-to-IsaacLab>/source/isaaclab_rl[all]"
+
+pip install numpy==1.26.0
 ```
-## Governance & Maintainers
-- Governance: `GOVERNANCE.md`
-- Maintainers: <team/handles>
-- Labeling/triage policy: <link>
 
-## Security
-- Vulnerability disclosure: `SECURITY.md`
-- Do not file public issues for security reports.
+Verify the install:
 
-## Support
-- Level: <Experimental | Maintained | Stable>
-- How to get help: Issues/Discussions/<channel link>
-- Response expectations (if any).
+```bash
+python -c "import isaaclab; print(isaaclab.__file__)"
+```
 
-# Community
-Provide the channel for community communications.
+### 4. Install this package
 
-# References
-Provide a list of related references
+```bash
+cd <path-to-this-repo>
+pip install -e .
 
-# License
-This project is licensed under the [NAME HERE] License - see the LICENSE.md file for details
-- License: <link>
+pip install numpy==1.26.0   # pip may upgrade it; pin again
+```
+
+### 5. Verify installation
+
+```bash
+python -c "from groot.rl.envs.base_task.base_task import BaseTask; print('OK')"
+```
+
+## Usage
+
+### Teacher Training (PPO)
+
+Train a teacher policy using privileged state observations:
+
+```bash
+HYDRA_FULL_ERROR=1 accelerate launch --num_processes 1 \
+    groot/rl/train_agent_trl.py \
+    +exp=loco_manip/walk_stand_place_grasp_turn_homie \
+    num_envs=48 \
+    project_name=wsdpt_teacher
+```
+
+> **Tip:** Add `headless=False` to open the Isaac Sim GUI and watch training live.
+
+<p align="center">
+  <img src="./docs/viral-teacher-gif.gif" width="60%"><br/>
+  <em>Teacher policy running in Isaac Sim</em>
+</p>
+
+| Argument | Description |
+|---|---|
+| `num_envs` | Number of parallel environments (higher = faster, more VRAM) |
+| `project_name` | Weights & Biases project name |
+| `headless` | `True` (default) for headless; `False` to open GUI |
+| `env.config.reset_from_dataset.enable` | Reset from demonstration dataset |
+
+### Teacher Evaluation
+
+```bash
+python groot/rl/eval_agent_trl.py \
+    +checkpoint=logs_rl/<experiment_dir>/model_step_044500.pt
+```
+
+### Student Training (DAgger Distillation)
+
+Train a vision-based student policy by distilling from a trained teacher:
+
+1. Update the teacher checkpoint path in the experiment config:
+
+```yaml
+# config/exp/loco_manip/wsdpt_student_for_teacher_v8q8.002_resnet_rgb_delay.yaml
+teacher_actor_path: logs_rl/<your_teacher_experiment>/model_step_XXXXXX.pt
+```
+
+2. Launch training:
+
+```bash
+HYDRA_FULL_ERROR=1 accelerate launch --num_processes 1 \@article{xue2025openingsimtorealdoorhumanoid,
+  title={Opening the Sim-to-Real Door for Humanoid Pixel-to-Action Policy Transfer},
+  author={Haoru Xue and Tairan He and Zi Wang and Qingwei Ben and Wenli Xiao and Zhengyi Luo and Xingye Da and Fernando Castañeda and Guanya Shi and Shankar Sastry and Linxi "Jim" Fan and Yuke Zhu},
+  journal={https://arxiv.org/abs/2512.01061},
+  year={2025},
+</p>
+
+### Student Evaluation
+
+```bash
+python groot/rl/eval_agent_trl.py \
+    +checkpoint=logs_rl/<student_experiment_dir>/model_step_XXXXXX.pt
+```
+
+## Configuration
+
+This project uses [Hydra](https://hydra.cc/) for configuration. Configs are composed from YAML files in `groot/rl/config/`. Override any value from the command line:
+
+```bash
+# Number of environments
+... num_envs=16
+
+# Reward weights
+... rewards.reward_scales.tracking_lin_vel=1.0
+
+# Training hyperparameters
+... algo.config.actor_learning_rate=1e-4
+```
+
+### Experiment Tracking
+
+Training logs to [Weights & Biases](https://wandb.ai/) by default:
+
+```bash
+wandb login
+```
+
+Checkpoints are saved to `logs_rl/<experiment_name>/` at intervals controlled by the `save_frequency` callback parameter.
+
+## ONNX Export
+
+During evaluation with `num_envs=1`, the policy is automatically exported as ONNX for deployment:
+
+```bash
+python groot/rl/eval_agent_trl.py \
+    +checkpoint=<path_to_checkpoint.pt> \
+    num_envs=1
+```
+
+The exported model is saved to `<experiment_dir>/exported/`.
+
+## Project Structure
+
+```
+groot/rl/
+├── train_agent_trl.py          # Training entry point (teacher & student)
+├── eval_agent_trl.py           # Evaluation entry point
+├── config/                     # Hydra YAML configs
+│   ├── base.yaml               #   Base training config
+│   ├── base_eval.yaml          #   Base evaluation config
+│   ├── exp/loco_manip/         #   Experiment configs
+│   ├── algo/                   #   Algorithm configs (PPO, DAgger)
+│   ├── env/                    #   Environment configs
+│   ├── robot/g1/               #   Robot configs (G1 43-DOF)
+│   ├── rewards/                #   Reward function configs
+│   ├── terrain/                #   Terrain configs
+│   ├── obs/                    #   Observation configs
+│   └── domain_rand/            #   Domain randomization configs
+├── envs/                       # Environment implementations
+│   ├── base_task/              #   Base task classes
+│   └── loco_manip/             #   Loco-manipulation task
+├── trl/                        # TRL-based trainers and modules
+│   ├── trainer/                #   PPO and distillation trainers
+│   ├── modules/                #   Actor-critic network modules
+│   ├── callbacks/              #   Training callbacks
+│   └── utils/                  #   Training utilities
+├── agents/modules/             # Neural network building blocks
+├── simulator/isaacsim/         # Isaac Sim interface
+├── data/                       # Task data (robot assets, scenarios)
+└── utils/                      # General utilities
+```
+
+## License
+
+This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE) file for details.
+
+## Copyright & Attribution
+
+Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This project includes third-party open-source software. Please refer to individual source files or `THIRD-PARTY-NOTICES.md` for specific licenses and copyright headers.
+
+## Citation
+
+If you find this work useful, please cite:
+
+```bibtex
+@article{he2025viral,
+    title={VIRAL: Visual Sim-to-Real at Scale for Humanoid Loco-Manipulation},
+    author={He, Tairan and Wang, Zi and Xue, Haoru and Ben, Qingwei and Luo, Zhengyi and Xiao, Wenli and Yuan, Ye and Da, Xingye and Castañeda, Fernando and Sastry, Shankar and Liu, Changliu and Shi, Guanya and Fan, Linxi and Zhu, Yuke},
+    journal={arXiv preprint arXiv:2511.15200},
+    year={2025}
+}
+
+@article{xue2025opening,
+  title={Opening the Sim-to-Real Door for Humanoid Pixel-to-Action Policy Transfer},
+  author={Xue, Haoru and He, Tairan and Wang, Zi and Ben, Qingwei and Xiao, Wenli and Luo, Zhengyi and Da, Xingye and Casta{\~n}eda, Fernando and Shi, Guanya and Sastry, Shankar and others},
+  journal={arXiv preprint arXiv:2512.01061},
+  year={2025}
+}
+}
+```
