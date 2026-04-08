@@ -177,11 +177,20 @@ teacher_actor_path: logs_rl/<your_teacher_experiment>/model_step_XXXXXX.pt
 2. Launch training:
 
 ```bash
-HYDRA_FULL_ERROR=1 accelerate launch --num_processes 1 \@article{xue2025openingsimtorealdoorhumanoid,
-  title={Opening the Sim-to-Real Door for Humanoid Pixel-to-Action Policy Transfer},
-  author={Haoru Xue and Tairan He and Zi Wang and Qingwei Ben and Wenli Xiao and Zhengyi Luo and Xingye Da and Fernando Castañeda and Guanya Shi and Shankar Sastry and Linxi "Jim" Fan and Yuke Zhu},
-  journal={https://arxiv.org/abs/2512.01061},
-  year={2025},
+HYDRA_FULL_ERROR=1 accelerate launch --num_processes 1 \
+    groot/rl/train_agent_trl.py \
+    +exp=loco_manip/wsdpt_student_for_teacher_v8q8.002_resnet_rgb_delay \
+    num_envs=8 \
+    headless=True \
+    experiment_name=wsdpt_student \
+    project_name=wsdpt_student_debug
+```
+
+If you add `headless=False`, you can see the student policy running in Isaac Sim:
+
+<p align="center">
+  <img src="./docs/viral-student-gif.gif" width="60%"><br/>
+  <em>Student policy running in Isaac Sim</em>
 </p>
 
 ### Student Evaluation
@@ -227,6 +236,7 @@ python groot/rl/eval_agent_trl.py \
 ```
 
 The exported model is saved to `<experiment_dir>/exported/`.
+
 
 ## Project Structure
 
