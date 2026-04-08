@@ -9,7 +9,7 @@
       <h3>Visual Sim-to-Real at Scale for<br>Humanoid Loco-Manipulation</h3>
       <a href="https://arxiv.org/abs/2511.15200"><img src="https://img.shields.io/badge/arXiv-2511.15200-b31b1b.svg" alt="VIRAL Paper"></a>
       <a href="https://viral-humanoid.github.io/"><img src="https://img.shields.io/badge/Project-Page-blue.svg" alt="VIRAL Project Page"></a>
-      <a href="https://gitlab-master.nvidia.com/ziwang/VIRAL/-/tree/main"><img src="https://img.shields.io/badge/Code-viral-lightgrey.svg" alt="VIRAL Code"></a>
+      <a href="https://github.com/NVlabs/GR00T-VisualSim2Real/tree/main"><img src="https://img.shields.io/badge/Code-viral-lightgrey.svg" alt="VIRAL Code"></a>
       <br><br>
       <img src="./docs/viral-for-preview-v2-576P-ezgif.com-video-to-gif-converter.gif" width="100%">
     </td>
@@ -17,7 +17,7 @@
       <h3>Opening the Sim-to-Real Door for<br>Humanoid Pixel-to-Action Policy Transfer</h3>
       <a href="https://arxiv.org/abs/2512.01061"><img src="https://img.shields.io/badge/arXiv-2511.15200-b31b1b.svg" alt="DoorMan Paper"></a>
       <a href="https://doorman-humanoid.github.io/"><img src="https://img.shields.io/badge/Project-Page-blue.svg" alt="DoorMan Project Page"></a>
-      <a href="https://gitlab-master.nvidia.com/ziwang/VIRAL/-/tree/doorman"><img src="https://img.shields.io/badge/Code-doorman-lightgrey.svg" alt="DoorMan Code"></a>
+      <a href="https://github.com/NVlabs/GR00T-VisualSim2Real/tree/doorman"><img src="https://img.shields.io/badge/Code-doorman-lightgrey.svg" alt="DoorMan Code"></a>
       <br><br>
       <img src="./docs/doorman-teaser-576P-ezgif.com-video-to-gif-converter.gif" width="100%">
     </td>
@@ -35,9 +35,9 @@ This repository contains the application code for **VIRAL** (Visual Sim-to-Real 
 This repository contains the official code for:
 
 - **VIRAL**: *Visual Sim-to-Real at Scale for Humanoid Loco-Manipulation*
-  &nbsp; [Paper](https://arxiv.org/abs/2511.15200) &nbsp;|&nbsp; [Project](https://viral-humanoid.github.io/) &nbsp;|&nbsp; [Code](https://gitlab-master.nvidia.com/ziwang/VIRAL/-/tree/main)
+  &nbsp; [Paper](https://arxiv.org/abs/2511.15200) &nbsp;|&nbsp; [Project](https://viral-humanoid.github.io/) &nbsp;|&nbsp; [Code](https://github.com/NVlabs/GR00T-VisualSim2Real/tree/main)
 - **DoorMan**: *Opening the Sim-to-Real Door for Humanoid Pixel-to-Action Policy Transfer*
-  &nbsp; [Paper](https://arxiv.org/abs/2512.01061) &nbsp;|&nbsp; [Project](https://doorman-humanoid.github.io/) &nbsp;|&nbsp; [Code](https://gitlab-master.nvidia.com/ziwang/VIRAL/-/tree/doorman)
+  &nbsp; [Paper](https://arxiv.org/abs/2512.01061) &nbsp;|&nbsp; [Project](https://doorman-humanoid.github.io/) &nbsp;|&nbsp; [Code](https://github.com/NVlabs/GR00T-VisualSim2Real/tree/doorman)
 
 ---
 
