@@ -6,20 +6,24 @@
 <table>
   <tr>
     <td align="center" valign="top" width="50%">
-      <h3>Visual Sim-to-Real at Scale for<br>Humanoid Loco-Manipulation</h3>
+      <h3>VIRAL</h3>
+      <em>Visual Sim-to-Real at Scale for<br>Humanoid Loco-Manipulation</em>
+      <br>
       <a href="https://arxiv.org/abs/2511.15200"><img src="https://img.shields.io/badge/arXiv-2511.15200-b31b1b.svg" alt="VIRAL Paper"></a>
       <a href="https://viral-humanoid.github.io/"><img src="https://img.shields.io/badge/Project-Page-blue.svg" alt="VIRAL Project Page"></a>
       <a href="https://github.com/NVlabs/GR00T-VisualSim2Real/tree/main"><img src="https://img.shields.io/badge/Code-viral-lightgrey.svg" alt="VIRAL Code"></a>
       <br><br>
-      <img src="./docs/viral-for-preview-v2-576P-ezgif.com-video-to-gif-converter.gif" width="100%">
+      <img src="./media/viral-teaser.gif" width="100%" alt="VIRAL demo">
     </td>
     <td align="center" valign="top" width="50%">
-      <h3>Opening the Sim-to-Real Door for<br>Humanoid Pixel-to-Action Policy Transfer</h3>
-      <a href="https://arxiv.org/abs/2512.01061"><img src="https://img.shields.io/badge/arXiv-2511.15200-b31b1b.svg" alt="DoorMan Paper"></a>
+      <h3>DoorMan</h3>
+      <em>Opening the Sim-to-Real Door for<br>Humanoid Pixel-to-Action Policy Transfer</em>
+      <br>
+      <a href="https://arxiv.org/abs/2512.01061"><img src="https://img.shields.io/badge/arXiv-2512.01061-b31b1b.svg" alt="DoorMan Paper"></a>
       <a href="https://doorman-humanoid.github.io/"><img src="https://img.shields.io/badge/Project-Page-blue.svg" alt="DoorMan Project Page"></a>
       <a href="https://github.com/NVlabs/GR00T-VisualSim2Real/tree/doorman"><img src="https://img.shields.io/badge/Code-doorman-lightgrey.svg" alt="DoorMan Code"></a>
       <br><br>
-      <img src="./docs/doorman-teaser-576P-ezgif.com-video-to-gif-converter.gif" width="100%">
+      <img src="./media/doorman-teaser.gif" width="100%" alt="DoorMan demo">
     </td>
   </tr>
 </table>
@@ -125,7 +129,7 @@ pip install numpy==1.26.0   # pip may upgrade it; pin again
 ### 5. Verify installation
 
 ```bash
-python -c "from groot.rl.envs.base_task.base_task import BaseTask; print('OK')"
+python -c "from gr00t.rl.envs.base_task.base_task import BaseTask; print('OK')"
 ```
 
 ## Usage
@@ -136,7 +140,7 @@ Train a teacher policy using privileged state observations:
 
 ```bash
 HYDRA_FULL_ERROR=1 accelerate launch --num_processes 1 \
-    groot/rl/train_agent_trl.py \
+    gr00t/rl/train_agent_trl.py \
     +exp=loco_manip/walk_stand_place_grasp_turn_homie \
     num_envs=48 \
     project_name=wsdpt_teacher
@@ -145,7 +149,7 @@ HYDRA_FULL_ERROR=1 accelerate launch --num_processes 1 \
 > **Tip:** Add `headless=False` to open the Isaac Sim GUI and watch training live.
 
 <p align="center">
-  <img src="./docs/viral-teacher-gif.gif" width="60%"><br/>
+  <img src="./media/viral-teacher-gif.gif" width="60%"><br/>
   <em>Teacher policy running in Isaac Sim</em>
 </p>
 
@@ -159,7 +163,7 @@ HYDRA_FULL_ERROR=1 accelerate launch --num_processes 1 \
 ### Teacher Evaluation
 
 ```bash
-python groot/rl/eval_agent_trl.py \
+python gr00t/rl/eval_agent_trl.py \
     +checkpoint=logs_rl/<experiment_dir>/model_step_044500.pt
 ```
 
@@ -178,7 +182,7 @@ teacher_actor_path: logs_rl/<your_teacher_experiment>/model_step_XXXXXX.pt
 
 ```bash
 HYDRA_FULL_ERROR=1 accelerate launch --num_processes 1 \
-    groot/rl/train_agent_trl.py \
+    gr00t/rl/train_agent_trl.py \
     +exp=loco_manip/wsdpt_student_for_teacher_v8q8.002_resnet_rgb_delay \
     num_envs=8 \
     headless=True \
@@ -189,20 +193,20 @@ HYDRA_FULL_ERROR=1 accelerate launch --num_processes 1 \
 If you add `headless=False`, you can see the student policy running in Isaac Sim:
 
 <p align="center">
-  <img src="./docs/viral-student-gif.gif" width="60%"><br/>
+  <img src="./media/viral-student-gif.gif" width="60%"><br/>
   <em>Student policy running in Isaac Sim</em>
 </p>
 
 ### Student Evaluation
 
 ```bash
-python groot/rl/eval_agent_trl.py \
+python gr00t/rl/eval_agent_trl.py \
     +checkpoint=logs_rl/<student_experiment_dir>/model_step_XXXXXX.pt
 ```
 
 ## Configuration
 
-This project uses [Hydra](https://hydra.cc/) for configuration. Configs are composed from YAML files in `groot/rl/config/`. Override any value from the command line:
+This project uses [Hydra](https://hydra.cc/) for configuration. Configs are composed from YAML files in `gr00t/rl/config/`. Override any value from the command line:
 
 ```bash
 # Number of environments
@@ -230,7 +234,7 @@ Checkpoints are saved to `logs_rl/<experiment_name>/` at intervals controlled by
 During evaluation with `num_envs=1`, the policy is automatically exported as ONNX for deployment:
 
 ```bash
-python groot/rl/eval_agent_trl.py \
+python gr00t/rl/eval_agent_trl.py \
     +checkpoint=<path_to_checkpoint.pt> \
     num_envs=1
 ```
@@ -241,7 +245,7 @@ The exported model is saved to `<experiment_dir>/exported/`.
 ## Project Structure
 
 ```
-groot/rl/
+gr00t/rl/
 ├── train_agent_trl.py          # Training entry point (teacher & student)
 ├── eval_agent_trl.py           # Evaluation entry point
 ├── config/                     # Hydra YAML configs
@@ -277,25 +281,24 @@ This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE
 
 Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-This project includes third-party open-source software. Please refer to individual source files or `THIRD-PARTY-NOTICES.md` for specific licenses and copyright headers.
+This project includes third-party open-source software. Please refer to individual source files for specific licenses and copyright headers.
 
 ## Citation
 
 If you find this work useful, please cite:
 
 ```bibtex
-@article{he2025viral,
+@inproceedings{he2025viral,
     title={VIRAL: Visual Sim-to-Real at Scale for Humanoid Loco-Manipulation},
     author={He, Tairan and Wang, Zi and Xue, Haoru and Ben, Qingwei and Luo, Zhengyi and Xiao, Wenli and Yuan, Ye and Da, Xingye and Castañeda, Fernando and Sastry, Shankar and Liu, Changliu and Shi, Guanya and Fan, Linxi and Zhu, Yuke},
-    journal={arXiv preprint arXiv:2511.15200},
-    year={2025}
+    booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+    year={2026}
 }
 
-@article{xue2025opening,
+@inproceedings{xue2025opening,
   title={Opening the Sim-to-Real Door for Humanoid Pixel-to-Action Policy Transfer},
   author={Xue, Haoru and He, Tairan and Wang, Zi and Ben, Qingwei and Xiao, Wenli and Luo, Zhengyi and Da, Xingye and Casta{\~n}eda, Fernando and Shi, Guanya and Sastry, Shankar and others},
-  journal={arXiv preprint arXiv:2512.01061},
-  year={2025}
-}
+  booktitle={Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year={2026}
 }
 ```

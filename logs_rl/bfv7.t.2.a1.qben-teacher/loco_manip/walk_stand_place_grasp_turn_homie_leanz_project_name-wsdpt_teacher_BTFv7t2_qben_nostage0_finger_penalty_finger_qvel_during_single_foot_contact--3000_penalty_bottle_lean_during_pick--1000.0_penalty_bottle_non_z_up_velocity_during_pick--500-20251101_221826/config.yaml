@@ -111,10 +111,10 @@ algo:
     max_noise_std: 1.0
     clamp_noise_std: true
     actor:
-      _target_: groot.rl.trl.modules.actor_critic_modules.Actor
+      _target_: gr00t.rl.trl.modules.actor_critic_modules.Actor
       running_mean_std: true
       backbone:
-        _target_: groot.rl.agents.modules.modules.BaseModule
+        _target_: gr00t.rl.agents.modules.modules.BaseModule
         process_output_dim: true
         module_config_dict:
           input_dim:
@@ -129,10 +129,10 @@ algo:
             - 128
             activation: SiLU
     critic:
-      _target_: groot.rl.trl.modules.actor_critic_modules.Critic
+      _target_: gr00t.rl.trl.modules.actor_critic_modules.Critic
       running_mean_std: true
       backbone:
-        _target_: groot.rl.agents.modules.modules.BaseModule
+        _target_: gr00t.rl.agents.modules.modules.BaseModule
         process_output_dim: true
         module_config_dict:
           type: MLP
@@ -147,10 +147,10 @@ algo:
             - 256
             - 128
             activation: SiLU
-  _target_: groot.rl.agents.ppo.ppo.PPO
+  _target_: gr00t.rl.agents.ppo.ppo.PPO
   _recursive_: false
 env:
-  _target_: groot.rl.envs.loco_manip.walk_stand_place_grasp_turn_homie.WalkStandPlaceGraspTurnHomie
+  _target_: gr00t.rl.envs.loco_manip.walk_stand_place_grasp_turn_homie.WalkStandPlaceGraspTurnHomie
   _recursive_: false
   config:
     experiment_name: ${experiment_name}
@@ -350,7 +350,7 @@ env:
       reset_from_teleop_curriculum: false
       motion_files: null
       use_motion_file_dir: true
-      motion_file_dir: groot/rl/data/motions/g1_wsdpt/33demos_675_775
+      motion_file_dir: gr00t/rl/data/motions/g1_wsdpt/33demos_675_775
       device: ''
       num_per_sample: 10
       sample_interval_s: 0.1
@@ -508,7 +508,7 @@ robot:
     urdf_file: g1/${robot.asset.robot_type}.urdf
     usd_file: g1/${robot.asset.robot_type}.usd
     xml_file: g1/${robot.asset.robot_type}.xml
-    asset_root: groot/rl/data/robots
+    asset_root: gr00t/rl/data/robots
     self_collisions: 0
     filter_ints: null
   homie_dof_obs_size: 29
@@ -1304,21 +1304,21 @@ terrain:
   slope_treshold: 0.75
 callbacks:
   model_save:
-    _target_: groot.rl.trl.callbacks.model_save_callback.ModelSaveCallback
+    _target_: gr00t.rl.trl.callbacks.model_save_callback.ModelSaveCallback
     save_dir: ${experiment_dir}
     save_frequency: 100
   autoresume:
-    _target_: groot.rl.trl.callbacks.autoresume_callback.AutoResumeCallback
+    _target_: gr00t.rl.trl.callbacks.autoresume_callback.AutoResumeCallback
     save_dir: ${experiment_dir}
     every_n_steps: 10
   wandb:
-    _target_: groot.rl.trl.callbacks.wandb_callback.WandbCallback
+    _target_: gr00t.rl.trl.callbacks.wandb_callback.WandbCallback
   read_eval_locomanip:
-    _target_: groot.rl.trl.callbacks.read_eval_locomanip_callback.ReadEvalLocomanipCallback
+    _target_: gr00t.rl.trl.callbacks.read_eval_locomanip_callback.ReadEvalLocomanipCallback
     eval_dir: ${experiment_dir}/eval
     check_interval: 1
 trainer:
-  _target_: groot.rl.trl.trainer.ppo_trainer_homie_api.TRLPPOTrainer
+  _target_: gr00t.rl.trl.trainer.ppo_trainer_homie_api.TRLPPOTrainer
 wandb:
   wandb_project: null
   wandb_tags: online
@@ -1327,7 +1327,7 @@ wandb:
   wandb_entity: null
   wandb_dir: ${experiment_dir}/.wandb
 simulator:
-  _target_: groot.rl.simulator.isaacsim.isaacsim.IsaacSim
+  _target_: gr00t.rl.simulator.isaacsim.isaacsim.IsaacSim
   _recursive_: false
   config:
     name: isaacsim

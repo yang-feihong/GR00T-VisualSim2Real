@@ -1,0 +1,4 @@
+read_eval_locomanip:
+  _target_: gr00t.rl.trl.callbacks.read_eval_locomanip_callback.ReadEvalLocomanipCallback
+  eval_dir: ${experiment_dir}/eval
+  check_interval: 1

@@ -208,7 +208,7 @@ episode_data/
 # redis related
 dump.rdb
 download_model.py
-groot/logs_rl/
+gr00t/logs_rl/
 # *.png  # tracked via LFS for VIRAL
 
 

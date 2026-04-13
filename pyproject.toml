@@ -3,7 +3,7 @@ requires = ["setuptools>=67", "wheel", "pip"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "groot"
+name = "gr00t"
 dynamic = ["version"]
 readme = "README.md"
 classifiers = [
@@ -57,7 +57,7 @@ dev = [
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["groot*"]
+include = ["gr00t*"]
 exclude = [
     "*.tests",
     "*.tests.*",
@@ -69,10 +69,10 @@ exclude = [
 include-package-data = true
 
 [tool.setuptools.package-data]
-groot = ["py.typed", "**/*.json", "**/*.yaml"]
+gr00t = ["py.typed", "**/*.json", "**/*.yaml"]
 
 [tool.setuptools.dynamic]
-version = {attr = "groot.version.VERSION"}
+version = {attr = "gr00t.version.VERSION"}
 
 [tool.black]
 line-length = 100

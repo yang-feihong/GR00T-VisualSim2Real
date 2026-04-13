@@ -1,0 +1,144 @@
+# @package _global_
+
+defaults:
+  - /algo: ppo
+  - /env: walk_stand_place_grasp_turn_homie
+  - /simulator: isaacsim
+  - /domain_rand: wsdpt
+  - /rewards: loco_manip/reward_wsdpt_butterflyV8_q_2_teacher
+  - /robot: g1/g1_43dof
+  - /terrain: terrain_locomotion_plane
+  - /obs: loco_manip/obs_walk_stand_place_grasp_turn_homie 
+  - /opt: wandb
+  - override /trainer: trl_homie_api
+
+exp_base: ${hydra:runtime.choices.exp}
+exp_var: walk_stand_place_grasp_turn_homie
+experiment_name: ${exp_base}_${exp_var}
+experiment_dir: ${base_dir}/${project_name}/${experiment_name}-${timestamp}
+resume: True
+checkpoint: logs_rl/bfv7.t.2.a1.qben-teacher/loco_manip/walk_stand_place_grasp_turn_homie_leanz_project_name-wsdpt_teacher_BTFv7t2_qben_nostage0_finger_penalty_finger_qvel_during_single_foot_contact--3000_penalty_bottle_lean_during_pick--1000.0_penalty_bottle_non_z_up_velocity_during_pick--500-20251101_221826/model_step_043900.pt
+# checkpoint: TRL_G1_Track/loco_manip/wsdpt_BFv3_teacher_150demos/loco_manip/walk_stand_place_grasp_turn_homie_tairanRESUME_test_project_name-wsdpt_BFv3_teacher_150demos_penalty_finger_qvel_during_single_foot_contact--150_penalty_arm_qvel_during_single_foot_contact--120-20251028_031847/model_step_020800.pt
+
+
+num_envs: 2048
+# project_name: teleop_res
+project_name: teleop_wspgt_homie_qben
+# experiment_name: teleop_res_2048_8gpu_4node
+
+callbacks:
+  model_save:
+    save_frequency: 100
+  read_eval_locomanip:
+    _target_: gr00t.rl.trl.callbacks.read_eval_locomanip_callback.ReadEvalLocomanipCallback
+    eval_dir: ${experiment_dir}/eval
+    check_interval: 1
+
+
+algo:
+  trl:
+    num_total_batches: 1000000
+  config:
+    entropy_coef: 0.01
+    use_new_actor_critic: True
+    num_steps_per_env: 24
+    num_mini_batches: 4
+    use_padding_mask: False
+    ppo_shuffle_every_epoch: True
+    sync_advantage_normalization: True
+    actor_learning_rate: 2e-5
+    critic_learning_rate: 2e-5
+    homie_walk_model_path: ./models/model_walk.pt
+    homie_stand_model_path: ./models/model_stand.pt
+    opt_homie: False
+    homie_switch_threshold: 0.5
+    init_noise_std: 0.5
+    max_noise_std: 1.0
+    clamp_noise_std: True
+    gamma: 0.998
+    lam: 0.97
+    init_at_random_ep_len: True
+
+    actor:
+      _target_: gr00t.rl.trl.modules.actor_critic_modules.Actor
+      running_mean_std: True
+      backbone:
+        _target_: gr00t.rl.agents.modules.modules.BaseModule
+        process_output_dim: True
+        module_config_dict:
+          input_dim: [actor_obs]
+          output_dim: [-1] # for homie module setting, should be -1
+          layer_config:
+            type: MLP
+            hidden_dims: [512, 256, 128]
+            activation: SiLU
+    critic:
+      _target_: gr00t.rl.trl.modules.actor_critic_modules.Critic
+      running_mean_std: True
+      backbone:
+        _target_: gr00t.rl.agents.modules.modules.BaseModule
+        process_output_dim: True
+        module_config_dict:
+          type: MLP
+          input_dim: [critic_obs]
+          output_dim: [1]
+          layer_config:
+            type: MLP
+            hidden_dims: [512, 256, 128]
+            activation: SiLU
+            
+simulator:
+  config:
+    scene:
+      replicate_physics: False
+      env_spacing: 10.0
+    sim:
+      physx:
+        num_position_iterations: 8
+        num_velocity_iterations: 4
+
+robot:
+  terminate_after_contacts_on : ["knee"]
+  asset:
+    self_collisions: 0
+  use_primitive: True
+  finger_primitive:
+    primitive_action_map:
+      left:
+        pos_1: [
+          -0.8976, -0.8976, -0.0, # index_0, middle_0, thumb_0
+          -0.99731429, -0.99731429, 0.5984, # index_1, middle_1, thumb_1
+          0.99731429, # thumb_2
+        ]
+        pos_0: [
+          -0.0, -0.0, -0.0,
+          -0.0, -0.0, -0.0,
+          -0.0
+        ]
+        mode: "discrete"
+      right:
+        # used in stand_grasp
+        # pos_0: [
+        #   0.0, -0.5984, -0.99731429, # thumb_0, 1, 2
+        #   0.8976, 0.99731429,   # middle_0, 1
+        #   0.8976, 0.99731429   # index_0, 1
+        # ]
+        pos_1: [
+          0.8976, 0.8976, 0.0, # index_0, middle_0, thumb_0
+          0.99731429, 0.99731429, -0.5984, # index_1, middle_1, thumb_1
+          -0.99731429, # thumb_2
+        ]
+        pos_0: [
+          0.0, 0.0, 0.0,
+          0.0, 0.0, 0.0,
+          0.0
+        ]
+        pos_init: [
+          0.5, 0.5, 0.0,
+          0.5, 0.5, -0.2,
+          -0.2
+        ]
+        mode: "discrete"
+
+  actions_dim: 31 # 15 + 14 + 2
+  check_action_dim: False
