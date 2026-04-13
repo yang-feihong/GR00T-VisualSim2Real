@@ -11,15 +11,15 @@
       <a href="https://viral-humanoid.github.io/"><img src="https://img.shields.io/badge/Project-Page-blue.svg" alt="VIRAL Project Page"></a>
       <a href="https://github.com/NVlabs/GR00T-VisualSim2Real/tree/main"><img src="https://img.shields.io/badge/Code-viral-lightgrey.svg" alt="VIRAL Code"></a>
       <br><br>
-      <img src="./docs/viral-for-preview-v2-576P-ezgif.com-video-to-gif-converter.gif" width="100%">
+      <img src="./media/viral-teaser.gif" width="100%">
     </td>
     <td align="center" valign="top" width="50%">
       <h3>Opening the Sim-to-Real Door for<br>Humanoid Pixel-to-Action Policy Transfer</h3>
-      <a href="https://arxiv.org/abs/2512.01061"><img src="https://img.shields.io/badge/arXiv-2511.15200-b31b1b.svg" alt="DoorMan Paper"></a>
+      <a href="https://arxiv.org/abs/2512.01061"><img src="https://img.shields.io/badge/arXiv-2512.01061-b31b1b.svg" alt="DoorMan Paper"></a>
       <a href="https://doorman-humanoid.github.io/"><img src="https://img.shields.io/badge/Project-Page-blue.svg" alt="DoorMan Project Page"></a>
       <a href="https://github.com/NVlabs/GR00T-VisualSim2Real/tree/doorman"><img src="https://img.shields.io/badge/Code-doorman-lightgrey.svg" alt="DoorMan Code"></a>
       <br><br>
-      <img src="./docs/doorman-teaser-576P-ezgif.com-video-to-gif-converter.gif" width="100%">
+      <img src="./media/doorman-teaser.gif" width="100%">
     </td>
   </tr>
 </table>
@@ -145,13 +145,13 @@ The door task uses HOMIE locomotion models for lower-body control. Place the fol
 ### 7. Verify installation
 
 ```bash
-python -c "from groot.rl.envs.door.door_open_homie import DoorPregrasp; print('OK')"
+python -c "from gr00t.rl.envs.door.door_open_homie import DoorPregrasp; print('OK')"
 ```
 
 ## Project Structure
 
 ```
-groot/rl/
+gr00t/rl/
 ├── train_agent_trl.py          # Training entry point (teacher & student)
 ├── eval_agent_trl.py           # Evaluation entry point
 ├── config/                     # Hydra YAML configs
@@ -187,10 +187,10 @@ groot/rl/
 
 ### Teacher Training (PPO + LSTM)
 
-Train a teacher policy using privileged state observations with LSTM memory:
+Train a teacher policy using privileged state observations with LSTM memory. The experiment config is at [`gr00t/gr00t/rl/config/exp/wbmanip/door_open_homie_lstm.yaml`](gr00t/gr00t/rl/config/exp/wbmanip/door_open_homie_lstm.yaml).
 
 ```bash
-python groot/rl/train_agent_trl.py \
+python gr00t/rl/train_agent_trl.py \
     +exp=wbmanip/door_open_homie_lstm \
     ++num_envs=1024 \
     ++algo.config.entropy_coef=0.001 \
@@ -209,22 +209,22 @@ Key arguments:
 Evaluate a trained teacher checkpoint:
 
 ```bash
-python groot/rl/eval_agent_trl.py \
+python gr00t/rl/eval_agent_trl.py \
     +checkpoint=<path_to_checkpoint.pt>
 ```
 
 For example:
 ```bash
-python groot/rl/eval_agent_trl.py \
+python gr00t/rl/eval_agent_trl.py \
     +checkpoint=logs_rl/g1_open_door_homie/wbmanip/door_open_homie_lstm-20250101_120000/model_step_020000.pt
 ```
 
 ### Student Training (DAgger + ResNet18 + LSTM)
 
-Train a vision-based student policy by distilling from a trained teacher:
+Train a vision-based student policy by distilling from a trained teacher. The experiment config is at [`gr00t/gr00t/rl/config/exp/wbmanip/door_open_homie_dagger-lstm.yaml`](gr00t/gr00t/rl/config/exp/wbmanip/door_open_homie_dagger-lstm.yaml).
 
 ```bash
-python groot/rl/train_agent_trl.py \
+python gr00t/rl/train_agent_trl.py \
     +exp=wbmanip/door_open_homie_dagger-lstm \
     ++num_envs=64 \
     ++algo.config.num_steps_per_env=32 \
@@ -252,13 +252,13 @@ Key student training arguments:
 ### Student Evaluation
 
 ```bash
-python groot/rl/eval_agent_trl.py \
+python gr00t/rl/eval_agent_trl.py \
     +checkpoint=logs_rl/<student_experiment_dir>/model_step_XXXXXX.pt
 ```
 
 ## Configuration
 
-This project uses [Hydra](https://hydra.cc/) for configuration. Configs are composed from YAML files in `groot/rl/config/`. Override any config value from the command line with `++`:
+This project uses [Hydra](https://hydra.cc/) for configuration. Configs are composed from YAML files in `gr00t/rl/config/`. Override any config value from the command line with `++`:
 
 ```bash
 # Override number of environments
@@ -286,7 +286,7 @@ Checkpoints are saved to `logs_rl/<project_name>/<experiment_name>/` with period
 During evaluation with `num_envs=1`, the policy can be exported as ONNX for deployment:
 
 ```bash
-python groot/rl/eval_agent_trl.py \
+python gr00t/rl/eval_agent_trl.py \
     +checkpoint=<path_to_checkpoint.pt> \
     num_envs=1
 ```
@@ -299,4 +299,4 @@ This project is licensed under the Apache License 2.0. See the [LICENSE](LICENSE
 
 Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-This project includes third-party open-source software. Please refer to individual source files or `THIRD-PARTY-NOTICES.md` for specific licenses and copyright headers.
+This project includes third-party open-source software. Please refer to individual source files for specific licenses and copyright headers.
