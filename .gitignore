@@ -216,3 +216,4 @@ gr00t/logs_rl/
 **/*.pyc
 obs_sweeping/*
 DINOv3_models/*
+data/door_assets/*

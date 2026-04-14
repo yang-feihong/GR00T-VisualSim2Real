@@ -183,6 +183,24 @@ gr00t/rl/
 └── utils/                      # General utilities
 ```
 
+## Door Asset Generation
+
+During training, door assets are procedurally generated on the fly. You can also generate them **offline** — see [gr00t/rl/scripts/README.md](gr00t/rl/scripts/README.md) for full documentation.
+
+<p align="center">
+  <img src="./media/door_assets.gif" width="90%">
+</p>
+
+```bash
+# Quick start: generate 100 doors matching training config
+python gr00t/rl/scripts/generate_door_assets.py \
+    --num_doors 100 --output_dir data/door_assets \
+    --build_latch --add_floors --randomize_material --seed 42
+
+# Generate 1000 doors with diverse configurations
+bash gr00t/rl/scripts/generate_1000_doors.sh
+```
+
 ## Usage
 
 ### Teacher Training (PPO + LSTM)
