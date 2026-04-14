@@ -6,24 +6,20 @@
 <table>
   <tr>
     <td align="center" valign="top" width="50%">
-      <h3>VIRAL</h3>
-      <em>Visual Sim-to-Real at Scale for<br>Humanoid Loco-Manipulation</em>
-      <br>
+      <p><b>VIRAL</b><br><br><b>Visual Sim-to-Real at Scale for<br>Humanoid Loco-Manipulation</b></p>
       <a href="https://arxiv.org/abs/2511.15200"><img src="https://img.shields.io/badge/arXiv-2511.15200-b31b1b.svg" alt="VIRAL Paper"></a>
       <a href="https://viral-humanoid.github.io/"><img src="https://img.shields.io/badge/Project-Page-blue.svg" alt="VIRAL Project Page"></a>
       <a href="https://github.com/NVlabs/GR00T-VisualSim2Real/tree/main"><img src="https://img.shields.io/badge/Code-viral-lightgrey.svg" alt="VIRAL Code"></a>
       <br><br>
-      <img src="./media/viral-teaser.gif" width="100%" alt="VIRAL demo">
+      <img src="./media/viral-teaser.gif" width="100%">
     </td>
     <td align="center" valign="top" width="50%">
-      <h3>DoorMan</h3>
-      <em>Opening the Sim-to-Real Door for<br>Humanoid Pixel-to-Action Policy Transfer</em>
-      <br>
+      <p><b>DoorMan</b><br><br><b>Opening the Sim-to-Real Door for<br>Humanoid Pixel-to-Action Policy Transfer</b></p>
       <a href="https://arxiv.org/abs/2512.01061"><img src="https://img.shields.io/badge/arXiv-2512.01061-b31b1b.svg" alt="DoorMan Paper"></a>
       <a href="https://doorman-humanoid.github.io/"><img src="https://img.shields.io/badge/Project-Page-blue.svg" alt="DoorMan Project Page"></a>
       <a href="https://github.com/NVlabs/GR00T-VisualSim2Real/tree/doorman"><img src="https://img.shields.io/badge/Code-doorman-lightgrey.svg" alt="DoorMan Code"></a>
       <br><br>
-      <img src="./media/doorman-teaser.gif" width="100%" alt="DoorMan demo">
+      <img src="./media/doorman-teaser.gif" width="100%">
     </td>
   </tr>
 </table>
@@ -58,18 +54,29 @@ Built on [Isaac Lab](https://isaac-sim.github.io/IsaacLab/) (Isaac Sim 5.1), [TR
 
 ## Table of Contents
 
-- [Prerequisites](#prerequisites)
-- [Installation](#installation)
-- [Usage](#usage)
-  - [Teacher Training (PPO)](#teacher-training-ppo)
-  - [Teacher Evaluation](#teacher-evaluation)
-  - [Student Training (DAgger)](#student-training-dagger-distillation)
-  - [Student Evaluation](#student-evaluation)
-- [Configuration](#configuration)
-- [ONNX Export](#onnx-export)
-- [Project Structure](#project-structure)
-- [License](#license)
-- [Citation](#citation)
+- [GR00T-VisualSim2Real](#gr00t-visualsim2real)
+  - [Overview](#overview)
+- [VIRAL: Visual Sim-to-Real at Scale for Humanoid Loco-Manipulation](#viral-visual-sim-to-real-at-scale-for-humanoid-loco-manipulation)
+  - [Table of Contents](#table-of-contents)
+  - [Prerequisites](#prerequisites)
+  - [Installation](#installation)
+    - [1. Create conda environment](#1-create-conda-environment)
+    - [2. Install Isaac Sim 5.1](#2-install-isaac-sim-51)
+    - [3. Install Isaac Lab](#3-install-isaac-lab)
+    - [4. Install this package](#4-install-this-package)
+    - [5. Verify installation](#5-verify-installation)
+  - [Usage](#usage)
+    - [Teacher Training (PPO)](#teacher-training-ppo)
+    - [Teacher Evaluation](#teacher-evaluation)
+    - [Student Training (DAgger Distillation)](#student-training-dagger-distillation)
+    - [Student Evaluation](#student-evaluation)
+  - [Configuration](#configuration)
+    - [Experiment Tracking](#experiment-tracking)
+  - [ONNX Export](#onnx-export)
+  - [Project Structure](#project-structure)
+  - [License](#license)
+  - [Copyright \& Attribution](#copyright--attribution)
+  - [Citation](#citation)
 
 ## Prerequisites
 
