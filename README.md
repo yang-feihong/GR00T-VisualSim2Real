@@ -181,7 +181,7 @@ Train a vision-based student policy by distilling from a trained teacher:
 1. Update the teacher checkpoint path in the experiment config:
 
 ```yaml
-# config/exp/loco_manip/wsdpt_student_for_teacher_v8q8.002_resnet_rgb_delay.yaml
+# gr00t/rl/config/exp/loco_manip/wsdpt_student_for_teacher_v8q8.002_resnet_rgb_delay.yaml
 teacher_actor_path: logs_rl/<your_teacher_experiment>/model_step_XXXXXX.pt
 ```
 
