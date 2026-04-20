@@ -205,7 +205,7 @@ bash gr00t/rl/scripts/generate_1000_doors.sh
 
 ### Teacher Training (PPO + LSTM)
 
-Train a teacher policy using privileged state observations with LSTM memory. The experiment config is at [`gr00t/gr00t/rl/config/exp/wbmanip/door_open_homie_lstm.yaml`](gr00t/gr00t/rl/config/exp/wbmanip/door_open_homie_lstm.yaml).
+Train a teacher policy using privileged state observations with LSTM memory. The experiment config is at [`gr00t/rl/config/exp/wbmanip/door_open_homie_lstm.yaml`](gr00t/rl/config/exp/wbmanip/door_open_homie_lstm.yaml).
 
 ```bash
 python gr00t/rl/train_agent_trl.py \
@@ -239,7 +239,7 @@ python gr00t/rl/eval_agent_trl.py \
 
 ### Student Training (DAgger + ResNet18 + LSTM)
 
-Train a vision-based student policy by distilling from a trained teacher. The experiment config is at [`gr00t/gr00t/rl/config/exp/wbmanip/door_open_homie_dagger-lstm.yaml`](gr00t/gr00t/rl/config/exp/wbmanip/door_open_homie_dagger-lstm.yaml).
+Train a vision-based student policy by distilling from a trained teacher. The experiment config is at [`gr00t/rl/config/exp/wbmanip/door_open_homie_dagger-lstm.yaml`](gr00t/rl/config/exp/wbmanip/door_open_homie_dagger-lstm.yaml).
 
 ```bash
 python gr00t/rl/train_agent_trl.py \
@@ -257,7 +257,7 @@ python gr00t/rl/train_agent_trl.py \
 **Important**: Before running student training, update the `teacher_actor_path` in the experiment config to point to your trained teacher checkpoint:
 
 ```yaml
-# In config/exp/wbmanip/door_open_homie_dagger-lstm.yaml
+# In gr00t/rl/config/exp/wbmanip/door_open_homie_dagger-lstm.yaml
 teacher_actor_path: logs_rl/<your_teacher_experiment>/model_step_XXXXXX.pt
 ```
 
