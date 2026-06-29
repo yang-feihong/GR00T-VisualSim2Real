@@ -1,0 +1,153 @@
+from __future__ import annotations
+
+import os
+import sys
+import argparse
+
+import torch
+
+_simulation_app = None
+
+_VIEWPORT_DISPLAY_FPS = 1 << 0
+_VIEWPORT_DISPLAY_RESOLUTION = 1 << 3
+_VIEWPORT_DISPLAY_MESH = 1 << 10
+_VIEWPORT_DISPLAY_DEV_MEM = 1 << 13
+_VIEWPORT_DISPLAY_HOST_MEM = 1 << 14
+_VIEWPORT_PERFORMANCE_HUD_OPTIONS = (
+    _VIEWPORT_DISPLAY_FPS
+    | _VIEWPORT_DISPLAY_RESOLUTION
+    | _VIEWPORT_DISPLAY_MESH
+    | _VIEWPORT_DISPLAY_DEV_MEM
+    | _VIEWPORT_DISPLAY_HOST_MEM
+)
+_RENDERER_MULTI_GPU_KIT_ARGS = (
+    "--/renderer/multiGpu/enabled=true",
+    "--/renderer/multiGPU/enabled=true",
+    "--/renderer/multiGpu/autoEnable=true",
+    "--/renderer/multiGPU/autoEnable=true",
+)
+
+
+def add_app_launcher_args(parser):
+    from isaaclab.app import AppLauncher
+
+    AppLauncher.add_app_launcher_args(parser)
+    parser.set_defaults(headless=True)
+    if "--no-headless" not in parser._option_string_actions:
+        parser.add_argument("--no-headless", dest="headless", action="store_false", default=argparse.SUPPRESS)
+
+
+def load_rgb_camera_specs(config_path):
+    if not config_path:
+        return None
+    from rgb_camera_debug import load_rgb_camera_config, rgb_camera_specs_from_config
+
+    return rgb_camera_specs_from_config(load_rgb_camera_config(config_path))
+
+
+def _enable_viewport_performance_hud(args):
+    if bool(args.headless):
+        return
+    args.display_options = _VIEWPORT_PERFORMANCE_HUD_OPTIONS
+
+
+def _enable_renderer_multi_gpu(args):
+    visible_gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
+    renderer_gpu_count = max(int(visible_gpu_count), 1)
+    device = str(args.device)
+    active_gpu = int(device.split(":")[-1]) if device.startswith("cuda:") else 0
+    args.multi_gpu = True
+    for setting_arg in _RENDERER_MULTI_GPU_KIT_ARGS:
+        if setting_arg not in sys.argv:
+            sys.argv.append(setting_arg)
+    for setting_arg in (
+        f"--/renderer/multiGpu/maxGpuCount={renderer_gpu_count}",
+        f"--/renderer/multiGPU/maxGpuCount={renderer_gpu_count}",
+        f"--/renderer/activeGpu={active_gpu}",
+    ):
+        if setting_arg not in sys.argv:
+            sys.argv.append(setting_arg)
+
+
+def _sync_headless_env(args):
+    os.environ["HEADLESS"] = "1" if bool(args.headless) else "0"
+
+
+def _show_viewport_performance_hud():
+    try:
+        import carb.settings
+
+        settings = carb.settings.get_settings()
+        settings.set("/persistent/app/viewport/displayOptions", _VIEWPORT_PERFORMANCE_HUD_OPTIONS)
+        settings.set("/app/viewport/displayOptions", _VIEWPORT_PERFORMANCE_HUD_OPTIONS)
+    except Exception as exc:
+        print(f"[viewer][warn] failed to set viewport display options: {exc}")
+
+
+def _disable_viewport_updates_in_headless(args):
+    if not bool(args.headless):
+        return
+
+    try:
+        from omni.kit.viewport.utility import get_active_viewport
+
+        viewport = get_active_viewport()
+        if viewport is not None:
+            viewport.updates_enabled = False
+    except Exception as exc:
+        print(f"[viewer][warn] failed to disable viewport updates in headless mode: {exc}")
+
+
+def _apply_renderer_multi_gpu_settings():
+    try:
+        import carb.settings
+
+        settings = carb.settings.get_settings()
+        visible_gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 1
+        renderer_gpu_count = max(int(visible_gpu_count), 1)
+        for setting_path in (
+            "/renderer/multiGpu/enabled",
+            "/renderer/multiGpu/autoEnable",
+            "/renderer/multiGPU/enabled",
+            "/renderer/multiGPU/autoEnable",
+        ):
+            settings.set(setting_path, True)
+        for setting_path in (
+            "/renderer/multiGpu/maxGpuCount",
+            "/renderer/multiGPU/maxGpuCount",
+        ):
+            settings.set(setting_path, renderer_gpu_count)
+        print(f"[renderer] requested multi-GPU rendering with maxGpuCount={renderer_gpu_count}")
+    except Exception as exc:
+        print(f"[renderer][warn] failed to enable renderer multi-GPU: {exc}")
+
+
+def _rgb_camera_config_has_enabled_cameras(config_path: str) -> bool:
+    try:
+        parsed = load_rgb_camera_specs(config_path)
+    except Exception:
+        return bool(config_path)
+    return bool(parsed and parsed["enabled"] and len(parsed["cameras"]) > 0)
+
+
+def launch_app(args):
+    global _simulation_app
+    if _simulation_app is None:
+        from isaaclab.app import AppLauncher
+
+        needs_cameras = (
+            _rgb_camera_config_has_enabled_cameras(args.rgb_camera_config)
+            or bool(args.record_video)
+            or bool(args.xr_publish_rgb_camera)
+        )
+        if needs_cameras and hasattr(args, "enable_cameras"):
+            args.enable_cameras = True
+        _sync_headless_env(args)
+        _enable_viewport_performance_hud(args)
+        _enable_renderer_multi_gpu(args)
+        _simulation_app = AppLauncher(args).app
+        _apply_renderer_multi_gpu_settings()
+        _disable_viewport_updates_in_headless(args)
+        if not bool(args.headless):
+            _show_viewport_performance_hud()
+    return _simulation_app
