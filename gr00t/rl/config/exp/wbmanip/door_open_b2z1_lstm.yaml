@@ -1,0 +1,93 @@
+# @package _global_
+
+defaults:
+  - /algo: ppo
+  - /env: door_open_b2z1
+  - /simulator: isaacsim
+  - /domain_rand: NO_domain_rand
+  - /rewards: wbmanip/reward_door_open_b2z1
+  - /robot: b2z1/b2z1
+  - /terrain: terrain_locomotion_plane
+  - /obs: wbmanip/door_open_b2z1
+  - /opt: wandb
+  - override /trainer: trl
+
+exp_base: ${hydra:runtime.choices.exp}
+exp_var: lstm
+experiment_name: ${exp_base}_${exp_var}
+experiment_dir: ${base_dir}/${project_name}/${experiment_name}-${timestamp}
+
+num_envs: 4096
+project_name: b2z1_open_door
+
+algo:
+  config:
+    entropy_coef: 0.01
+    use_new_actor_critic: True
+    num_steps_per_env: 64
+    num_learning_epochs: 5
+    num_mini_batches: 4
+    use_padding_mask: False
+    ppo_shuffle_every_epoch: True
+    sync_advantage_normalization: True
+    actor_learning_rate: 1.0e-4
+    critic_learning_rate: 1.0e-4
+    desired_kl: 0.005
+
+    init_noise_std: 0.8
+    max_noise_std: 0.8
+    clamp_noise_std: True
+    save_interval: 500
+
+    gamma: 0.9975
+    lam: 0.985
+
+    init_at_random_ep_len: True
+
+    actor:
+      _target_: gr00t.rl.trl.modules.actor_critic_modules_recurrent.RecurrentActor
+      running_mean_std: True
+      rnn_type: "lstm"
+      rnn_hidden_dim: 256
+      rnn_num_layers: 2
+      backbone:
+        _target_: gr00t.rl.agents.modules.modules.BaseModule
+        process_output_dim: True
+        module_config_dict:
+          input_dim: [actor_obs]
+          output_dim: [10]
+          layer_config:
+            type: MLP
+            hidden_dims: [512, 256, 128]
+            activation: SiLU
+    critic:
+      _target_: gr00t.rl.trl.modules.actor_critic_modules_recurrent.RecurrentCritic
+      running_mean_std: True
+      rnn_type: "lstm"
+      rnn_hidden_dim: 256
+      rnn_num_layers: 2
+      backbone:
+        _target_: gr00t.rl.agents.modules.modules.BaseModule
+        process_output_dim: True
+        module_config_dict:
+          type: MLP
+          input_dim: [critic_obs]
+          output_dim: [1]
+          layer_config:
+            type: MLP
+            hidden_dims: [512, 256, 128]
+            activation: SiLU
+
+simulator:
+  config:
+    scene:
+      replicate_physics: False
+      env_spacing: 20.0
+    sim:
+      physx:
+        num_position_iterations: 8
+        num_velocity_iterations: 4
+
+robot:
+  asset:
+    self_collisions: 1

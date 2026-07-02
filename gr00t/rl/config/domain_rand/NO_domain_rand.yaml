@@ -36,6 +36,7 @@ domain_rand:
   randomize_initial_dof_vel: false
   initial_dof_vel_range: [-0.5, 0.5]
   initial_dof_vel_distribution: "uniform"
+  randomize_initial_root_vel: false
 
   # DOF Position Randomization Curriculum (disabled by default)
   dof_pos_randomization_curriculum: false

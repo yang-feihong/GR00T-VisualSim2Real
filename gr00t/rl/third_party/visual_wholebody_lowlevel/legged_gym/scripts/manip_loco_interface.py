@@ -8,17 +8,15 @@ from pathlib import Path
 import torch
 
 LOW_LEVEL_ROOT = Path(__file__).resolve().parents[2]
-REPO_ROOT = LOW_LEVEL_ROOT.parent
-RSL_RL_ROOT = REPO_ROOT / "third_party" / "rsl_rl"
-for p in [str(LOW_LEVEL_ROOT), str(RSL_RL_ROOT)]:
+for p in [str(LOW_LEVEL_ROOT)]:
     if p in sys.path:
         sys.path.remove(p)
     sys.path.insert(0, p)
 
-from legged_gym.utils.helpers import build_common_arg_parser, build_env_cfg, format_env_vec, format_float_sequence, jit_policy_obs, load_jit_policy, load_policy_from_checkpoint
+from legged_gym.utils.helpers import build_common_arg_parser, build_env_cfg, format_env_vec, format_float_sequence, load_policy_from_checkpoint
 from legged_gym.utils.isaaclab_app import add_app_launcher_args, launch_app
 from legged_gym.utils.run_metadata import checkpoint_model_path
-from isaaclab_viewer import IsaacLabViewerController
+from legged_gym.scripts.isaaclab_viewer import IsaacLabViewerController
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -27,8 +25,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def load_policy(ckpt_path: str, device, stochastic=False):
-    return load_policy_from_checkpoint(ckpt_path, device, stochastic=stochastic)
+def load_policy(ckpt_path: str, device):
+    return load_policy_from_checkpoint(ckpt_path, device)
 
 
 class ManipLoco_Policy:
@@ -61,14 +59,7 @@ class ManipLoco_Policy:
         self.env.reset()
         self.obs = self.env.get_observations()
 
-        if self.args.use_jit:
-            self.policy = load_jit_policy(self.args, self.env.device)
-        else:
-            self.policy = load_policy(
-                str(checkpoint_model_path(self.args)),
-                self.env.device,
-                stochastic=self.args.stochastic,
-            )
+        self.policy = load_policy(str(checkpoint_model_path(self.args)), self.env.device)
 
         try:
             from rgb_camera_debug import SimRgbCameraManager
@@ -234,10 +225,7 @@ class ManipLoco_Policy:
         loop_start = time.perf_counter()
         policy_start = time.perf_counter()
         with torch.no_grad():
-            if self.args.use_jit:
-                actions = self.policy(jit_policy_obs(self.obs.detach(), self.env))
-            else:
-                actions = self.policy(self.obs.detach(), hist_encoding=True)
+            actions = self.policy(self.obs.detach(), hist_encoding=True)
         policy_dt = time.perf_counter() - policy_start
 
         env_step_start = time.perf_counter()

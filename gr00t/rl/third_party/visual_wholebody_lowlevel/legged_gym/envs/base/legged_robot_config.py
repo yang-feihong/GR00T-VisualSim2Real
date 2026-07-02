@@ -15,7 +15,7 @@ from isaaclab.actuators import ImplicitActuatorCfg
 
 
 _LOW_LEVEL_ROOT = Path(__file__).resolve().parents[3]
-_DEFAULT_B2Z1_URDF = _LOW_LEVEL_ROOT / "resources/robots/b2z1/urdf/b2z1_isaacsim_mesh_axis_fixed.urdf"
+_DEFAULT_B2Z1_URDF = _LOW_LEVEL_ROOT / "resources/robots/b2z1/urdf/b2z1.urdf"
 
 
 @configclass

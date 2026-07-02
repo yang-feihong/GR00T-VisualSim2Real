@@ -2,34 +2,22 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
-import os
-
 import numpy as np
-import omni.kit.commands
 from isaaclab.sim.utils import bind_visual_material
-from pxr import Sdf, Usd
-from typing_extensions import override
+from pxr import Usd
 
-from gr00t.rl.isaac_utils.playground.utils.usd_utils import (
-    get_custom_data_from_prim,
-    write_custom_data_to_prim,
-)
-
-MATERIAL_RANDOMIZATION_SCRIPT_PATH = os.path.join(
-    os.path.dirname(__file__), "material_randomization.py"
-)
+_DYNAMIC_MATERIAL_RANDOMIZERS = []
 
 
-def _get_behavior_script_base():
-    """Lazy import: omni.kit.scripting requires its extension to be enabled first."""
-    import omni.kit.app
+def _resolve_material_randomization_prim_paths(stage: Usd.Stage, prim_path: str) -> list[str]:
+    if stage.GetPrimAtPath(prim_path).IsValid():
+        return [prim_path]
 
-    ext_manager = omni.kit.app.get_app().get_extension_manager()
-    ext_manager.set_extension_enabled_immediate("omni.kit.scripting", True)
+    suffix = prim_path
+    if "/root/" in prim_path:
+        suffix = "/root/" + prim_path.split("/root/", 1)[1]
 
-    from omni.kit.scripting import BehaviorScript
-
-    return BehaviorScript
+    return [str(prim.GetPath()) for prim in stage.Traverse() if str(prim.GetPath()).endswith(suffix)]
 
 
 # Build the class lazily so that the module can be imported before SimulationApp init.
@@ -43,39 +31,7 @@ def get_material_randomization_class():
     if _MaterialRandomization is not None:
         return _MaterialRandomization
 
-    BehaviorScript = _get_behavior_script_base()
-
-    class MaterialRandomization(BehaviorScript):
-        @override
-        def on_init(self):
-            custom_data = get_custom_data_from_prim(self.stage, self.prim.GetPrim().GetPath())
-            self.randomization_interval = custom_data["randomizationInterval"]
-            self.randomization_material_list = custom_data["randomizationMaterialList"]
-            self.last_randomization_time = 0.0
-            self.randomization_interval_perturbation = np.random.uniform(
-                self.randomization_interval * -0.1, self.randomization_interval * 0.1
-            )
-
-        @override
-        def on_update(self, current_time: float, delta_time: float):
-            if (
-                current_time - self.last_randomization_time
-                < self.randomization_interval + self.randomization_interval_perturbation
-            ):
-                return
-
-            self.last_randomization_time = current_time
-            self.randomization_interval_perturbation = np.random.uniform(
-                self.randomization_interval * -0.1, self.randomization_interval * 0.1
-            )
-
-            new_material_prim_path = np.random.choice(self.randomization_material_list)
-            bind_visual_material(self.prim.GetPrim().GetPath(), new_material_prim_path, self.stage)
-
-        @override
-        def on_play(self):
-            self.last_randomization_time = 0.0
-
+    class MaterialRandomization:
         @staticmethod
         def add_to_prim(
             stage: Usd.Stage,
@@ -83,18 +39,51 @@ def get_material_randomization_class():
             randomization_interval: float,
             randomization_material_list: list[str],
         ):
-            write_custom_data_to_prim(
-                stage,
-                prim_path,
+            _DYNAMIC_MATERIAL_RANDOMIZERS.append(
                 {
-                    "randomizationInterval": randomization_interval,
-                    "randomizationMaterialList": randomization_material_list,
-                },
+                    "prim_path": str(prim_path),
+                    "randomization_interval": float(randomization_interval),
+                    "randomization_material_list": list(randomization_material_list),
+                    "last_randomization_time": 0.0,
+                    "randomization_interval_perturbation": np.random.uniform(
+                        randomization_interval * -0.1, randomization_interval * 0.1
+                    ),
+                    "resolved_prim_paths": None,
+                }
             )
-            omni.kit.commands.execute("ApplyScriptingAPICommand", paths=[Sdf.Path(prim_path)])
-            stage.GetPrimAtPath(prim_path).CreateAttribute(
-                "omni:scripting:scripts", Sdf.ValueTypeNames.AssetArray
-            ).Set([MATERIAL_RANDOMIZATION_SCRIPT_PATH])
 
     _MaterialRandomization = MaterialRandomization
     return _MaterialRandomization
+
+
+def step_dynamic_material_randomization(stage: Usd.Stage, current_time: float):
+    for randomizer in _DYNAMIC_MATERIAL_RANDOMIZERS:
+        if (
+            current_time - randomizer["last_randomization_time"]
+            < randomizer["randomization_interval"]
+            + randomizer["randomization_interval_perturbation"]
+        ):
+            continue
+
+        material_list = randomizer["randomization_material_list"]
+        if not material_list:
+            continue
+
+        if randomizer["resolved_prim_paths"] is None:
+            randomizer["resolved_prim_paths"] = _resolve_material_randomization_prim_paths(
+                stage, randomizer["prim_path"]
+            )
+        if not randomizer["resolved_prim_paths"]:
+            continue
+
+        randomizer["last_randomization_time"] = current_time
+        randomizer["randomization_interval_perturbation"] = np.random.uniform(
+            randomizer["randomization_interval"] * -0.1,
+            randomizer["randomization_interval"] * 0.1,
+        )
+        for resolved_prim_path in randomizer["resolved_prim_paths"]:
+            bind_visual_material(
+                resolved_prim_path,
+                str(np.random.choice(material_list)),
+                stage,
+            )

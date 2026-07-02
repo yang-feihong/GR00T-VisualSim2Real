@@ -48,7 +48,7 @@ import yaml
 from hydra.core.hydra_config import HydraConfig
 from hydra.utils import instantiate
 from loguru import logger
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
 
 from gr00t.rl.utils.config_utils import register_rl_resolvers
 
@@ -251,6 +251,8 @@ def main(config: OmegaConf):
             source_file = current_file_dir_path / "apps/phc.isaaclab.python.headless.rendering.kit"
             shutil.copy(source_file, dest_path)
             args_cli.experience = dest_path / "phc.isaaclab.python.headless.rendering.kit"
+        elif args_cli.headless and not args_cli.enable_cameras:
+            args_cli.experience = current_file_dir_path / "apps/b2z1.isaaclab.python.headless.no_render.kit"
 
         app_launcher = AppLauncher(args_cli)
         simulation_app = app_launcher.app
@@ -307,6 +309,14 @@ def main(config: OmegaConf):
     pre_process_config(config)
 
     # --- Initialize environment ---
+    no_render_headless = (
+        config.headless
+        and not config.simulator.config.render_results
+        and not config.simulator.config.cameras.enable_cameras
+    )
+    with open_dict(config.simulator.config):
+        config.simulator.config.disable_visual_markers = no_render_headless
+        config.simulator.config.disable_visual_materials = no_render_headless
     config.env.config.save_rendering_dir = str(Path(config.experiment_dir) / "renderings_training")
     config.env.config.experiment_dir = str(Path(config.experiment_dir))
     env = custom_instantiate(config.env, device=device, _resolve=False)
@@ -437,6 +447,11 @@ def main(config: OmegaConf):
 
     # --- Training loop ---
     trainer.train()
+
+    if config.get("force_exit_after_train", False):
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(0)
 
     if simulator_type == "IsaacSim":
         simulation_app.close()

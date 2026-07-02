@@ -1,0 +1,100 @@
+[package]
+title = "B2Z1 Isaac Lab Python Headless No Render"
+description = "Isaac Lab headless experience for B2Z1 import/debug without renderer or cameras"
+version = "0.1.0"
+keywords = ["experience", "app", "isaaclab", "python", "headless"]
+
+[settings]
+app.versionFile = "${exe-path}/VERSION"
+app.folder = "${exe-path}/"
+app.name = "Isaac-Sim"
+app.version = "5.1.0"
+app.content.emptyStageOnStart = false
+app.enableStdoutOutput = false
+app.asyncRendering = false
+app.asyncRenderingLowLatency = false
+app.audio.enabled = false
+app.vulkan = false
+app.runLoops.main.rateLimitEnabled = false
+app.useFabricSceneDelegate = false
+renderer.enabled = ""
+renderer.active = ""
+renderer.multiGpu.enabled = false
+renderer.multiGpu.autoEnable = false
+physics.fabricUseGPUInterop = false
+physics.updateToUsd = false
+physics.updateParticlesToUsd = false
+physics.updateVelocitiesToUsd = false
+physics.updateForceSensorsToUsd = false
+physics.outputVelocitiesLocalSpace = false
+physics.useFastCache = false
+physics.visualizationDisplayJoints = false
+physics.fabricUpdateTransformations = false
+physics.fabricUpdateVelocities = false
+physics.fabricUpdateForceSensors = false
+physics.fabricUpdateJointStates = false
+omni.replicator.asyncRendering = false
+exts."omni.replicator.core".Orchestrator.enabled = false
+isaac.startup.ros_bridge_extension = ""
+metricsAssembler.changeListenerEnabled = false
+persistent.isaac.asset_root.default = "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1"
+persistent.isaac.asset_root.cloud = "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1"
+persistent.isaac.asset_root.nvidia = "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1"
+
+[settings.app.python]
+interceptSysStdOutput = false
+logSysStdOutput = false
+
+[settings.app.settings]
+persistent = true
+dev_build = false
+fabricDefaultStageFrameHistoryCount = 3
+
+[settings.app.exts]
+folders = [
+    "${exe-path}/exts",
+    "${exe-path}/extscore",
+    "${exe-path}/../exts",
+    "${exe-path}/../extsDeprecated",
+    "${exe-path}/../extscache",
+    "${exe-path}/../extsPhysics",
+    "${exe-path}/../isaacsim/exts",
+    "${exe-path}/../isaacsim/extsDeprecated",
+    "${exe-path}/../isaacsim/extscache",
+    "${exe-path}/../isaacsim/extsPhysics",
+    "${app}",
+    "${app}/../source",
+    "/workspace/IsaacLab/source",
+]
+
+[settings.exts."omni.kit.registry.nucleus"]
+registries = [
+    { name = "kit/default", url = "https://ovextensionsprod.blob.core.windows.net/exts/kit/prod/107/shared" },
+    { name = "kit/sdk", url = "https://ovextensionsprod.blob.core.windows.net/exts/kit/prod/sdk/${kit_version_short}/${kit_git_hash}" },
+    { name = "kit/community", url = "https://dw290v42wisod.cloudfront.net/exts/kit/community" },
+]
+
+[settings.app.extensions]
+skipPublishVerification = false
+registryEnabled = true
+
+[dependencies]
+"omni.usd" = {}
+"omni.kit.usd.layers" = {}
+"omni.physx" = {}
+"omni.physx.tensors" = {}
+"omni.physx.fabric" = {}
+"omni.warp.core" = {}
+"usdrt.scenegraph" = {}
+"omni.kit.telemetry" = {}
+"omni.kit.loop" = {}
+"isaacsim.simulation_app" = {}
+"isaacsim.core.api" = {}
+"isaacsim.core.cloner" = {}
+"isaacsim.core.utils" = {}
+"isaacsim.core.version" = {}
+"isaaclab" = { order = 1000 }
+"isaaclab_assets" = { order = 1000 }
+"isaaclab_tasks" = { order = 1000 }
+"isaaclab_mimic" = { order = 1000 }
+"isaaclab_rl" = { order = 1000 }

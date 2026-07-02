@@ -530,9 +530,12 @@ class IsaacSim(BaseSimulator):
                 },
             )
 
-        self.torso_index = self._robot.find_bodies("torso_link", preserve_order=True)[0][0]
+        self.torso_index = self._robot.find_bodies(
+            self.robot_config.get("root_body_name", "torso_link"), preserve_order=True
+        )[0][0]
         self.right_palm_index = self._robot.find_bodies(
-            "right_hand_palm_link", preserve_order=True
+            self.robot_config.get("gripper_body_name", "right_hand_palm_link"),
+            preserve_order=True,
         )[0][0]
 
         # if self.domain_rand_config.get("randomize_object_material", False):
@@ -677,8 +680,17 @@ class IsaacSim(BaseSimulator):
         else:
             raise ValueError(f"Unsupported IsaacSim version: {DEFAULT_ISAACSIM_VERSION}")
 
+        lowlevel_cmd_cfg = self.robot_config.get("b2z1_command", {})
+        b2z1_manual_leg_pd = (
+            self.robot_config.get("asset", {}).get("robot_type", None) == "b2z1"
+            and lowlevel_cmd_cfg.get("lowlevel_leg_control_mode", None) == "effort"
+        )
+        use_runtime_urdf = bool(
+            self.robot_config.get("asset", {}).get("use_runtime_urdf", False)
+        )
         asset_abs_path = os.path.abspath(os.path.join(asset_root, asset_path))
-        assert os.path.isfile(asset_abs_path)
+        if not (b2z1_manual_leg_pd and use_runtime_urdf):
+            assert os.path.isfile(asset_abs_path)
         logger.warning(
             f"num_position_iterations: {self.simulator_config.sim.physx.num_position_iterations}"
         )
@@ -686,24 +698,68 @@ class IsaacSim(BaseSimulator):
             f"num_velocity_iterations: {self.simulator_config.sim.physx.num_velocity_iterations}"
         )
         # import ipdb; ipdb.set_trace()
-        spawn = sim_utils.UsdFileCfg(
-            usd_path=asset_abs_path,
-            activate_contact_sensors=True,
-            rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                disable_gravity=False,
-                retain_accelerations=False,
-                linear_damping=0.0,
-                angular_damping=0.0,
-                max_linear_velocity=1000.0,
-                max_angular_velocity=1000.0,
-                max_depenetration_velocity=1.0,
-            ),
-            articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-                enabled_self_collisions=not bool(self.env_config.robot.asset.self_collisions),
-                solver_position_iteration_count=self.simulator_config.sim.physx.num_position_iterations,
-                solver_velocity_iteration_count=self.simulator_config.sim.physx.num_velocity_iterations,
-            ),
-        )
+        if b2z1_manual_leg_pd and use_runtime_urdf:
+            urdf_path = self.robot_config.asset.urdf_file
+            urdf_abs_path = os.path.abspath(os.path.join(asset_root, urdf_path))
+            assert os.path.isfile(urdf_abs_path), urdf_abs_path
+            spawn = sim_utils.UrdfFileCfg(
+                asset_path=urdf_abs_path,
+                activate_contact_sensors=True,
+                force_usd_conversion=True,
+                fix_base=False,
+                merge_fixed_joints=True,
+                replace_cylinders_with_capsules=True,
+                self_collision=False,
+                make_instanceable=False,
+                joint_drive=sim_utils.UrdfConverterCfg.JointDriveCfg(
+                    target_type="none",
+                    gains=sim_utils.UrdfConverterCfg.JointDriveCfg.PDGainsCfg(
+                        stiffness=0.0,
+                        damping=0.0,
+                    ),
+                ),
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                    disable_gravity=False,
+                    retain_accelerations=False,
+                    linear_damping=0.0,
+                    angular_damping=0.0,
+                    max_linear_velocity=1000.0,
+                    max_angular_velocity=1000.0,
+                    max_depenetration_velocity=1.0,
+                ),
+                collision_props=sim_utils.CollisionPropertiesCfg(
+                    contact_offset=0.005,
+                    rest_offset=0.0,
+                ),
+                articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+                    enabled_self_collisions=bool(self.env_config.robot.asset.self_collisions),
+                    solver_position_iteration_count=self.simulator_config.sim.physx.num_position_iterations,
+                    solver_velocity_iteration_count=self.simulator_config.sim.physx.num_velocity_iterations,
+                ),
+            )
+        else:
+            spawn = sim_utils.UsdFileCfg(
+                usd_path=asset_abs_path,
+                activate_contact_sensors=True,
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                    disable_gravity=False,
+                    retain_accelerations=False,
+                    linear_damping=0.0,
+                    angular_damping=0.0,
+                    max_linear_velocity=1000.0,
+                    max_angular_velocity=1000.0,
+                    max_depenetration_velocity=1.0,
+                ),
+                collision_props=sim_utils.CollisionPropertiesCfg(
+                    contact_offset=0.005,
+                    rest_offset=0.0,
+                ),
+                articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+                    enabled_self_collisions=bool(self.env_config.robot.asset.self_collisions),
+                    solver_position_iteration_count=self.simulator_config.sim.physx.num_position_iterations,
+                    solver_velocity_iteration_count=self.simulator_config.sim.physx.num_velocity_iterations,
+                ),
+            )
 
         # urdf_path = self.robot_config.asset.urdf_file
         # asset_abs_path = os.path.abspath(os.path.join(asset_root, urdf_path))
@@ -737,8 +793,16 @@ class IsaacSim(BaseSimulator):
         # prepare to override the articulation configuration in groot/rl/simulator/isaacsim_articulation_cfg.py
         default_joint_angles = copy.deepcopy(self.robot_config.init_state.default_joint_angles)
         # import ipdb; ipdb.set_trace()
+        init_rot_xyzw = tuple(self.robot_config.init_state.rot)
+        init_rot_wxyz = (
+            init_rot_xyzw[3],
+            init_rot_xyzw[0],
+            init_rot_xyzw[1],
+            init_rot_xyzw[2],
+        )
         init_state = ArticulationCfg.InitialStateCfg(
             pos=tuple(self.robot_config.init_state.pos),
+            rot=init_rot_wxyz,
             joint_pos={
                 joint_name: joint_angle for joint_name, joint_angle in default_joint_angles.items()
             },
@@ -801,29 +865,74 @@ class IsaacSim(BaseSimulator):
         # )
 
         # ImplicitID
-        stiffness_dict = {".*" + key + ".*": value for key, value in stiffness_dict.items()}
-        damping_dict = {".*" + key + ".*": value for key, value in damping_dict.items()}
-        actuators = dict()
-        actuators["all"] = ImplicitActuatorCfg(
-            joint_names_expr=[dof_names_list[i] for i in range(len(dof_names_list))],
-            effort_limit_sim={
-                dof_names_list[i]: dof_effort_limit_list[i] for i in range(len(dof_names_list))
-            },
-            velocity_limit_sim={
-                dof_names_list[i]: dof_vel_limit_list[i] for i in range(len(dof_names_list))
-            },
-            # stiffness=0,
-            # damping=0,
-            stiffness=stiffness_dict,
-            damping=damping_dict,
-            armature={
-                dof_names_list[i]: dof_armature_list[i] * 3 for i in range(len(dof_names_list))
-            },
-            friction={
-                dof_names_list[i]: dof_joint_friction_list[i] * 0
-                for i in range(len(dof_names_list))
-            },
-        )
+        if b2z1_manual_leg_pd:
+            actuators = {
+                "legs": ImplicitActuatorCfg(
+                    joint_names_expr=[".*hip_joint", ".*thigh_joint", ".*calf_joint"],
+                    effort_limit_sim=600.0,
+                    velocity_limit_sim=100.0,
+                    stiffness=0.0,
+                    damping=0.0,
+                    armature=0.0,
+                    friction=0.0,
+                ),
+                "arm": ImplicitActuatorCfg(
+                    joint_names_expr=[
+                        "joint1",
+                        "joint2",
+                        "joint3",
+                        "joint4",
+                        "joint5",
+                        "joint6",
+                        "jointGripper",
+                    ],
+                    effort_limit_sim=80.0,
+                    velocity_limit_sim=20.0,
+                    stiffness={
+                        "joint1": 400.0,
+                        "joint2": 400.0,
+                        "joint3": 400.0,
+                        "joint4": 400.0,
+                        "joint5": 400.0,
+                        "joint6": 400.0,
+                        "jointGripper": 400.0,
+                    },
+                    damping={
+                        "joint1": 40.0,
+                        "joint2": 40.0,
+                        "joint3": 40.0,
+                        "joint4": 40.0,
+                        "joint5": 40.0,
+                        "joint6": 40.0,
+                        "jointGripper": 40.0,
+                    },
+                    armature=0.0,
+                    friction=0.0,
+                ),
+            }
+        else:
+            stiffness_dict = {".*" + key + ".*": value for key, value in stiffness_dict.items()}
+            damping_dict = {".*" + key + ".*": value for key, value in damping_dict.items()}
+            actuators = dict()
+            actuators["all"] = ImplicitActuatorCfg(
+                joint_names_expr=[dof_names_list[i] for i in range(len(dof_names_list))],
+                effort_limit_sim={
+                    dof_names_list[i]: dof_effort_limit_list[i] for i in range(len(dof_names_list))
+                },
+                velocity_limit_sim={
+                    dof_names_list[i]: dof_vel_limit_list[i] for i in range(len(dof_names_list))
+                },
+                stiffness=stiffness_dict,
+                damping=damping_dict,
+                armature={
+                    dof_names_list[i]: dof_armature_list[i] * 3
+                    for i in range(len(dof_names_list))
+                },
+                friction={
+                    dof_names_list[i]: dof_joint_friction_list[i] * 0
+                    for i in range(len(dof_names_list))
+                },
+            )
         logger.warning(f"dof_armature_list {dof_armature_list}")
         logger.warning(f"dof_joint_friction_list {dof_joint_friction_list}")
 
@@ -836,27 +945,14 @@ class IsaacSim(BaseSimulator):
         # robot_articulation_config: ArticulationCfg = UNITREE_G1_29DOF_CFG.replace(prim_path="/World/envs/env_.*/Robot", init_state=init_state)
 
         if "task_config" in self.__dict__ and hasattr(self.task_config, "target_obj"):
-            which_hand = self.task_config.get("which_hand", "right_hand")
-            if which_hand == "right_hand":
-                g1_hand_links = [
-                    "/World/envs/env_.*/Robot/{}".format(n)
-                    for n in self.robot_config.body_names
-                    if "right_hand" in n
-                ]
-            elif which_hand == "left_hand":
-                g1_hand_links = [
-                    "/World/envs/env_.*/Robot/{}".format(n)
-                    for n in self.robot_config.body_names
-                    if "left_hand" in n
-                ]
-            elif which_hand == "any_hand":
-                g1_hand_links = [
-                    "/World/envs/env_.*/Robot/{}".format(n)
-                    for n in self.robot_config.body_names
-                    if ("left_hand" in n or "right_hand" in n)
-                ]
-            else:
-                raise ValueError(f"Invalid which_hand: {which_hand}")
+            task_contact_body_names = self.robot_config.get(
+                "task_contact_body_names", self.robot_config.get("manipulator_body_names", [])
+            )
+            if not task_contact_body_names:
+                raise ValueError("robot.task_contact_body_names must be set for manipulation tasks")
+            manipulator_links = [
+                "/World/envs/env_.*/Robot/{}".format(n) for n in task_contact_body_names
+            ]
             object_contact_prim_path = f"/World/envs/env_.*/{self.task_config.target_obj}"
             if self.task_config.get("target_obj_contact_sub_prim_path", None) is not None:
                 object_contact_prim_path = os.path.join(
@@ -864,18 +960,18 @@ class IsaacSim(BaseSimulator):
                 )
             object_to_hand_contact_sensor_config: ContactSensorCfg = ContactSensorCfg(
                 prim_path=object_contact_prim_path,
-                filter_prim_paths_expr=g1_hand_links,
+                filter_prim_paths_expr=manipulator_links,
             )
             object_to_hand_frame_transformer_config: FrameTransformerCfg = FrameTransformerCfg(
                 prim_path=object_contact_prim_path,
                 target_frames=[
-                    FrameTransformerCfg.FrameCfg(prim_path=link) for link in g1_hand_links
+                    FrameTransformerCfg.FrameCfg(prim_path=link) for link in manipulator_links
                 ],
             )
 
             table_to_hand_contact_sensor_config: ContactSensorCfg = ContactSensorCfg(
                 prim_path="/World/envs/env_.*/table_grid",
-                filter_prim_paths_expr=g1_hand_links,
+                filter_prim_paths_expr=manipulator_links,
             )
 
             target_obj_table_contact_sensor_config: ContactSensorCfg = ContactSensorCfg(
@@ -938,14 +1034,17 @@ class IsaacSim(BaseSimulator):
                 filter_prim_paths_expr=["/World/envs/env_.*/table_grid"],
             )
 
-        g1_body_links = [
+        body_contact_name_substrings = self.robot_config.get(
+            "body_contact_name_substrings", ["hip", "torso", "pelvis", "base"]
+        )
+        body_links = [
             "/World/envs/env_.*/Robot/{}".format(n)
             for n in self.robot_config.body_names
-            if ("hip" in n or "torso" in n or "pelvis" in n)
+            if any(substr in n for substr in body_contact_name_substrings)
         ]
 
         table_to_body_contact_sensor_config: ContactSensorCfg = ContactSensorCfg(
-            prim_path="/World/envs/env_.*/table_grid", filter_prim_paths_expr=g1_body_links
+            prim_path="/World/envs/env_.*/table_grid", filter_prim_paths_expr=body_links
         )
 
         contact_sensor_config: ContactSensorCfg = ContactSensorCfg(
@@ -965,9 +1064,9 @@ class IsaacSim(BaseSimulator):
                 # This determines the spacing between ray samples to achieve the desired number of points
                 pattern_resolution = grid_size / (resolution - 1) if resolution > 1 else grid_size
 
-                # Add a height scanner to the torso to detect the height of the terrain mesh
+                scanner_body_name = self.robot_config.get("root_body_name", "pelvis")
                 height_scanner_config = RayCasterCfg(
-                    prim_path="/World/envs/env_.*/Robot/pelvis",
+                    prim_path=f"/World/envs/env_.*/Robot/{scanner_body_name}",
                     offset=RayCasterCfg.OffsetCfg(pos=(0.0, 0.0, 0.0)),
                     attach_yaw_only=True,
                     # Apply a grid pattern based on the configured resolution
@@ -1127,18 +1226,30 @@ class IsaacSim(BaseSimulator):
             )
             terrain_config.num_envs = self.scene.cfg.num_envs
             terrain_config.env_spacing = self.scene.cfg.env_spacing
+            if getattr(self.simulator_config, "disable_visual_materials", False):
+                terrain_config.terrain_type = "usd"
+                terrain_config.usd_path = str(
+                    os.path.abspath("gr00t/rl/data/terrain/headless_ground_plane.usda")
+                )
 
-        self.vis_spheres = VisualizationMarkers(
-            VisualizationMarkersCfg(
-                prim_path="/Visuals/goal_marker_sphere",
-                markers={
-                    "sphere": sim_utils.SphereCfg(
-                        radius=0.05,
-                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 1.0, 0.0)),
-                    ),
-                },
-            )
+        self.visual_markers_enabled = not getattr(
+            self.simulator_config, "disable_visual_markers", False
         )
+        self.vis_spheres = None
+        if self.visual_markers_enabled:
+            self.vis_spheres = VisualizationMarkers(
+                VisualizationMarkersCfg(
+                    prim_path="/Visuals/goal_marker_sphere",
+                    markers={
+                        "sphere": sim_utils.SphereCfg(
+                            radius=0.05,
+                            visual_material=sim_utils.PreviewSurfaceCfg(
+                                diffuse_color=(1.0, 1.0, 0.0)
+                            ),
+                        ),
+                    },
+                )
+            )
 
         self._task = {}
         self.task_root_origin = {}
@@ -1189,6 +1300,61 @@ class IsaacSim(BaseSimulator):
                     )
             else:
                 TaskObjCfgDict = task_module.TaskObjCfgDict
+
+            task_visual_materials_enabled = getattr(
+                self.simulator_config, "enable_task_visual_materials", False
+            )
+            task_randomize_material = getattr(
+                self.simulator_config, "task_randomize_material", None
+            )
+            task_dynamic_material_randomization = getattr(
+                self.simulator_config, "task_dynamic_material_randomization", None
+            )
+            task_dynamic_material_randomization_interval = getattr(
+                self.simulator_config, "task_dynamic_material_randomization_interval", None
+            )
+            for task_obj_cfg in TaskObjCfgDict.values():
+                spawn_cfg = getattr(task_obj_cfg, "spawn", None)
+                spawn_cfgs = getattr(spawn_cfg, "assets_cfg", [spawn_cfg])
+                for asset_spawn_cfg in spawn_cfgs:
+                    if asset_spawn_cfg is None:
+                        continue
+                    if (
+                        task_randomize_material is not None
+                        and hasattr(asset_spawn_cfg, "randomize_material")
+                    ):
+                        asset_spawn_cfg.randomize_material = task_randomize_material
+                    if (
+                        task_dynamic_material_randomization is not None
+                        and hasattr(asset_spawn_cfg, "dynamic_material_randomization")
+                    ):
+                        asset_spawn_cfg.dynamic_material_randomization = (
+                            task_dynamic_material_randomization
+                        )
+                    if (
+                        task_dynamic_material_randomization_interval is not None
+                        and hasattr(asset_spawn_cfg, "dynamic_material_randomization_interval")
+                    ):
+                        asset_spawn_cfg.dynamic_material_randomization_interval = (
+                            task_dynamic_material_randomization_interval
+                        )
+
+            if (
+                getattr(self.simulator_config, "disable_visual_materials", False)
+                and not task_visual_materials_enabled
+            ):
+                for task_obj_cfg in TaskObjCfgDict.values():
+                    spawn_cfg = getattr(task_obj_cfg, "spawn", None)
+                    spawn_cfgs = getattr(spawn_cfg, "assets_cfg", [spawn_cfg])
+                    for asset_spawn_cfg in spawn_cfgs:
+                        if asset_spawn_cfg is None:
+                            continue
+                        if hasattr(asset_spawn_cfg, "randomize_material"):
+                            asset_spawn_cfg.randomize_material = False
+                        if hasattr(asset_spawn_cfg, "use_preloaded_materials"):
+                            asset_spawn_cfg.use_preloaded_materials = False
+                        if hasattr(asset_spawn_cfg, "dynamic_material_randomization"):
+                            asset_spawn_cfg.dynamic_material_randomization = False
 
             # import ipdb; ipdb.set_trace()
             for name, obj_cfg in TaskObjCfgDict.items():
@@ -1248,14 +1414,9 @@ class IsaacSim(BaseSimulator):
                 if self.task_config.get("target_obj_transform_sub_prim_path", None) is not None:
                     target_obj_transform_prim_path = os.path.join(target_obj_transform_prim_path, self.task_config.target_obj_transform_sub_prim_path)
 
-                left_hand_frame_transformer_config = FrameTransformerCfg(
-                    prim_path="/World/envs/env_.*/Robot/left_hand_palm_link",
-                    target_frames=[
-                        FrameTransformerCfg.FrameCfg(prim_path=target_obj_transform_prim_path),
-                    ],
-                )
-                right_hand_frame_transformer_config = FrameTransformerCfg(
-                    prim_path="/World/envs/env_.*/Robot/right_hand_palm_link",
+                gripper_body_name = self.robot_config.get("gripper_body_name", "gripper_link")
+                hand_frame_transformer_config = FrameTransformerCfg(
+                    prim_path=f"/World/envs/env_.*/Robot/{gripper_body_name}",
                     target_frames=[
                         FrameTransformerCfg.FrameCfg(prim_path=target_obj_transform_prim_path),
                     ],
@@ -1338,11 +1499,8 @@ class IsaacSim(BaseSimulator):
                 )
 
             if hasattr(self.task_config, "target_obj_contact_sensor"):
-                self.scene.sensors["left_hand_frame_transformer"] = FrameTransformer(
-                    left_hand_frame_transformer_config
-                )
-                self.scene.sensors["right_hand_frame_transformer"] = FrameTransformer(
-                    right_hand_frame_transformer_config
+                self.scene.sensors["hand_frame_transformer"] = FrameTransformer(
+                    hand_frame_transformer_config
                 )
                 self.object_to_hand_frame_transformer = FrameTransformer(
                     object_to_hand_frame_transformer_config
@@ -1497,33 +1655,35 @@ class IsaacSim(BaseSimulator):
             #         visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0))),
             #         }))
 
-            self.visual_cube_red = VisualizationMarkers(
-                VisualizationMarkersCfg(
-                    prim_path="/Visuals/goal_marker_cube_red",
-                    markers={
-                        "cube": sim_utils.CuboidCfg(
-                            size=(0.075, 0.075, 0.075),
-                            visual_material=sim_utils.PreviewSurfaceCfg(
-                                diffuse_color=(1.0, 0.0, 0.0)
+            self.visual_cube_red = None
+            self.visual_cube_green = None
+            if self.visual_markers_enabled:
+                self.visual_cube_red = VisualizationMarkers(
+                    VisualizationMarkersCfg(
+                        prim_path="/Visuals/goal_marker_cube_red",
+                        markers={
+                            "cube": sim_utils.CuboidCfg(
+                                size=(0.075, 0.075, 0.075),
+                                visual_material=sim_utils.PreviewSurfaceCfg(
+                                    diffuse_color=(1.0, 0.0, 0.0)
+                                ),
                             ),
-                        ),
-                    },
+                        },
+                    )
                 )
-            )
-
-            self.visual_cube_green = VisualizationMarkers(
-                VisualizationMarkersCfg(
-                    prim_path="/Visuals/goal_marker_cube_green",
-                    markers={
-                        "cube": sim_utils.CuboidCfg(
-                            size=(0.075, 0.075, 0.075),
-                            visual_material=sim_utils.PreviewSurfaceCfg(
-                                diffuse_color=(0.0, 1.0, 0.0)
+                self.visual_cube_green = VisualizationMarkers(
+                    VisualizationMarkersCfg(
+                        prim_path="/Visuals/goal_marker_cube_green",
+                        markers={
+                            "cube": sim_utils.CuboidCfg(
+                                size=(0.075, 0.075, 0.075),
+                                visual_material=sim_utils.PreviewSurfaceCfg(
+                                    diffuse_color=(0.0, 1.0, 0.0)
+                                ),
                             ),
-                        ),
-                    },
+                        },
+                    )
                 )
-            )
 
         # Add visualization markers for object position prediction
         # self.pred_obj_pos_marker = VisualizationMarkers(VisualizationMarkersCfg( prim_path="/Visuals/predicted_obj_pos",
@@ -1938,17 +2098,11 @@ class IsaacSim(BaseSimulator):
                 else:
                     raise ValueError(f"Invalid hand: {which_hand}")
             else:
-                self.left_hand_transform_pos = self.scene.sensors[
-                    "left_hand_frame_transformer"
+                self.hand_transform_pos = self.scene.sensors[
+                    "hand_frame_transformer"
                 ].data.target_pos_source.clone()
-                self.left_hand_transform_rot = self.scene.sensors[
-                    "left_hand_frame_transformer"
-                ].data.target_quat_source.clone()
-                self.right_hand_transform_pos = self.scene.sensors[
-                    "right_hand_frame_transformer"
-                ].data.target_pos_source.clone()
-                self.right_hand_transform_rot = self.scene.sensors[
-                    "right_hand_frame_transformer"
+                self.hand_transform_rot = self.scene.sensors[
+                    "hand_frame_transformer"
                 ].data.target_quat_source.clone()
 
             # import ipdb; ipdb.set_trace()
@@ -2030,10 +2184,14 @@ class IsaacSim(BaseSimulator):
     def set_actor_root_state_tensor(
         self, set_env_ids, root_states
     ):  # TODO: only robot actor root state
-        self._robot.write_root_state_to_sim(root_states[set_env_ids, :], set_env_ids)
+        root_states_wxyz = root_states[set_env_ids, :].clone()
+        root_states_wxyz[:, 3:7] = root_states_wxyz[:, [6, 3, 4, 5]]
+        self._robot.write_root_state_to_sim(root_states_wxyz, set_env_ids)
 
     def write_root_state_to_sim(self, root_states, set_env_ids):
-        self._robot.write_root_state_to_sim(root_states, set_env_ids)
+        root_states_wxyz = root_states.clone()
+        root_states_wxyz[:, 3:7] = root_states_wxyz[:, [6, 3, 4, 5]]
+        self._robot.write_root_state_to_sim(root_states_wxyz, set_env_ids)
 
     def set_dof_state_tensor(self, set_env_ids, dof_states):
         dof_pos, dof_vel = dof_states[set_env_ids, :, 0], dof_states[set_env_ids, :, 1]
@@ -2159,6 +2317,17 @@ class IsaacSim(BaseSimulator):
         self.scene.write_data_to_sim()
         # simulate
         self.sim.step(render=False)
+        if getattr(self.simulator_config, "task_dynamic_material_randomization", False):
+            from gr00t.rl.isaac_utils.playground.scripts.material_randomization import (
+                step_dynamic_material_randomization,
+            )
+
+            import omni.usd
+
+            step_dynamic_material_randomization(
+                omni.usd.get_context().get_stage(),
+                self._sim_step_counter / self.simulator_config.sim.fps,
+            )
         # render between steps only if the GUI or an RTX sensor needs it
         # note: we assume the render interval to be the shortest accepted rendering interval.
         #    If a camera needs rendering at a faster frequency, this will lead to unexpected behavior.
@@ -2209,9 +2378,13 @@ class IsaacSim(BaseSimulator):
         self.draw.draw_points(point_list, color_list, sizes)
 
     def draw_spheres_batch(self, pos, rot=None, scales=None):
+        if self.vis_spheres is None:
+            return
         self.vis_spheres.visualize(pos, rot, scales)
 
     def draw_cubes_batch_red(self, pos, rot=None, scales=None):
+        if self.visual_cube_red is None:
+            return
         if pos.shape[0] > 0:
             self.visual_cube_red.set_visibility(True)
             if rot is None:
@@ -2223,6 +2396,8 @@ class IsaacSim(BaseSimulator):
             self.visual_cube_red.set_visibility(False)
 
     def draw_cubes_batch_green(self, pos, rot=None, scales=None):
+        if self.visual_cube_green is None:
+            return
         if pos.shape[0] > 0:
             self.visual_cube_green.set_visibility(True)
             if rot is None:

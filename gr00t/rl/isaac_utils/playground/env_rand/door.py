@@ -3,6 +3,7 @@
 
 
 import os
+from pathlib import Path
 from typing import Literal, Optional
 
 import isaaclab.sim as sim_utils
@@ -25,6 +26,8 @@ def _get_material_randomization():
 
 
 MR = None  # Will be lazily loaded on first use
+REPO_ROOT = Path(__file__).resolve().parents[5]
+LOCAL_MATERIALS_ROOT = REPO_ROOT / "materials"
 from gr00t.rl.isaac_utils.playground.utils.math_utils import Rotation, set_prim_transform
 from gr00t.rl.isaac_utils.playground.utils.usd_utils import (
     add_collider,
@@ -143,7 +146,7 @@ def spawn_door(
     **kwargs,
 ) -> Usd.Prim:
     global MR
-    if MR is None:
+    if cfg.randomize_material and cfg.dynamic_material_randomization and MR is None:
         MR = _get_material_randomization()
     stage: Usd.Stage = omni.usd.get_context().get_stage()
     # determine the door width
@@ -967,70 +970,76 @@ def spawn_door(
 def preload_door_materials(
     stage: Usd.Stage, random_transform_each_num: int = 1, random_color_each_num: int = 1
 ):
+    def local_material(relative_path: str) -> str:
+        path = LOCAL_MATERIALS_ROOT / relative_path
+        if not path.is_file():
+            raise FileNotFoundError(f"Door material is missing: {path}")
+        return str(path)
+
     textured_material_list = [
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Wood/Ash.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Wood/Ash_Planks.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Wood/Bamboo.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Wood/Bamboo_Planks.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Wood/Beadboard.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Wood/Birch.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Wood/Birch_Planks.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Wood/Cherry.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Wood/Cherry_Planks.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Wood/Cork.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Wood/Mahogany.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Wood/Mahogany_Planks.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Wood/Oak.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Wood/Oak_Planks.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Wood/Parquet_Floor.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Wood/Plywood.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Wood/Timber.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Wood/Timber_Cladding.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Wood/Walnut.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Wood/Walnut_Planks.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Plastics/Plastic.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Plastics/Plastic_ABS.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Plastics/Rubber_Smooth.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Plastics/Veneer_OU_Walnut.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Plastics/Veneer_UX_Walnut_Cherry.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Plastics/Veneer_Z5_Maple.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Plastics/Vinyl.mdl",
+        local_material("Base/Wood/Ash.mdl"),
+        local_material("Base/Wood/Ash_Planks.mdl"),
+        local_material("Base/Wood/Bamboo.mdl"),
+        local_material("Base/Wood/Bamboo_Planks.mdl"),
+        local_material("Base/Wood/Beadboard.mdl"),
+        local_material("Base/Wood/Birch.mdl"),
+        local_material("Base/Wood/Birch_Planks.mdl"),
+        local_material("Base/Wood/Cherry.mdl"),
+        local_material("Base/Wood/Cherry_Planks.mdl"),
+        local_material("Base/Wood/Cork.mdl"),
+        local_material("Base/Wood/Mahogany.mdl"),
+        local_material("Base/Wood/Mahogany_Planks.mdl"),
+        local_material("Base/Wood/Oak.mdl"),
+        local_material("Base/Wood/Oak_Planks.mdl"),
+        local_material("Base/Wood/Parquet_Floor.mdl"),
+        local_material("Base/Wood/Plywood.mdl"),
+        local_material("Base/Wood/Timber.mdl"),
+        local_material("Base/Wood/Timber_Cladding.mdl"),
+        local_material("Base/Wood/Walnut.mdl"),
+        local_material("Base/Wood/Walnut_Planks.mdl"),
+        local_material("Base/Plastics/Plastic.mdl"),
+        local_material("Base/Plastics/Plastic_ABS.mdl"),
+        local_material("Base/Plastics/Rubber_Smooth.mdl"),
+        local_material("Base/Plastics/Veneer_OU_Walnut.mdl"),
+        local_material("Base/Plastics/Veneer_UX_Walnut_Cherry.mdl"),
+        local_material("Base/Plastics/Veneer_Z5_Maple.mdl"),
+        local_material("Base/Plastics/Vinyl.mdl"),
     ]
 
     random_color_material_list = [
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Miscellaneous/Paint_Gloss.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Miscellaneous/Paint_Gloss_Finish.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Miscellaneous/Paint_Matte.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Miscellaneous/Paint_Matte_Finish.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Miscellaneous/Paint_Satin.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Miscellaneous/Paint_Satin_Finish.mdl",
+        local_material("Base/Miscellaneous/Paint_Gloss.mdl"),
+        local_material("Base/Miscellaneous/Paint_Gloss_Finish.mdl"),
+        local_material("Base/Miscellaneous/Paint_Matte.mdl"),
+        local_material("Base/Miscellaneous/Paint_Matte_Finish.mdl"),
+        local_material("Base/Miscellaneous/Paint_Satin.mdl"),
+        local_material("Base/Miscellaneous/Paint_Satin_Finish.mdl"),
     ]
 
     metallic_material_list = [
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/Aluminum_Anodized.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/Aluminum_Anodized_Black.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/Aluminum_Anodized_Blue.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/Aluminum_Anodized_Charcoal.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/Aluminum_Anodized_Red.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/Aluminum_Cast.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/Aluminum_Polished.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/Brass.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/Bronze.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/Brushed_Antique_Copper.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/Cast_Metal_Silver_Vein.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/Chrome.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/Copper.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/CorrugatedMetal.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/Gold.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/Iron.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/Metal_Door.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/Metal_Seamed_Roof.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/RustedMetal.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/Silver.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/Steel_Blued.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/Steel_Carbon.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/Steel_Cast.mdl",
-        "https://omniverse-content-production.s3-us-west-2.amazonaws.com/Assets/Isaac/5.1/NVIDIA/Materials/Base/Metals/Steel_Stainless.mdl",
+        local_material("Base/Metals/Aluminum_Anodized.mdl"),
+        local_material("Base/Metals/Aluminum_Anodized_Black.mdl"),
+        local_material("Base/Metals/Aluminum_Anodized_Blue.mdl"),
+        local_material("Base/Metals/Aluminum_Anodized_Charcoal.mdl"),
+        local_material("Base/Metals/Aluminum_Anodized_Red.mdl"),
+        local_material("Base/Metals/Aluminum_Cast.mdl"),
+        local_material("Base/Metals/Aluminum_Polished.mdl"),
+        local_material("Base/Metals/Brass.mdl"),
+        local_material("Base/Metals/Bronze.mdl"),
+        local_material("Base/Metals/Brushed_Antique_Copper.mdl"),
+        local_material("Base/Metals/Cast_Metal_Silver_Vein.mdl"),
+        local_material("Base/Metals/Chrome.mdl"),
+        local_material("Base/Metals/Copper.mdl"),
+        local_material("Base/Metals/CorrugatedMetal.mdl"),
+        local_material("Base/Metals/Gold.mdl"),
+        local_material("Base/Metals/Iron.mdl"),
+        local_material("Base/Metals/Metal_Door.mdl"),
+        local_material("Base/Metals/Metal_Seamed_Roof.mdl"),
+        local_material("Base/Metals/RustedMetal.mdl"),
+        local_material("Base/Metals/Silver.mdl"),
+        local_material("Base/Metals/Steel_Blued.mdl"),
+        local_material("Base/Metals/Steel_Carbon.mdl"),
+        local_material("Base/Metals/Steel_Cast.mdl"),
+        local_material("Base/Metals/Steel_Stainless.mdl"),
     ]
 
     door_frame_material_prim_paths = preload_materials(

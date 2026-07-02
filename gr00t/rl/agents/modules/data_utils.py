@@ -79,7 +79,9 @@ class RolloutStorage(nn.Module):
             hidden_states: Tuple of (actor_hidden_states, critic_hidden_states)
                           Each can be None, a tensor (GRU), or a tuple of tensors (LSTM)
         """
-        if hidden_states is None or hidden_states == (None, None):
+        if hidden_states is None:
+            return
+        if isinstance(hidden_states, tuple) and all(state is None for state in hidden_states):
             return
 
         # make a tuple out of GRU hidden state to match the LSTM format

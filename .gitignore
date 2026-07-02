@@ -217,3 +217,8 @@ gr00t/logs_rl/
 obs_sweeping/*
 DINOv3_models/*
 data/door_assets/*
+
+/artifacts
+/materials
+/models/b2z1_lowlevel
+**/.asset_hash

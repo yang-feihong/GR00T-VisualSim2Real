@@ -1,0 +1,40 @@
+# @package _global_
+
+defaults:
+  - /algo: ppo
+  - /env: b2z1_flat_lowlevel
+  - /simulator: isaacsim
+  - /domain_rand: NO_domain_rand
+  - /rewards: b2z1_flat_lowlevel
+  - /robot: b2z1/b2z1
+  - /terrain: terrain_locomotion_plane
+  - /obs: b2z1_flat_lowlevel
+  - /opt: wandb
+  - override /trainer: trl
+
+exp_base: ${hydra:runtime.choices.exp}
+exp_var: flat_lowlevel
+experiment_name: ${exp_base}_${exp_var}
+experiment_dir: ${base_dir}/${project_name}/${experiment_name}-${timestamp}
+
+num_envs: 1
+project_name: b2z1_flat_lowlevel
+
+simulator:
+  config:
+    scene:
+      replicate_physics: False
+      env_spacing: 5.0
+    sim:
+      physx:
+        num_position_iterations: 4
+        num_velocity_iterations: 0
+    randomize_dome_light: False
+
+robot:
+  b2z1_command:
+    lowlevel_disable_arm_ik: True
+    lowlevel_leg_control_mode: effort
+  asset:
+    self_collisions: 0
+    use_runtime_urdf: True

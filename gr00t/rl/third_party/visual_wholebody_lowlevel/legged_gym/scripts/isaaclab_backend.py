@@ -4,9 +4,7 @@ import sys
 from pathlib import Path
 
 LOW_LEVEL_ROOT = Path(__file__).resolve().parents[2]
-REPO_ROOT = LOW_LEVEL_ROOT.parent
-RSL_RL_ROOT = REPO_ROOT / "third_party" / "rsl_rl"
-for p in [str(LOW_LEVEL_ROOT), str(RSL_RL_ROOT)]:
+for p in [str(LOW_LEVEL_ROOT)]:
     if p in sys.path:
         sys.path.remove(p)
     sys.path.insert(0, p)

@@ -1,0 +1,122 @@
+# @package _global_
+
+defaults:
+  - legged_base
+
+env:
+  _target_: gr00t.rl.envs.door.door_open_homie.DoorPregrasp
+  config:
+    max_episode_length_s: 20
+
+    normalization:
+      clip_actions: 100.0
+      clip_observations: 100.0
+
+    termination:
+      terminate_when_close_to_dof_pos_limit: False
+      terminate_when_close_to_dof_vel_limit: False
+      terminate_when_close_to_torque_limit: False
+      terminate_by_contact: False
+      terminate_by_gravity: False
+      terminate_by_low_height: True
+    termination_scales:
+      termination_close_to_dof_pos_limit : 0.98
+      termination_close_to_dof_vel_limit : 0.98
+      termination_close_to_torque_limit : 0.98
+      termination_gravity_x : 0.7
+      termination_gravity_y : 0.7
+      termination_min_base_height : 0.25
+      termination_contact_force : 10.0
+    termination_probality:
+      terminate_when_close_to_dof_pos_limit: 0.25
+      terminate_when_close_to_dof_vel_limit: 0.25
+      terminate_when_close_to_torque_limit: 0.25
+
+    noise_to_initial_level: 0
+    init_noise_scale:
+      dof_pos: 0.05
+      dof_vel: 0.10
+      root_pos: 0.05
+      root_rot: 10
+      root_vel: 0.01
+      root_ang_vel: 0.01
+
+    task:
+      type: "manipulation"
+      name: "door"
+      objects: ["door"]
+      target_obj: "door"
+      thershold: 0.05
+      target_obj_contact_sensor: True
+      target_obj_contact_sub_prim_path: "door_handle"
+      target_obj_transform_sub_prim_path: "grasp_target"
+      which_hand: "gripper"
+
+    ref_height: 0.55
+    pregrasp_target_vel: 0.3
+    target_root_vel: 0.3
+
+    max_stage_time: [250, 100, 100, 100, 100, 200]
+    award_remaining_time_on_advance: True
+    accumulate_stage_reward: False
+    reset_on_complete: True
+    reset_on_complete_delay: 50.0
+    reset_on_overtime: True
+    stage_reward_scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+
+    delta_action_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    delta_action_scale: 0.3
+    delta_action_clip: 15.0
+    reset_delta_actions_with_backmap: False
+
+    warped_action:
+      indices: [0, 1, 2]
+      k: 0.0
+      s: 0.0
+
+    enable_staged_reset: True
+    staged_reset_ratios: [0.5, 0.1, 0.1, 0.1, 0.1, 0.1]
+    staged_reset_max_samples_per_stage: 200
+
+    target_root_pos: [2.0, 0.0, 0.55]
+    randomize_door_init_state: False
+
+    resting_dof_pos: [
+      -0.2, 0.8, -1.5,
+      0.2, 0.8, -1.5,
+      -0.2, 0.8, -1.5,
+      0.2, 0.8, -1.5,
+      0.0, 1.48, -0.63, -0.84, 0.0, 1.57,
+      -0.785,
+    ]
+    gripper_open_pos: [0.785]
+    gripper_closed_pos: [-0.785]
+
+    termination_curriculum:
+      level_down_ave_goal_reached_rate: 0.5
+      level_up_ave_goal_reached_rate: 0.7
+      degree: -0.0001
+      min_level: 0.1
+      max_level: 1.0
+      initial_level: 1.0
+
+    pred_model_path: "pred_model.pth"
+    random_model_path: "random_model.pth"
+    pred_model_num_per_sample: 10
+    pred_model_stride: 5
+    pred_model_baseline_error: 0.001357
+    pred_model:
+      in_features: 3101
+      hidden_features: [1024, 1024, 1024, 1024]
+      out_features: 1
+      activation: relu
+      normalization: batch_norm
+
+    random_model:
+      in_features: 3101
+      hidden_features: [1024, 1024, 1024, 1024]
+      out_features: 1
+      activation: relu
+      normalization: batch_norm
+
+log_task_name: door_open_b2z1

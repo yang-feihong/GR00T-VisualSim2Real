@@ -1,0 +1,266 @@
+# @package _global_
+
+defaults:
+  - robot_base
+
+robot:
+  num_bodies: 24
+  dof_obs_size: 19
+  actions_dim: 10
+  joint_actions_dim: 19
+  lowlevel_actions_dim: 18
+  lower_body_actions_dim: 18
+  upper_body_actions_dim: 1
+  body_keys: ["whole_body"]
+  policy_obs_dim: -1
+  critic_obs_dim: -1
+  check_action_dim: False
+
+  key_bodies: []
+  contact_bodies: []
+  num_feet: 4
+  foot_name: "foot"
+  knee_name: "calf"
+  base_body_name: "base_link"
+  gripper_body_name: "gripper_link"
+  root_body_name: "base_link"
+  manipulator_body_names: ["gripper_link"]
+  task_contact_body_names: ["gripper_link"]
+  body_contact_name_substrings: ["base", "hip", "thigh", "calf"]
+  has_torso: False
+  has_upper_body_dof: True
+
+  dof_names: [
+    "FL_hip_joint", "FR_hip_joint", "RL_hip_joint", "RR_hip_joint",
+    "joint1",
+    "FL_thigh_joint", "FR_thigh_joint", "RL_thigh_joint", "RR_thigh_joint",
+    "joint2",
+    "FL_calf_joint", "FR_calf_joint", "RL_calf_joint", "RR_calf_joint",
+    "joint3", "joint4", "joint5", "joint6",
+    "jointGripper",
+  ]
+  lower_dof_names: [
+    "FL_hip_joint", "FR_hip_joint", "RL_hip_joint", "RR_hip_joint",
+    "joint1",
+    "FL_thigh_joint", "FR_thigh_joint", "RL_thigh_joint", "RR_thigh_joint",
+    "joint2",
+    "FL_calf_joint", "FR_calf_joint", "RL_calf_joint", "RR_calf_joint",
+    "joint3", "joint4", "joint5", "joint6",
+  ]
+  upper_dof_names: ["jointGripper"]
+  arm_dof_names: ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+  right_arm_dof_names: ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+  left_arm_dof_names: ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+  waist_dof_names: []
+  gripper_dof_names: ["jointGripper"]
+
+  body_names: [
+    "base_link",
+    "FL_hip", "FL_thigh", "FL_calf", "FL_foot",
+    "FR_hip", "FR_thigh", "FR_calf", "FR_foot",
+    "RL_hip", "RL_thigh", "RL_calf", "RL_foot",
+    "RR_hip", "RR_thigh", "RR_calf", "RR_foot",
+    "link01", "link02", "link03", "link04", "link05", "link06",
+    "gripper_link",
+  ]
+  arm_body_names: ["link01", "link02", "link03", "link04", "link05", "link06", "gripper_link"]
+
+  dof_pos_lower_limit_list: [
+    -0.87, -0.87, -0.87, -0.87,
+    -2.6179938779914944,
+    -0.94, -0.94, -0.94, -0.94,
+    0.0,
+    -2.82, -2.82, -2.82, -2.82,
+    -2.8797932657906435, -1.5184364492350666, -1.3439035240356338, -2.792526803190927,
+    -0.78539816339,
+  ]
+  dof_pos_upper_limit_list: [
+    0.87, 0.87, 0.87, 0.87,
+    2.6179938779914944,
+    4.69, 4.69, 4.69, 4.69,
+    2.9670597283903604,
+    -0.43, -0.43, -0.43, -0.43,
+    0.0, 1.5184364492350666, 1.3439035240356338, 2.792526803190927,
+    0.78539816339,
+  ]
+  dof_pos_humanly_lower_limit_list: ${robot.dof_pos_lower_limit_list}
+  dof_pos_humanly_upper_limit_list: ${robot.dof_pos_upper_limit_list}
+  dof_vel_limit_list: [
+    23.0, 23.0, 23.0, 23.0,
+    3.1415,
+    23.0, 23.0, 23.0, 23.0,
+    3.1415,
+    14.0, 14.0, 14.0, 14.0,
+    3.1415, 3.1415, 3.1415, 3.1415,
+    3.1415,
+  ]
+  dof_effort_limit_list: [
+    200.0, 200.0, 200.0, 200.0,
+    30.0,
+    200.0, 200.0, 200.0, 200.0,
+    60.0,
+    320.0, 320.0, 320.0, 320.0,
+    30.0, 30.0, 30.0, 30.0,
+    20.0,
+  ]
+  dof_effort_limit_scale: 0.95
+  dof_armature_list: [
+    0.0, 0.0, 0.0, 0.0,
+    0.0,
+    0.0, 0.0, 0.0, 0.0,
+    0.0,
+    0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0,
+    0.0,
+  ]
+  dof_joint_friction_list: [
+    0.0, 0.0, 0.0, 0.0,
+    0.0,
+    0.0, 0.0, 0.0, 0.0,
+    0.0,
+    0.0, 0.0, 0.0, 0.0,
+    0.0, 0.0, 0.0, 0.0,
+    0.0,
+  ]
+
+  terminate_after_contacts_on: ["base_link"]
+  penalize_contacts_on: ["base_link", "hip", "thigh"]
+  randomize_link_body_names: ["base_link"]
+
+  init_state:
+    pos: [0.0, 0.0, 0.5]
+    rot: [0.0, 0.0, 0.0, 1.0]
+    lin_vel: [0.0, 0.0, 0.0]
+    ang_vel: [0.0, 0.0, 0.0]
+    default_joint_angles:
+      FR_hip_joint: -0.0
+      FR_thigh_joint: 0.8
+      FR_calf_joint: -1.5
+      FL_hip_joint: 0.0
+      FL_thigh_joint: 0.8
+      FL_calf_joint: -1.5
+      RR_hip_joint: -0.0
+      RR_thigh_joint: 0.8
+      RR_calf_joint: -1.5
+      RL_hip_joint: 0.0
+      RL_thigh_joint: 0.8
+      RL_calf_joint: -1.5
+      joint1: 0.0
+      joint2: 1.48
+      joint3: -0.63
+      joint4: -0.84
+      joint5: 0.0
+      joint6: 1.57
+      jointGripper: -0.785
+
+  control:
+    control_type: P
+    stiffness:
+      hip: 360.0
+      thigh: 360.0
+      calf: 360.0
+      joint1: 5.0
+      joint2: 5.0
+      joint3: 5.0
+      joint4: 5.0
+      joint5: 5.0
+      joint6: 5.0
+      jointGripper: 5.0
+    damping:
+      hip: 5.0
+      thigh: 5.0
+      calf: 5.0
+      joint1: 0.5
+      joint2: 0.5
+      joint3: 0.5
+      joint4: 0.5
+      joint5: 0.5
+      joint6: 0.5
+      jointGripper: 0.5
+    action_scale: [
+      0.4, 0.4, 0.4, 0.4,
+      2.1,
+      0.45, 0.45, 0.45, 0.45,
+      0.6,
+      0.45, 0.45, 0.45, 0.45,
+      0.6, 0.0, 0.0, 0.0,
+      0.78539816339,
+    ]
+    action_clip_value: 100.0
+    clip_torques: True
+
+  b2z1_command:
+    command_scale: [0.8, 0.8, 1.0, 0.5, 0.7, 0.6, 0.5, 0.5, 0.5, 1.0]
+    command_clip: [0.8, 0.8, 1.0, 0.5, 0.7, 0.6, 0.5, 0.5, 0.5, 1.0]
+    gripper_action_scale: 1.0
+    gripper_joint_name: "jointGripper"
+    lowlevel_policy_path: "models/b2z1_lowlevel/0713_go2_style_b2_等高系/model_45000.pt"
+    lowlevel_policy_obs_dim: 744
+    lowlevel_num_proprio: 66
+    lowlevel_num_priv: 18
+    lowlevel_history_len: 10
+    lowlevel_ang_vel_scale: 0.25
+    lowlevel_dof_pos_scale: 1.0
+    lowlevel_dof_vel_scale: 0.05
+    lowlevel_command_obs_scale: [2.0, 2.0, 0.25]
+    lowlevel_action_scale: [
+      0.4, 0.45, 0.45,
+      0.4, 0.45, 0.45,
+      0.4, 0.45, 0.45,
+      0.4, 0.45, 0.45,
+      2.1, 0.6, 0.6, 0.0, 0.0, 0.0,
+    ]
+    lowlevel_obs_clip: 100.0
+    lowlevel_action_clip: 100.0
+    lowlevel_ik_damping: 0.05
+    lowlevel_arm_induced_pitch: 0.38
+    lowlevel_goal_center_offset: [0.22, 0.0, 0.7]
+    lowlevel_default_ee_goal_cart: [0.4619397663, 0.0, 0.1913417162]
+    lowlevel_policy_joint_names: [
+      "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
+      "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
+      "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
+      "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
+      "joint1", "joint2", "joint3", "joint4", "joint5", "joint6",
+    ]
+    lowlevel_env_joint_names: [
+      "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
+      "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
+      "RL_hip_joint", "RL_thigh_joint", "RL_calf_joint",
+      "RR_hip_joint", "RR_thigh_joint", "RR_calf_joint",
+      "joint1", "joint2", "joint3", "joint4", "joint5", "joint6",
+    ]
+    lowlevel_arm_joint_names: ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
+    lowlevel_policy_model:
+      activation: "elu"
+      num_proprio: 66
+      num_priv: 18
+      history_len: 10
+      priv_encoder_dims: [64, 20]
+      actor_hidden_dims: [512, 256, 128]
+      leg_control_head_hidden_dims: [128, 128]
+      arm_control_head_hidden_dims: [128, 128]
+      num_leg_actions: 12
+      num_arm_actions: 6
+      output_tanh: False
+
+  asset:
+    collapse_fixed_joints: True
+    replace_cylinder_with_capsule: True
+    flip_visual_attachments: False
+    armature: 0.0
+    thickness: 0.01
+    max_angular_velocity: 1000.
+    max_linear_velocity: 1000.
+    density: 0.001
+    angular_damping: 0.0
+    linear_damping: 0.0
+    disable_gravity: False
+    fix_base_link: False
+    urdf_file: "/workspace/GR00T-VisualSim2Real/gr00t/rl/third_party/visual_wholebody_lowlevel/resources/robots/b2z1/urdf/generated/b2z1_mount_0_x0p22_y0_z0p17.urdf"
+    usd_file: "b2z1/b2z1.usd"
+    xml_file: null
+    robot_type: b2z1
+    self_collisions: 0
+    use_runtime_urdf: False
+    default_dof_drive_mode: 3

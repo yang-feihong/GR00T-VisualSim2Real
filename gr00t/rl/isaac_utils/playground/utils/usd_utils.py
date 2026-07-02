@@ -3,17 +3,20 @@
 
 
 import os
-import asyncio
+import re
 import numpy as np
 from pxr import Usd, Sdf, Gf, UsdPhysics, UsdGeom, UsdLux
 import omni.kit.commands
 import omni.kit.app
-manager = omni.kit.app.get_app().get_extension_manager()
-manager.set_extension_enabled_immediate("omni.kit.material.library", True)
-import omni.kit.material.library
+
+
+def _get_mdl_material_names(material_path: str) -> list[str]:
+    with open(material_path, "r", encoding="utf-8") as material_file:
+        return re.findall(r"export\s+material\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(", material_file.read())
 
 
 def preload_materials(stage: Usd.Stage, material_list: list[str], material_root_prim_path: str, random_transform_each_num: int = 1, random_color_material_list: list[str] | None = None, random_color_each_num: int = 0) -> list[str]:
+
     if stage.GetPrimAtPath(material_root_prim_path).IsValid():
         custom_data = get_custom_data_from_prim(stage, material_root_prim_path)
         if "material_prim_paths" in custom_data:
@@ -23,7 +26,7 @@ def preload_materials(stage: Usd.Stage, material_list: list[str], material_root_
     material_prim_paths = []
     material_count = 0
     for material_path in material_list:
-        subidentifiers = asyncio.run(omni.kit.material.library.get_subidentifier_from_mdl(material_path))
+        subidentifiers = _get_mdl_material_names(material_path)
         if not subidentifiers:
             print(f"Warning: No subidentifiers found for material: {material_path}, skipping.")
             continue
@@ -49,7 +52,7 @@ def preload_materials(stage: Usd.Stage, material_list: list[str], material_root_
                         material_prim_paths.append(material_prim_path)
     if random_color_material_list is not None:
         for material_path in random_color_material_list:
-            subidentifiers = asyncio.run(omni.kit.material.library.get_subidentifier_from_mdl(material_path))
+            subidentifiers = _get_mdl_material_names(material_path)
             if not subidentifiers:
                 print(f"Warning: No subidentifiers found for material: {material_path}, skipping.")
                 continue

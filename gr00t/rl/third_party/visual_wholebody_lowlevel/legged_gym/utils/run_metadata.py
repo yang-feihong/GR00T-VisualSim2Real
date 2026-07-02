@@ -5,11 +5,7 @@ import math
 import os
 from pathlib import Path
 
-from legged_gym.utils.b1z1_mount import normalize_mount_deg, normalize_mount_xyz
-from legged_gym.utils.robot_ablation import (
-    get_b1z1_b2z1_robot_ablation_checkpoint_value,
-    normalize_leg_collision_scale,
-)
+from legged_gym.utils.b2z1_mount import normalize_mount_deg, normalize_mount_xyz
 
 RUN_METADATA_FILENAME = "run_metadata.json"
 CHECKPOINT_FEATURE_NAMES = (
@@ -18,8 +14,6 @@ CHECKPOINT_FEATURE_NAMES = (
     "mixed_height_reference",
     "ee_goal_sampling_mode",
     "ee_goal_obs_mode",
-    "robot_ablation",
-    "leg_collision_scale",
     "reward_scale_preset",
     "gait_frequency_min",
     "gait_frequency_max",
@@ -148,8 +142,6 @@ def _extract_checkpoint_features(args, env_cfg):
     if env_cfg is None:
         raise ValueError("env_cfg is required when extracting checkpoint features")
     mount_xyz = normalize_mount_xyz(env_cfg.goal_ee.urdf_mount.arm_base_offset)
-    robot_ablation = env_cfg.asset.robot_ablation
-    leg_collision_scale = env_cfg.asset.leg_collision_scale
     mixed_height_reference = env_cfg.goal_ee.sphere_center.mixed_height_reference
     return {
         "observe_gait_commands": bool(env_cfg.env.observe_gait_commands),
@@ -157,8 +149,6 @@ def _extract_checkpoint_features(args, env_cfg):
         "mixed_height_reference": bool(mixed_height_reference),
         "ee_goal_sampling_mode": str(env_cfg.goal_ee.ranges.ee_goal_sampling_mode),
         "ee_goal_obs_mode": str(env_cfg.env.ee_goal_obs_mode),
-        "robot_ablation": get_b1z1_b2z1_robot_ablation_checkpoint_value(robot_ablation),
-        "leg_collision_scale": normalize_leg_collision_scale(leg_collision_scale),
         "reward_scale_preset": str(env_cfg.rewards.reward_scale_preset),
         "gait_frequency_min": float(env_cfg.env.gait_frequency_min),
         "gait_frequency_max": float(env_cfg.env.gait_frequency_max),

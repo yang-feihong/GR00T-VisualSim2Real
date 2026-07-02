@@ -670,12 +670,11 @@ class TRLPPOTrainer(PPOTrainer):
         actions_log_prob = policy_model.get_actions_log_prob(actions).unsqueeze(1)
         policy_state_dict["actions_log_prob"] = actions_log_prob
 
-        # Add hidden states to return dict if they were captured
-        if store_hidden_states and actor_hidden_states is not None:
-            policy_state_dict["hidden_states"] = (
-                actor_hidden_states,
-                None,
-            )  # (actor, critic) - critic is computed separately
+        self._last_policy_hidden_states = (
+            (actor_hidden_states, None)
+            if store_hidden_states and actor_hidden_states is not None
+            else (None, None)
+        )
 
         return policy_state_dict
 
@@ -732,23 +731,26 @@ class TRLPPOTrainer(PPOTrainer):
                         values.append(step_values)
                         # Store both actor and critic hidden states
                         combined_hidden_states = (
-                            policy_state_dict.get("hidden_states", (None, None))[0],
+                            getattr(self, "_last_policy_hidden_states", (None, None))[0],
                             critic_hidden_states,
                         )
-                        policy_state_dict["hidden_states"] = combined_hidden_states
 
                 # Append states to storage
                 for key, value in obs_dict.items():
                     self.storage.update_key(key, value)
 
                 for key, value in policy_state_dict.items():
-                    # Skip hidden_states as they're stored separately
-                    if key != "hidden_states":
-                        self.storage.update_key(key, value)
+                    self.storage.update_key(key, value)
 
                 # Store hidden states separately for recurrent policies
-                if "hidden_states" in policy_state_dict:
-                    self.storage._save_hidden_states(policy_state_dict["hidden_states"])  # type: ignore[attr-defined]
+                hidden_states = (
+                    combined_hidden_states
+                    if self.value_model is not None
+                    and hasattr(self.value_model, "is_recurrent")
+                    and self.value_model.is_recurrent
+                    else getattr(self, "_last_policy_hidden_states", (None, None))
+                )
+                self.storage._save_hidden_states(hidden_states)  # type: ignore[attr-defined]
 
                 # Step the environment
                 actor_state = {"actions": policy_state_dict["actions"]}

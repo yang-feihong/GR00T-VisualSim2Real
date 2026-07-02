@@ -99,6 +99,13 @@ class LeggedRobotBase(BaseTask):
         self.torques = torch.zeros(
             self.num_envs, self.num_dof, dtype=torch.float, device=self.device, requires_grad=False
         )
+        action_scale = self.config.robot.control.action_scale
+        if isinstance(action_scale, (int, float)):
+            self.action_scale = float(action_scale)
+        else:
+            self.action_scale = torch.tensor(
+                list(action_scale), dtype=torch.float, device=self.device, requires_grad=False
+            )
         self.p_gains = torch.zeros(
             self.num_dof, dtype=torch.float, device=self.device, requires_grad=False
         )
@@ -466,19 +473,18 @@ class LeggedRobotBase(BaseTask):
         # prepare list of functions
         self.reward_functions = []
         self.reward_names = []
+        self.episode_sums = {
+            name: torch.zeros(
+                self.num_envs, dtype=torch.float, device=self.device, requires_grad=False
+            )
+            for name in self.reward_scales.keys()
+        }
         for name, scale in self.reward_scales.items():
             if name == "termination":
                 continue
             self.reward_names.append(name)
             name = "_reward_" + name
             self.reward_functions.append(getattr(self, name))
-            # reward episode sums
-            self.episode_sums = {
-                name: torch.zeros(
-                    self.num_envs, dtype=torch.float, device=self.device, requires_grad=False
-                )
-                for name in self.reward_scales.keys()
-            }
 
     def set_is_evaluating(self, is_evaluating=True, log_info=True, **kwargs):
         if log_info:
@@ -641,7 +647,7 @@ class LeggedRobotBase(BaseTask):
             self.torques = self._compute_torques(self.actions_after_delay).view(
                 self.torques.shape
             )  # When using implicit PD
-            actions_scaled = self.actions_after_delay * self.config.robot.control.action_scale
+            actions_scaled = self.actions_after_delay * self.action_scale
             jpos_target = actions_scaled + self.default_dof_pos
             # jpos_target *= 0.
             self.simulator._robot.set_joint_position_target(
@@ -657,7 +663,7 @@ class LeggedRobotBase(BaseTask):
     def _action_backmap(self):
         return (
             self.simulator.dof_pos - self.default_dof_pos
-        ) / self.config.robot.control.action_scale
+        ) / self.action_scale
 
     def reset_all(self):
         self.reset_envs_idx(torch.arange(self.num_envs, device=self.device))
@@ -667,6 +673,7 @@ class LeggedRobotBase(BaseTask):
         self.simulator.set_dof_state_tensor(
             torch.arange(self.num_envs, device=self.device), self.target_robot_dof_state
         )
+        self.need_to_refresh_envs[:] = False
         # self.simulator.set_task_root_state_tensor(torch.arange(self.num_envs, device=self.device), self.target_task_root_states)
         # self.simulator.set_task_visual_state_tensor(torch.arange(self.num_envs, device=self.device))
         self._refresh_sim_tensors()
@@ -1234,7 +1241,7 @@ class LeggedRobotBase(BaseTask):
         if self.config.robot.control.get("rescale_action_by_dof_limit", False):
             pos_targets = pos_targets * self.dof_scales
         else:
-            pos_targets = pos_targets * self.config.robot.control.action_scale
+            pos_targets = pos_targets * self.action_scale
 
         control_type = self.config.robot.control.control_type
 
@@ -1703,9 +1710,15 @@ class LeggedRobotBase(BaseTask):
                 "Target state is no longer supported for legged robot base task"
             )
         else:
-            self.target_robot_dof_state[env_ids, :, 0] = self.default_dof_pos * torch_rand_float(
-                0.5, 1.5, (len(env_ids), self.num_dof), device=str(self.device)
-            )
+            if self.config.domain_rand.get("randomize_initial_dof_pos", True):
+                self.target_robot_dof_state[env_ids, :, 0] = (
+                    self.default_dof_pos
+                    * torch_rand_float(
+                        0.5, 1.5, (len(env_ids), self.num_dof), device=str(self.device)
+                    )
+                )
+            else:
+                self.target_robot_dof_state[env_ids, :, 0] = self.default_dof_pos
             self.target_robot_dof_state[env_ids, :, 1] = 0.0
 
     def _reset_root_states(self, env_ids, target_root_states=None):
@@ -1731,9 +1744,12 @@ class LeggedRobotBase(BaseTask):
                 self.target_robot_root_states[env_ids, :3] += self.env_origins[env_ids]
             # base velocities
 
-            self.target_robot_root_states[env_ids, 7:13] = torch_rand_float(
-                -0.5, 0.5, (len(env_ids), 6), device=str(self.device)
-            )  # [7:10]: lin vel, [10:13]: ang vel
+            if self.config.domain_rand.get("randomize_initial_root_vel", True):
+                self.target_robot_root_states[env_ids, 7:13] = torch_rand_float(
+                    -0.5, 0.5, (len(env_ids), 6), device=str(self.device)
+                )  # [7:10]: lin vel, [10:13]: ang vel
+            else:
+                self.target_robot_root_states[env_ids, 7:13] = 0.0
 
     def _plot_domain_rand_params(self):
         raise NotImplementedError
