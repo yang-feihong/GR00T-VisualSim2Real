@@ -28,6 +28,152 @@ from gr00t.rl.utils.config_utils import register_rl_resolvers
 
 register_rl_resolvers()
 
+from gr00t.rl.scripts.b2z1_physics_fixture import (
+    JOINT_POS,
+    POLICY_ACTION,
+    ROOT_POS,
+    EE_GOAL_CART,
+    VELOCITY_COMMAND,
+    joint_state_by_name,
+    snapshot,
+    tensor,
+)
+
+
+def run_open_loop(env, trace_path: str, num_substeps: int, root_height: float):
+    root_pos = (ROOT_POS[0], ROOT_POS[1], root_height)
+    root_state = tensor((*root_pos, 0.0, 0.0, 0.0, 1.0, *([0.0] * 6)), env.device)
+    joint_pos = joint_state_by_name(env.dof_names, JOINT_POS, env.device)
+    joint_vel = torch.zeros_like(joint_pos)
+    env_ids = torch.zeros(1, dtype=torch.long, device=env.device)
+    env.simulator.write_root_state_to_sim(root_state, env_ids)
+    env.simulator.write_joint_state_to_sim(joint_pos, joint_vel, env_ids)
+    env.simulator.clear_external_force_and_torque()
+    env.simulator.scene.write_data_to_sim()
+    env.simulator.scene.update(dt=env.sim_dt)
+    env._pre_compute_observations_callback()
+
+    # Match both physical state and retained actuator command state.
+    env.actions_after_delay.zero_()
+    env._b2z1_arm_pos_targets.copy_(
+        env.default_dof_pos[:, env._b2z1_arm_joint_indices]
+    )
+    gripper_target_range = (
+        env._b2z1_gripper_closed_target - env._b2z1_gripper_open_target
+    )
+    env.actions_after_delay[:, env._b2z1_gripper_joint_index] = (
+        env._b2z1_gripper_open_command
+        + (
+            joint_pos[:, env._b2z1_gripper_joint_index]
+            - env._b2z1_gripper_open_target
+        )
+        / gripper_target_range
+        * (env._b2z1_gripper_closed_command - env._b2z1_gripper_open_command)
+    )
+    env._apply_force_in_physics_step()
+    env.simulator.scene.write_data_to_sim()
+
+    data = env.simulator._robot.data
+    metadata = {
+        "body_names": list(data.body_names),
+        "articulation_dof_names": list(data.joint_names),
+        "initial_root_state": snapshot(env.simulator.robot_root_states),
+        "initial_joint_pos": snapshot(env.simulator.dof_pos),
+        "initial_joint_vel": snapshot(env.simulator.dof_vel),
+        "initial_body_pos": snapshot(data.body_pos_w),
+        "initial_body_quat": snapshot(data.body_quat_w),
+        "initial_body_lin_vel": snapshot(data.body_lin_vel_w),
+        "initial_body_ang_vel": snapshot(data.body_ang_vel_w),
+        "body_mass": snapshot(data.default_mass),
+        "body_inertia": snapshot(data.default_inertia),
+        "joint_armature": snapshot(data.default_joint_armature),
+        "joint_friction": snapshot(data.default_joint_friction_coeff),
+        "default_joint_pos": snapshot(env.default_dof_pos),
+        "hard_dof_pos_limits": snapshot(env.simulator.hard_dof_pos_limits),
+        "dof_vel_limits": snapshot(env.dof_vel_limits),
+        "torque_limits": snapshot(env.torque_limits),
+        "articulation_joint_pos_limits": snapshot(data.joint_pos_limits),
+        "articulation_joint_vel_limits": snapshot(data.joint_vel_limits),
+        "articulation_joint_effort_limits": snapshot(data.joint_effort_limits),
+    }
+
+    env._b2z1_commands.zero_()
+    env._b2z1_commands[:, 3:6] = (
+        tensor(EE_GOAL_CART, env.device) - env._b2z1_default_ee_goal_cart
+    )
+    env._refresh_b2z1_arm_target()
+    goal_position, goal_orientation_xyzw = env._compute_b2z1_ee_goal_world()
+    ik_alignment = {
+        "goal_position": snapshot(goal_position),
+        "goal_orientation_wxyz": snapshot(goal_orientation_xyzw[:, [3, 0, 1, 2]]),
+        "arm_target": snapshot(env._b2z1_arm_pos_targets),
+    }
+
+    env._b2z1_commands.zero_()
+    env._b2z1_commands[:, :3] = tensor(VELOCITY_COMMAND, env.device)
+    env._b2z1_commands[:, 3:6] = (
+        tensor(EE_GOAL_CART, env.device) - env._b2z1_default_ee_goal_cart
+    )
+    env._lowlevel_prev_policy_actions.zero_()
+    env._lowlevel_obs_history.zero_()
+    env.episode_length_buf.zero_()
+    gait_reset_mask = torch.ones(env.num_envs, dtype=torch.bool, device=env.device)
+    env._set_lowlevel_fixed_trot_stopped(gait_reset_mask)
+    policy_obs = env._build_lowlevel_obs().clone()
+    with torch.no_grad():
+        policy_output = env._lowlevel_policy(policy_obs)
+
+    env.actions_after_delay.zero_()
+    env.actions_after_delay[:, env._lowlevel_policy_joint_indices] = tensor(
+        POLICY_ACTION, env.device
+    )
+    env.actions_after_delay[:, env._b2z1_gripper_joint_index] = (
+        env._b2z1_gripper_open_command
+        + (
+            joint_pos[:, env._b2z1_gripper_joint_index]
+            - env._b2z1_gripper_open_target
+        )
+        / gripper_target_range
+        * (env._b2z1_gripper_closed_command - env._b2z1_gripper_open_command)
+    )
+    env._b2z1_arm_pos_targets.copy_(
+        env.default_dof_pos[:, env._b2z1_arm_joint_indices]
+    )
+    records = []
+    for _ in range(num_substeps):
+        env._apply_force_in_physics_step()
+        requested = env.torques.clone()
+        position_target = env.simulator._robot.data.joint_pos_target.clone()
+        env.simulator.simulate_at_each_physics_step()
+        records.append(
+            {
+                "root_state": snapshot(env.simulator.robot_root_states),
+                "joint_pos": snapshot(env.simulator.dof_pos),
+                "joint_vel": snapshot(env.simulator.dof_vel),
+                "requested_torque": snapshot(requested),
+                "position_target": snapshot(position_target),
+                "control_target": snapshot(env._b2z1_arm_pos_targets),
+                "applied_torque": snapshot(
+                    env.simulator._robot.data.applied_torque[:, env.simulator.dof_ids]
+                ),
+            }
+        )
+    torch.save(
+        {
+            "dof_names": list(env.dof_names),
+            "metadata": metadata,
+            "policy_alignment": {
+                "proprio": snapshot(policy_obs[:, : env._lowlevel_num_prop]),
+                "observation": snapshot(policy_obs),
+                "action": snapshot(policy_output),
+            },
+            "ik_alignment": ik_alignment,
+            "records": records,
+        },
+        trace_path,
+    )
+    logger.info(f"Wrote open-loop trace to {trace_path}")
+
 
 def isaacsim_ext_folders() -> list[str]:
     folders = []
@@ -41,13 +187,15 @@ def isaacsim_ext_folders() -> list[str]:
     ov_ext_cache = Path.home() / ".local/share/ov/data/exts/v2"
     if ov_ext_cache.is_dir():
         folders.append(str(ov_ext_cache))
-    isaaclab_source = Path("/workspace/IsaacLab/source")
+    isaaclab_source = Path("/workspace/isaaclab/source")
+    if not isaaclab_source.exists():
+        isaaclab_source = Path("/workspace/IsaacLab/source")
     if isaaclab_source.is_dir():
         folders.append(str(isaaclab_source))
     return folders
 
 
-def isaacsim_kit_args() -> str:
+def isaacsim_kit_args(use_gpu: bool) -> str:
     args = []
     for folder in isaacsim_ext_folders():
         args.extend(["--ext-folder", folder])
@@ -58,10 +206,15 @@ def isaacsim_kit_args() -> str:
             "--/renderer/active=none",
             "--/renderer/multiGpu/enabled=false",
             "--/renderer/multiGpu/autoEnable=false",
-            "--/physics/fabricUseGPUInterop=false",
-            "--/physics/cudaDevice=-1",
         ]
     )
+    if not use_gpu:
+        args.extend(
+            [
+                "--/physics/fabricUseGPUInterop=false",
+                "--/physics/cudaDevice=-1",
+            ]
+        )
     return " ".join(args)
 
 
@@ -182,7 +335,11 @@ def main(config: OmegaConf):
         )
         args_cli.headless = config.headless
         args_cli.device = device
-        args_cli.kit_args = " ".join(part for part in (args_cli.kit_args, isaacsim_kit_args()) if part)
+        args_cli.kit_args = " ".join(
+            part
+            for part in (args_cli.kit_args, isaacsim_kit_args(torch.cuda.is_available()))
+            if part
+        )
 
         if args_cli.enable_cameras and config.headless:
             dest_path = Path(isaaclab.__file__).resolve().parent.parent.parent.parent / "apps"
@@ -219,6 +376,18 @@ def main(config: OmegaConf):
     env = custom_instantiate(config.env, device=device, _resolve=False)
     env.reset_all()
 
+    open_loop_trace_path = config.get("open_loop_trace_path", None)
+    if open_loop_trace_path:
+        run_open_loop(
+            env,
+            str(open_loop_trace_path),
+            int(config.get("open_loop_substeps", 4)),
+            float(config.get("open_loop_root_height", ROOT_POS[2])),
+        )
+        if simulation_app is not None:
+            simulation_app.close()
+        return
+
     fixed_command = torch.tensor(
         config.get("fixed_command", [0.0] * 10),
         device=env.device,
@@ -237,6 +406,7 @@ def main(config: OmegaConf):
     trace_path = config.get("trace_path", None)
     trace_steps = set(int(x) for x in config.get("trace_steps", [0, 1, 2, 3, 4, 5, 10, 20, 50]))
     trace = {"meta": {}, "steps": {}} if trace_path is not None else None
+    debug_stage_cycle = bool(config.get("debug_stage_cycle", False))
     if trace is not None:
         trace["meta"]["dof_names"] = list(env.dof_names)
         trace["meta"]["dof_ids"] = list(env.simulator.dof_ids)
@@ -248,12 +418,16 @@ def main(config: OmegaConf):
             trace["meta"]["policy_joint_indices"] = policy_joint_indices
             trace["meta"]["policy_joint_names"] = [env.dof_names[i] for i in policy_joint_indices]
     for step in range(num_steps):
+        if debug_stage_cycle:
+            env.stage_buf.fill_(step % env.num_stages)
         obs, rew, reset, extras = env.step({"actions": actions.clone()})
         env.render_results()
         if skeleton_video_path is not None and step % skeleton_stride == 0:
             skeleton_frames.append(env.simulator._rigid_body_pos[0].detach().cpu().clone())
         if trace is not None and step in trace_steps:
             step_trace = {
+                "stage": env.stage_buf[0].detach().cpu(),
+                "reward": rew[0].detach().cpu(),
                 "commands": env.get_physical_b2z1_commands()[0].detach().cpu(),
                 "dof_pos": env.simulator.dof_pos[0].detach().cpu(),
                 "dof_vel": env.simulator.dof_vel[0].detach().cpu(),
@@ -262,8 +436,46 @@ def main(config: OmegaConf):
                 "base_quat": env.base_quat[0].detach().cpu(),
                 "root_state": env.simulator.robot_root_states[0].detach().cpu(),
                 "rigid_body_pos": env.simulator._rigid_body_pos[0].detach().cpu(),
+                "rigid_body_rot": env.simulator._rigid_body_rot[0].detach().cpu(),
+                "task_contact_prim_rot_wxyz": (
+                    env.simulator.task_contact_prim_rot_wxyz[0].detach().cpu()
+                ),
+                "hand_target_pos_source": (
+                    env.simulator.hand_transform_pos[0].detach().cpu()
+                ),
+                "hand_target_quat_source_wxyz": (
+                    env.simulator.hand_transform_rot[0].detach().cpu()
+                ),
+                "hand_source_pos_w": (
+                    env.simulator.scene.sensors["hand_frame_transformer"]
+                    .data.source_pos_w[0]
+                    .detach()
+                    .cpu()
+                ),
+                "hand_source_quat_wxyz": (
+                    env.simulator.scene.sensors["hand_frame_transformer"]
+                    .data.source_quat_w[0]
+                    .detach()
+                    .cpu()
+                ),
+                "grasp_target_pos_w": (
+                    env.simulator.scene.sensors["hand_frame_transformer"]
+                    .data.target_pos_w[0]
+                    .detach()
+                    .cpu()
+                ),
+                "grasp_target_quat_wxyz": (
+                    env.simulator.scene.sensors["hand_frame_transformer"]
+                    .data.target_quat_w[0]
+                    .detach()
+                    .cpu()
+                ),
                 "torques": env.torques[0].detach().cpu(),
                 "actions_after_delay": env.actions_after_delay[0].detach().cpu(),
+                "arm_pos_targets": env._b2z1_arm_pos_targets[0].detach().cpu(),
+                "joint_pos_targets": (
+                    env.simulator._robot.data.joint_pos_target[0].detach().cpu()
+                ),
             }
             if hasattr(env, "_lowlevel_policy_joint_indices"):
                 policy_ids = env._lowlevel_policy_joint_indices

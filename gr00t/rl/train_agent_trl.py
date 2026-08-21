@@ -87,9 +87,16 @@ def resume_training(config):
         experiment_dir_base = os.path.join(
             config.base_dir, config.project_name, config.experiment_name
         )
-        last_existing_checkpoint = sorted(
+        checkpoints = sorted(
             glob.glob(os.path.join(f"{experiment_dir_base}-*", "last.pt"))
-        )[-1]
+        )
+        if not checkpoints:
+            raise FileNotFoundError(
+                f"auto_load_latest found no last.pt under {experiment_dir_base}-*"
+            )
+        last_existing_checkpoint = checkpoints[-1]
+    if not os.path.isfile(last_existing_checkpoint):
+        raise FileNotFoundError(f"Checkpoint does not exist: {last_existing_checkpoint}")
     experiment_dir = os.path.dirname(last_existing_checkpoint)
     config.experiment_dir = experiment_dir
     config.checkpoint = last_existing_checkpoint
@@ -170,6 +177,9 @@ def process_output_dim_in_config(config):
 def main(config: OmegaConf):
     # Auto-calculate vision_feature_dim for history-based vision models
     auto_calculate_vision_feature_dim(config)
+
+    if config.get("auto_load_latest", False):
+        resume_training(config)
 
     from transformers import HfArgumentParser
     from trl import ModelConfig, PPOConfig, ScriptArguments

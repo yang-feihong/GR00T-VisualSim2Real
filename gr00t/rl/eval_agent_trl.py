@@ -106,6 +106,11 @@ def main(override_config: OmegaConf):
     os.chdir(hydra.utils.get_original_cwd())
 
     # --- Load and merge training config from checkpoint directory ---
+    if override_config.checkpoint is None:
+        raise ValueError("Evaluation requires +checkpoint=/path/to/checkpoint.pt")
+    if not Path(override_config.checkpoint).is_file():
+        raise FileNotFoundError(f"Checkpoint does not exist: {override_config.checkpoint}")
+
     if override_config.checkpoint is not None:
         has_config = True
         checkpoint = Path(override_config.checkpoint)
@@ -191,6 +196,10 @@ def main(override_config: OmegaConf):
             source_file = current_file_dir_path / "apps/phc.isaaclab.python.headless.rendering.kit"
             shutil.copy(source_file, dest_path)
             args_cli.experience = dest_path / "phc.isaaclab.python.headless.rendering.kit"
+        elif args_cli.headless and config.robot.get("b2z1_command") is not None:
+            args_cli.experience = (
+                current_file_dir_path / "apps/b2z1.isaaclab.python.headless.no_render.kit"
+            )
 
         app_launcher = AppLauncher(args_cli)
         simulation_app = app_launcher.app

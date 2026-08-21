@@ -6,7 +6,6 @@ obs:
       dof_pos,
       relative_to_door,
       dof_vel,
-      actions,
       projected_gravity,
       door_dof_pos,
       base_lin_vel,
@@ -16,7 +15,6 @@ obs:
       privileged_door_info,
       delta_actions,
       hand_handle_transform,
-      unwarped_actions,
       b2z1_commands,
     ]
 
@@ -24,7 +22,6 @@ obs:
       dof_pos,
       relative_to_door,
       dof_vel,
-      actions,
       projected_gravity,
       door_dof_pos,
       base_lin_vel,
@@ -34,7 +31,6 @@ obs:
       privileged_door_info,
       delta_actions,
       hand_handle_transform,
-      unwarped_actions,
       transition,
       complete,
       time_in_stage,
@@ -43,53 +39,12 @@ obs:
       b2z1_commands,
     ]
 
-  obs_auxiliary:
-    history_long: {
-      dof_pos: 20,
-      relative_to_door: 20,
-      dof_vel: 2,
-      actions: 15,
-      projected_gravity: 15,
-      door_dof_pos: 15,
-      base_lin_vel: 15,
-      base_ang_vel: 15,
-      hand_force: 15,
-      stage: 15,
-      privileged_door_info: 15,
-      delta_actions: 15,
-      hand_handle_transform: 15,
-      transition: 15,
-      complete: 15,
-      time_in_stage: 15,
-      actual_time_in_stage: 15,
-    }
-
-    history_short: {
-      dof_pos: 3,
-      relative_to_door: 3,
-      dof_vel: 2,
-      actions: 1,
-      projected_gravity: 1,
-      door_dof_pos: 2,
-      base_lin_vel: 2,
-      base_ang_vel: 2,
-      hand_force: 2,
-      stage: 2,
-      privileged_door_info: 2,
-      delta_actions: 2,
-      hand_handle_transform: 2,
-      transition: 2,
-      complete: 2,
-      time_in_stage: 2,
-      actual_time_in_stage: 2,
-    }
+  obs_auxiliary: {}
 
   obs_scales: {
     dof_pos: 1.0,
     relative_to_door: 1.0,
     dof_vel: 0.05,
-    history: 1.0,
-    actions: 1.0,
     projected_gravity: 1.0,
     door_dof_pos: 1.0,
     base_lin_vel: 1.0,
@@ -99,7 +54,6 @@ obs:
     privileged_door_info: 1.0,
     delta_actions: 1.0,
     hand_handle_transform: 1.0,
-    unwarped_actions: 1.0,
     transition: 1.0,
     complete: 1.0,
     time_in_stage: 1.0,
@@ -112,8 +66,6 @@ obs:
     dof_pos: 0.01,
     relative_to_door: 0.0,
     dof_vel: 0.2,
-    history: 0.0,
-    actions: 0.0,
     projected_gravity: 0.0,
     door_dof_pos: 0.0,
     base_lin_vel: 0.0,
@@ -123,7 +75,6 @@ obs:
     privileged_door_info: 0.0,
     delta_actions: 0.0,
     hand_handle_transform: 0.0,
-    unwarped_actions: 0.0,
     transition: 0.0,
     complete: 0.0,
     time_in_stage: 0.0,
@@ -145,7 +96,6 @@ obs:
     - hand_force: 3
     - relative_to_door: 9
     - dof_vel: ${robot.dof_obs_size}
-    - actions: ${robot.actions_dim}
     - projected_gravity: 3
     - door_dof_pos: 2
     - base_lin_vel: 3
@@ -160,4 +110,3 @@ obs:
     - actual_time_in_stage: 1
     - total_time: 1
     - delta_actions: ${eval:'len(${env.config.delta_action_indices})'}
-    - unwarped_actions: ${eval:'len(${env.config.warped_action.indices})'}

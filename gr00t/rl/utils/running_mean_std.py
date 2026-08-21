@@ -68,7 +68,7 @@ class RunningMeanStd(nn.Module):
         new_count = tot_count
         return new_mean, new_var, new_count
 
-    def forward(self, input, unnorm=False):
+    def forward(self, input, unnorm=False, update_stats=True):
         # change shape
         input_shape = input.shape
         if len(input.shape) == 3:
@@ -104,9 +104,9 @@ class RunningMeanStd(nn.Module):
                 y = torch.clamp(y, min=-5.0, max=5.0)
 
         # update After normalization, so that the values used for training and testing are the same.
-        if self.training and not self.frozen:
+        if self.training and not self.frozen and update_stats:
             mean = input.mean(self.axis)  # along channel axis
-            var = input.var(self.axis)
+            var = input.var(self.axis, unbiased=False)
             new_mean, new_var, new_count = self._update_mean_var_count_from_moments(
                 self.running_mean, self.running_var, self.count, mean, var, input.size()[0]
             )

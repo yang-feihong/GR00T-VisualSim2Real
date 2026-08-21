@@ -26,6 +26,33 @@ robot:
   root_body_name: "base_link"
   manipulator_body_names: ["gripper_link"]
   task_contact_body_names: ["gripper_link"]
+  # Keep the IK/pose frame above, but sense contact on the movable gripper mesh.
+  task_contact_prim_names: ["gripperMover"]
+  # B2Z1 gripper morphology used by manipulation rewards.  The gripper_link +X
+  # axis is the approach/palm direction and aligns with the door grasp target.
+  task_palm_side_directions: ["+x"]
+  task_grasp_orientation_mode: "target_frame_with_source_offset"
+  # Desired gripper_link orientation in the door grasp-target frame.  Rx(-pi/2)
+  # is lab30's zero orientation-command convention and aligns the jaw with the
+  # horizontal handle while preserving target-frame hinge/handle rotations.
+  task_grasp_source_quat_target_wxyz: [0.70710678, -0.70710678, 0.0, 0.0]
+  task_grasp_reward_mode: "single_gripper_contact"
+  task_face_target_yaw_only: True
+  # Only joints attributable to the high-level manipulation command belong in
+  # task joint-limit rewards; leg limits are owned by the low-level controller.
+  task_reward_dof_names: [
+    "joint1", "joint2", "joint3", "joint4", "joint5", "joint6", "jointGripper"
+  ]
+  # Radians and radians/second, scaled for jointGripper's [-1.57, 0] travel.
+  task_gripper_pos_tracking_std: 0.3
+  task_gripper_vel_tracking_std: 0.2
+  task_gripper_target_vel: 0.6
+  task_gripper_open_tolerance: 0.175
+  task_gripper_closed_tolerance: 0.25
+  # B2Z1's nominal gripper reach is about 0.66 m from the root frame.
+  task_approach_root_distance: 0.8
+  task_arm_overspeed_limit_ratio: 0.95
+  task_arm_termination_limit_ratio: 1.0
   body_contact_name_substrings: ["base", "hip", "thigh", "calf"]
   has_torso: False
   has_upper_body_dof: True
@@ -71,37 +98,37 @@ robot:
     -0.94, -0.94, -0.94, -0.94,
     0.0,
     -2.82, -2.82, -2.82, -2.82,
-    -2.8797932657906435, -1.5184364492350666, -1.3439035240356338, -2.792526803190927,
-    -0.78539816339,
+    -4.78, -1.744, -1.727, -2.79,
+    -1.57,
   ]
   dof_pos_upper_limit_list: [
     0.87, 0.87, 0.87, 0.87,
     2.6179938779914944,
     4.69, 4.69, 4.69, 4.69,
-    2.9670597283903604,
+    3.14,
     -0.43, -0.43, -0.43, -0.43,
-    0.0, 1.5184364492350666, 1.3439035240356338, 2.792526803190927,
-    0.78539816339,
+    0.0, 1.57, 1.727, 2.79,
+    0.0,
   ]
   dof_pos_humanly_lower_limit_list: ${robot.dof_pos_lower_limit_list}
   dof_pos_humanly_upper_limit_list: ${robot.dof_pos_upper_limit_list}
   dof_vel_limit_list: [
     23.0, 23.0, 23.0, 23.0,
-    3.1415,
+    20.0,
     23.0, 23.0, 23.0, 23.0,
-    3.1415,
+    20.0,
     14.0, 14.0, 14.0, 14.0,
-    3.1415, 3.1415, 3.1415, 3.1415,
-    3.1415,
+    20.0, 20.0, 20.0, 20.0,
+    20.0,
   ]
   dof_effort_limit_list: [
     200.0, 200.0, 200.0, 200.0,
-    30.0,
+    80.0,
     200.0, 200.0, 200.0, 200.0,
-    60.0,
+    80.0,
     320.0, 320.0, 320.0, 320.0,
-    30.0, 30.0, 30.0, 30.0,
-    20.0,
+    80.0, 80.0, 80.0, 80.0,
+    80.0,
   ]
   dof_effort_limit_scale: 0.95
   dof_armature_list: [
@@ -124,7 +151,8 @@ robot:
   ]
 
   terminate_after_contacts_on: ["base_link"]
-  penalize_contacts_on: ["base_link", "hip", "thigh"]
+  # Keep the morphology contact policy identical to lab30 B2Z1Cfg.asset.
+  penalize_contacts_on: ["base_link", "thigh", "calf"]
   randomize_link_body_names: ["base_link"]
 
   init_state:
@@ -150,7 +178,7 @@ robot:
       joint3: -0.63
       joint4: -0.84
       joint5: 0.0
-      joint6: 1.57
+      joint6: 0.0
       jointGripper: -0.785
 
   control:
@@ -192,17 +220,46 @@ robot:
   b2z1_command:
     command_scale: [0.8, 0.8, 1.0, 0.5, 0.7, 0.6, 0.5, 0.5, 0.5, 1.0]
     command_clip: [0.8, 0.8, 1.0, 0.5, 0.7, 0.6, 0.5, 0.5, 0.5, 1.0]
-    gripper_action_scale: 1.0
+    # Locomotion bounds come from the checkpoint's command training range.
+    command_lower: [-0.5, -0.5, -0.7854, -0.5, -0.7, -0.6, -0.5, -0.5, -0.5, -1.0]
+    command_upper: [0.8, 0.5, 0.7854, 0.5, 0.7, 0.6, 0.5, 0.5, 0.5, 1.0]
     gripper_joint_name: "jointGripper"
-    lowlevel_policy_path: "models/b2z1_lowlevel/0713_go2_style_b2_等高系/model_45000.pt"
-    lowlevel_policy_obs_dim: 744
-    lowlevel_num_proprio: 66
+    gripper_open_pos: -0.785
+    gripper_closed_pos: 0.0
+    # Match Doorman's finger primitive convention.
+    gripper_open_command: -1.0
+    gripper_closed_command: 1.0
+    lowlevel_leg_control_mode: "effort"
+    lowlevel_policy_path: "ckpt/b2z1-low/20260817_154058_is-dc6jrxz4suufnmlp-devmachine-0_gpu1_agent2_z8e0p66v/model_40000.pt"
+    lowlevel_policy_obs_dim: 799
+    lowlevel_num_proprio: 71
     lowlevel_num_priv: 18
+    # Deployment constants from visual_wholebody_yfh_lab30 B2Z1IsaacLabCfg.
+    lowlevel_privileged_obs: [
+      1.0417996645, 0.0278970338, -0.0049375524, 0.0034558435, 0.0041646943,
+      0.5203154087,
+      -0.0505197048, -0.0021830797, 0.0155738592, 0.0877133608,
+      0.0432497263, 0.0514459610, -0.0362112522, -0.0647801161,
+      0.0294282436, 0.0939646959, 0.0774357319, -0.0036721826,
+    ]
     lowlevel_history_len: 10
     lowlevel_ang_vel_scale: 0.25
     lowlevel_dof_pos_scale: 1.0
     lowlevel_dof_vel_scale: 0.05
     lowlevel_command_obs_scale: [2.0, 2.0, 0.25]
+    lowlevel_observe_foot_contacts: True
+    lowlevel_zero_observed_foot_contacts: True
+    lowlevel_observe_gait_commands: True
+    lowlevel_foot_contact_force_threshold: 1.5
+    lowlevel_lin_vel_x_clip: 0.1
+    lowlevel_lin_vel_y_clip: 0.1
+    lowlevel_ang_vel_yaw_clip: 0.1
+    lowlevel_fixed_trot_frequency: 1.5
+    lowlevel_gait_transition_duration_s: 0.5
+    lowlevel_trot_stance_ratio: 0.5
+    lowlevel_trot_swing_ratio: 0.5
+    # Exact fixed-trot timing recorded with model_40000.pt.
+    lowlevel_trot_swing_duration_max_s: 0.25
     lowlevel_action_scale: [
       0.4, 0.45, 0.45,
       0.4, 0.45, 0.45,
@@ -214,8 +271,11 @@ robot:
     lowlevel_action_clip: 100.0
     lowlevel_ik_damping: 0.05
     lowlevel_arm_induced_pitch: 0.38
-    lowlevel_goal_center_offset: [0.22, 0.0, 0.7]
+    lowlevel_goal_center_offset: [0.2, 0.0, 0.7]
     lowlevel_default_ee_goal_cart: [0.4619397663, 0.0, 0.1913417162]
+    # [radius, pitch, yaw], copied from the low-level checkpoint metadata.
+    lowlevel_ee_goal_sphere_lower: [0.4, -1.4959965017, -1.5707963268]
+    lowlevel_ee_goal_sphere_upper: [0.95, 1.0471975512, 1.5707963268]
     lowlevel_policy_joint_names: [
       "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
       "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
@@ -233,7 +293,9 @@ robot:
     lowlevel_arm_joint_names: ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
     lowlevel_policy_model:
       activation: "elu"
-      num_proprio: 66
+      # lab30 normal-checkpoint playback calls act_inference(hist_encoding=False).
+      latent_mode: "privileged"
+      num_proprio: 71
       num_priv: 18
       history_len: 10
       priv_encoder_dims: [64, 20]
@@ -258,7 +320,8 @@ robot:
     disable_gravity: False
     fix_base_link: False
     urdf_file: "/workspace/GR00T-VisualSim2Real/gr00t/rl/third_party/visual_wholebody_lowlevel/resources/robots/b2z1/urdf/generated/b2z1_mount_0_x0p22_y0_z0p17.urdf"
-    usd_file: "b2z1/b2z1.usd"
+    # Exact Isaac Lab conversion used by visual_wholebody_yfh_lab30.
+    usd_file: "b2z1_lab30/b2z1_mount_0_x0p22_y0_z0p17.usd"
     xml_file: null
     robot_type: b2z1
     self_collisions: 0

@@ -1220,9 +1220,16 @@ class LeggedRobotBase(BaseTask):
         for obs_key, obs_config in self.config.obs.obs_dict.items():
             obs_keys = sorted(obs_config)
             obs_keys = [k[:-4] if k.endswith("_raw") else k for k in obs_keys]
-            self.obs_buf_dict[obs_key] = torch.cat(
+            obs = torch.cat(
                 [self.obs_buf_dict_raw[obs_key][key] for key in obs_keys], dim=-1
             )
+            expected_dim = self.config.robot.algo_obs_dim_dict.get(obs_key)
+            if obs.ndim == 2 and expected_dim is not None and obs.shape[-1] != expected_dim:
+                raise RuntimeError(
+                    f"{obs_key} observation dimension mismatch: "
+                    f"configured {expected_dim}, runtime {obs.shape[-1]}"
+                )
+            self.obs_buf_dict[obs_key] = obs
 
     def _compute_torques(self, actions):
         """Compute torques from actions.

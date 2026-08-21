@@ -202,9 +202,14 @@ def _apply_checkpoint_observation_dim_args(cfg, metadata: dict):
     cfg.env.history_len = int(env_metadata["history_len"])
 
 
-def _apply_checkpoint_gait_args(cfg, features: dict):
+def _apply_checkpoint_gait_args(cfg, features: dict, metadata: dict):
+    env_metadata = metadata["env_cfg"]["env"]
     for name in GAIT_FREQUENCY_FEATURE_NAMES:
-        setattr(cfg.env, name, float(features[name]))
+        value = features.get(name, env_metadata.get(name))
+        if value is None and name in ("gait_frequency_min", "gait_frequency_max"):
+            value = features.get("fixed_trot_frequency", env_metadata.get("fixed_trot_frequency"))
+        if value is not None:
+            setattr(cfg.env, name, float(value))
 
 
 def _apply_checkpoint_command_schedule_args(cfg, metadata: dict):
@@ -278,6 +283,7 @@ def resolve_robot_urdf_path(args, require_checkpoint_metadata=False, checkpoint_
 
 
 def _apply_cli_basic_env_args(cfg, args):
+    cfg.sim.device = str(args.sim_device)
     cfg.scene.num_envs = int(args.num_envs)
     cfg.env.num_envs = int(args.num_envs)
     cfg.env.teleop_mode = bool(args.teleop_mode)
@@ -387,7 +393,7 @@ def build_env_cfg(args, for_play=False):
         _validate_checkpoint_robot_args(checkpoint_features)
         _apply_checkpoint_goal_and_observation_args(cfg, checkpoint_features)
         _apply_checkpoint_observation_dim_args(cfg, metadata)
-        _apply_checkpoint_gait_args(cfg, checkpoint_features)
+        _apply_checkpoint_gait_args(cfg, checkpoint_features, metadata)
         _apply_checkpoint_command_schedule_args(cfg, metadata)
 
     _apply_cli_basic_env_args(cfg, args)

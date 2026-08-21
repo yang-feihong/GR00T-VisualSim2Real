@@ -3,11 +3,11 @@ set -euo pipefail
 
 # Official B2Z1 door-opening RL training entry.
 # Defaults are intentionally small for launch validation; increase these for real runs.
-GPU_ID="2"                 # Host GPU exposed as cuda:0 inside this process.
-NUM_ENVS="1"
-NUM_TOTAL_BATCHES="2"
-NUM_STEPS_PER_ENV="8"
-NUM_MINI_BATCHES="1"
+GPU_ID="${GPU_ID:-2}"                 # Host GPU exposed as cuda:0 inside this process.
+NUM_ENVS="${NUM_ENVS:-1}"
+NUM_TOTAL_BATCHES="${NUM_TOTAL_BATCHES:-2}"
+NUM_STEPS_PER_ENV="${NUM_STEPS_PER_ENV:-8}"
+NUM_MINI_BATCHES="${NUM_MINI_BATCHES:-1}"
 DYNAMIC_MATERIAL_RANDOMIZATION="${DYNAMIC_MATERIAL_RANDOMIZATION:-false}"
 DYNAMIC_MATERIAL_RANDOMIZATION_INTERVAL="${DYNAMIC_MATERIAL_RANDOMIZATION_INTERVAL:-1.0}"
 LOG_FILE="${LOG_FILE:-/tmp/b2z1_door_train_validation.log}"
@@ -40,7 +40,7 @@ accelerate launch --num_processes 1 gr00t/rl/train_agent_trl.py \
 status=${PIPESTATUS[0]}
 set -e
 
-if rg -q "Error executing job|Traceback|ValueError|RuntimeError|TypeError" "${LOG_FILE}"; then
+if grep -Eq "Error executing job|Traceback|ValueError|RuntimeError|TypeError" "${LOG_FILE}"; then
   exit 1
 fi
 

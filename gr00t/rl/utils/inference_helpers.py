@@ -24,32 +24,83 @@ def export_policy_as_onnx(inference_model, path, exported_policy_name, example_o
     actor = copy.deepcopy(inference_model["actor"]).to("cpu")
     actor.eval()
 
-    class PPOWrapper(nn.Module):
+    class FeedForwardWrapper(nn.Module):
         def __init__(self, actor):
-            """
-            model: The original PyTorch model.
-            input_keys: List of input names as keys for the input dictionary.
-            """
-            super(PPOWrapper, self).__init__()
+            super().__init__()
             self.actor = actor
 
-        def forward(self, obs_dict):
-            """
-            Dynamically creates a dictionary from the input keys and args.
-            """
-            return self.actor.act_inference(obs_dict)
+        def forward(self, actor_obs):
+            return self.actor.forward({self.actor.input_key: actor_obs})
 
-    wrapper = PPOWrapper(actor)
-    example_input_list = {"obs_dict": example_obs_dict}
+    class LSTMWrapper(nn.Module):
+        def __init__(self, actor):
+            super().__init__()
+            self.running_mean_std = actor.running_mean_std
+            self.rnn = actor.memory.rnn
+            self.actor_module = actor.actor_module
+
+        def forward(self, actor_obs, h_in, c_in):
+            if self.running_mean_std is not None:
+                actor_obs = self.running_mean_std(actor_obs)
+            memory_out, (h_out, c_out) = self.rnn(
+                actor_obs.unsqueeze(0), (h_in, c_in)
+            )
+            action = self.actor_module(memory_out.squeeze(0))
+            return action, h_out, c_out
+
+    class GRUWrapper(nn.Module):
+        def __init__(self, actor):
+            super().__init__()
+            self.running_mean_std = actor.running_mean_std
+            self.rnn = actor.memory.rnn
+            self.actor_module = actor.actor_module
+
+        def forward(self, actor_obs, h_in):
+            if self.running_mean_std is not None:
+                actor_obs = self.running_mean_std(actor_obs)
+            memory_out, h_out = self.rnn(actor_obs.unsqueeze(0), h_in)
+            action = self.actor_module(memory_out.squeeze(0))
+            return action, h_out
+
+    actor_obs = example_obs_dict[actor.input_key].detach().to("cpu")
+    dynamic_axes = {"actor_obs": {0: "batch"}, "action": {0: "batch"}}
+    if getattr(actor, "is_recurrent", False):
+        num_layers = actor.memory.rnn.num_layers
+        hidden_size = actor.memory.rnn.hidden_size
+        state = actor_obs.new_zeros(num_layers, actor_obs.shape[0], hidden_size)
+        dynamic_axes["h_in"] = {1: "batch"}
+        dynamic_axes["h_out"] = {1: "batch"}
+        if isinstance(actor.memory.rnn, nn.LSTM):
+            wrapper = LSTMWrapper(actor)
+            example_input_list = (actor_obs, state, state.clone())
+            input_names = ["actor_obs", "h_in", "c_in"]
+            output_names = ["action", "h_out", "c_out"]
+            dynamic_axes["c_in"] = {1: "batch"}
+            dynamic_axes["c_out"] = {1: "batch"}
+        elif isinstance(actor.memory.rnn, nn.GRU):
+            wrapper = GRUWrapper(actor)
+            example_input_list = (actor_obs, state)
+            input_names = ["actor_obs", "h_in"]
+            output_names = ["action", "h_out"]
+        else:
+            raise ValueError(f"Unsupported recurrent policy type: {type(actor.memory.rnn)}")
+    else:
+        wrapper = FeedForwardWrapper(actor)
+        example_input_list = actor_obs
+        input_names = ["actor_obs"]
+        output_names = ["action"]
+
+    wrapper.eval()
     with torch.no_grad():
         torch.onnx.export(
             wrapper,
-            example_input_list,  # Pass x1 and x2 as separate inputs
+            example_input_list,
             path,
-            verbose=True,
-            input_names=["obs_dict"],  # Specify the input names
-            output_names=["action"],  # Name the output
-            opset_version=13,  # Specify the opset version, if needed
+            verbose=False,
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            opset_version=13,
         )
 
 

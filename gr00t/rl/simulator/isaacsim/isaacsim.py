@@ -213,8 +213,12 @@ class IsaacSim(BaseSimulator):
             device=self.sim_device,
             physx=PhysxCfg(
                 solver_type=self.simulator_config.sim.physx.solver_type,
-                max_position_iteration_count=255,
-                max_velocity_iteration_count=255,
+                max_position_iteration_count=(
+                    self.simulator_config.sim.physx.num_position_iterations
+                ),
+                max_velocity_iteration_count=(
+                    self.simulator_config.sim.physx.num_velocity_iterations
+                ),
                 gpu_max_rigid_patch_count=10 * 2**15,
             ),
         )
@@ -683,7 +687,7 @@ class IsaacSim(BaseSimulator):
         lowlevel_cmd_cfg = self.robot_config.get("b2z1_command", {})
         b2z1_manual_leg_pd = (
             self.robot_config.get("asset", {}).get("robot_type", None) == "b2z1"
-            and lowlevel_cmd_cfg.get("lowlevel_leg_control_mode", None) == "effort"
+            and lowlevel_cmd_cfg.get("lowlevel_leg_control_mode", "effort") == "effort"
         )
         use_runtime_urdf = bool(
             self.robot_config.get("asset", {}).get("use_runtime_urdf", False)
@@ -728,7 +732,7 @@ class IsaacSim(BaseSimulator):
                     max_depenetration_velocity=1.0,
                 ),
                 collision_props=sim_utils.CollisionPropertiesCfg(
-                    contact_offset=0.005,
+                    contact_offset=0.01,
                     rest_offset=0.0,
                 ),
                 articulation_props=sim_utils.ArticulationRootPropertiesCfg(
@@ -751,7 +755,7 @@ class IsaacSim(BaseSimulator):
                     max_depenetration_velocity=1.0,
                 ),
                 collision_props=sim_utils.CollisionPropertiesCfg(
-                    contact_offset=0.005,
+                    contact_offset=0.01,
                     rest_offset=0.0,
                 ),
                 articulation_props=sim_utils.ArticulationRootPropertiesCfg(
@@ -866,26 +870,35 @@ class IsaacSim(BaseSimulator):
 
         # ImplicitID
         if b2z1_manual_leg_pd:
+            arm_gripper_names = [
+                "joint1",
+                "joint2",
+                "joint3",
+                "joint4",
+                "joint5",
+                "joint6",
+                "jointGripper",
+            ]
             actuators = {
                 "legs": ImplicitActuatorCfg(
                     joint_names_expr=[".*hip_joint", ".*thigh_joint", ".*calf_joint"],
-                    effort_limit_sim=600.0,
-                    velocity_limit_sim=100.0,
+                    effort_limit_sim={
+                        ".*hip_joint": 200.0,
+                        ".*thigh_joint": 200.0,
+                        ".*calf_joint": 320.0,
+                    },
+                    velocity_limit_sim={
+                        ".*hip_joint": 23.0,
+                        ".*thigh_joint": 23.0,
+                        ".*calf_joint": 14.0,
+                    },
                     stiffness=0.0,
                     damping=0.0,
                     armature=0.0,
                     friction=0.0,
                 ),
                 "arm": ImplicitActuatorCfg(
-                    joint_names_expr=[
-                        "joint1",
-                        "joint2",
-                        "joint3",
-                        "joint4",
-                        "joint5",
-                        "joint6",
-                        "jointGripper",
-                    ],
+                    joint_names_expr=arm_gripper_names,
                     effort_limit_sim=80.0,
                     velocity_limit_sim=20.0,
                     stiffness={
@@ -950,6 +963,17 @@ class IsaacSim(BaseSimulator):
             )
             if not task_contact_body_names:
                 raise ValueError("robot.task_contact_body_names must be set for manipulation tasks")
+            task_contact_prim_names = self.robot_config.get(
+                "task_contact_prim_names", task_contact_body_names
+            )
+            if len(task_contact_prim_names) != len(task_contact_body_names):
+                raise ValueError(
+                    "robot.task_contact_prim_names must correspond one-to-one with "
+                    "robot.task_contact_body_names"
+                )
+            contact_links = [
+                "/World/envs/env_.*/Robot/{}".format(n) for n in task_contact_prim_names
+            ]
             manipulator_links = [
                 "/World/envs/env_.*/Robot/{}".format(n) for n in task_contact_body_names
             ]
@@ -960,7 +984,14 @@ class IsaacSim(BaseSimulator):
                 )
             object_to_hand_contact_sensor_config: ContactSensorCfg = ContactSensorCfg(
                 prim_path=object_contact_prim_path,
-                filter_prim_paths_expr=manipulator_links,
+                filter_prim_paths_expr=contact_links,
+            )
+            task_hand_contact_sensor_config: ContactSensorCfg = ContactSensorCfg(
+                prim_path=contact_links[0]
+                if len(contact_links) == 1
+                else "/World/envs/env_.*/Robot/("
+                + "|".join(task_contact_prim_names)
+                + ")",
             )
             object_to_hand_frame_transformer_config: FrameTransformerCfg = FrameTransformerCfg(
                 prim_path=object_contact_prim_path,
@@ -971,7 +1002,7 @@ class IsaacSim(BaseSimulator):
 
             table_to_hand_contact_sensor_config: ContactSensorCfg = ContactSensorCfg(
                 prim_path="/World/envs/env_.*/table_grid",
-                filter_prim_paths_expr=manipulator_links,
+                filter_prim_paths_expr=contact_links,
             )
 
             target_obj_table_contact_sensor_config: ContactSensorCfg = ContactSensorCfg(
@@ -1194,8 +1225,8 @@ class IsaacSim(BaseSimulator):
                 max_init_terrain_level=9,
                 collision_group=-1,
                 physics_material=sim_utils.RigidBodyMaterialCfg(
-                    friction_combine_mode="multiply",
-                    restitution_combine_mode="multiply",
+                    friction_combine_mode="average",
+                    restitution_combine_mode="average",
                     static_friction=self.terrain_config.static_friction,
                     dynamic_friction=self.terrain_config.dynamic_friction,
                 ),
@@ -1216,8 +1247,8 @@ class IsaacSim(BaseSimulator):
                 terrain_type="plane",
                 collision_group=-1,
                 physics_material=sim_utils.RigidBodyMaterialCfg(
-                    friction_combine_mode="multiply",
-                    restitution_combine_mode="multiply",
+                    friction_combine_mode="average",
+                    restitution_combine_mode="average",
                     static_friction=self.terrain_config.static_friction,
                     dynamic_friction=self.terrain_config.dynamic_friction,
                     restitution=0.0,
@@ -1226,7 +1257,10 @@ class IsaacSim(BaseSimulator):
             )
             terrain_config.num_envs = self.scene.cfg.num_envs
             terrain_config.env_spacing = self.scene.cfg.env_spacing
-            if getattr(self.simulator_config, "disable_visual_materials", False):
+            use_headless_usd_ground = getattr(
+                self.simulator_config, "use_headless_usd_ground", False
+            )
+            if use_headless_usd_ground:
                 terrain_config.terrain_type = "usd"
                 terrain_config.usd_path = str(
                     os.path.abspath("gr00t/rl/data/terrain/headless_ground_plane.usda")
@@ -1408,6 +1442,8 @@ class IsaacSim(BaseSimulator):
                 self.scene.sensors["object_to_hand_contact_sensor"] = (
                     self.object_to_hand_contact_sensor
                 )
+                self.task_hand_contact_sensor = ContactSensor(task_hand_contact_sensor_config)
+                self.scene.sensors["task_hand_contact_sensor"] = self.task_hand_contact_sensor
                 # self.scene.sensors["object_table_contact_sensor"] = self.object_table_contact_sensor
 
                 target_obj_transform_prim_path = f"/World/envs/env_.*/{self.task_config.target_obj}"
@@ -1775,6 +1811,19 @@ class IsaacSim(BaseSimulator):
             self.robot_config.body_names, preserve_order=True
         )
 
+        task_contact_prim_names = self.robot_config.get("task_contact_prim_names", [])
+        if task_contact_prim_names:
+            (
+                self.task_contact_prim_body_ids,
+                resolved_task_contact_prim_names,
+            ) = self._robot.find_bodies(task_contact_prim_names, preserve_order=True)
+            if resolved_task_contact_prim_names != list(task_contact_prim_names):
+                raise RuntimeError(
+                    "Resolved task contact bodies do not match robot.task_contact_prim_names: "
+                    f"expected {list(task_contact_prim_names)}, "
+                    f"got {resolved_task_contact_prim_names}"
+                )
+
         self.contact_to_body_idx = [
             self.contact_sensor.body_names.index(body_name) for body_name in self.body_names
         ]
@@ -1826,6 +1875,23 @@ class IsaacSim(BaseSimulator):
         # import ipdb; ipdb.set_trace()
         assert self.dof_names == self.robot_config.dof_names, "DOF names must match the config"
         assert self.body_names == self.robot_config.body_names, "Body names must match the config"
+
+        if self.robot_config.asset.robot_type == "b2z1":
+            position_limits = torch.tensor(
+                list(
+                    zip(
+                        self.robot_config.dof_pos_lower_limit_list,
+                        self.robot_config.dof_pos_upper_limit_list,
+                        strict=True,
+                    )
+                ),
+                dtype=torch.float32,
+                device=self.sim_device,
+            ).unsqueeze(0).expand(self.num_envs, -1, -1)
+            self._robot.write_joint_position_limit_to_sim(
+                position_limits,
+                joint_ids=self.dof_ids,
+            )
 
         # return self.num_dof, self.num_bodies, self.dof_names, self.body_names
 
@@ -2049,6 +2115,9 @@ class IsaacSim(BaseSimulator):
                 self.object_to_hand_contact_forces = (
                     self.object_to_hand_contact_sensor.data.force_matrix_w.clone()
                 )
+                self.task_hand_contact_forces = (
+                    self.task_hand_contact_sensor.data.net_forces_w.clone()
+                )
             elif hasattr(self.task_config, "hold_object_contact_sensor"):
                 self.hold_object_to_hand_contact_forces = (
                     self.hold_object_to_hand_contact_sensor.data.force_matrix_w.clone()
@@ -2169,6 +2238,12 @@ class IsaacSim(BaseSimulator):
     def _rigid_body_ang_vel(self):
         return self._robot.data.body_ang_vel_w[:, self.body_ids, :]
 
+    @property
+    def task_contact_prim_rot_wxyz(self):
+        if not hasattr(self, "task_contact_prim_body_ids"):
+            raise RuntimeError("Task contact body orientations were not configured.")
+        return self._robot.data.body_quat_w[:, self.task_contact_prim_body_ids, :]
+
     def get_task_root_state(self, obj_name):
         return self._task[obj_name].data.root_state_w
 
@@ -2201,11 +2276,7 @@ class IsaacSim(BaseSimulator):
         self._robot.write_joint_state_to_sim(dof_pos, dof_vel, self.dof_ids, set_env_ids)
 
     def clear_external_force_and_torque(self):
-        force_b = self._robot._external_force_b.clone()
-        torque_b = self._robot._external_torque_b.clone()
-        force_b[:, :] = 0.0
-        torque_b[:, :] = 0.0
-        self._robot.set_external_force_and_torque(force_b, torque_b)
+        self._robot.permanent_wrench_composer.reset()
 
     def wsdpt_push_robot(self, torso_force, right_palm_force, env_ids=None):
         if env_ids is None:

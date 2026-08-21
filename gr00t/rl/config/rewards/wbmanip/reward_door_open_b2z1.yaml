@@ -18,7 +18,6 @@ rewards:
 
       hand_handle_orientation: 3.0
       pregrasp_finger_dof_pos_l1: 1.0
-      penalty_unused_dof_deviation_l1: -0.2
       pregrasp_target_distance: 6.0
       penalty_not_standing_still: -15.0
 

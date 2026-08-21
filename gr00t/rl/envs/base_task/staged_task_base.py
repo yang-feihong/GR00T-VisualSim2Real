@@ -667,6 +667,11 @@ class StagedTaskBase(LeggedRobotBase):
         """
         Sample stages to reset for the given envs.
         """
+        # Evaluation metrics must measure complete episodes from the task's
+        # canonical initial state, not curriculum snapshots from later stages.
+        if self.is_evaluating:
+            return torch.zeros_like(env_ids)
+
         # Create weight matrix: (len(env_ids), num_stages)
         # Start with base ratios for all environments
         weights = self.staged_reset_ratios.unsqueeze(0).repeat(len(env_ids), 1)

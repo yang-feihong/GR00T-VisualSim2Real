@@ -12,7 +12,21 @@ import isaaclab.sim as sim_utils
 from legged_gym.utils.isaaclab_math import quat_rotate_inverse, quat_mul, quat_apply, quat_from_euler_xyz, euler_from_quat, torch_rand_float, wrap_to_pi
 from .legged_robot_config import LeggedRobotIsaacLabCfg
 import numpy as np
-from rsl_rl.utils import resolve_schedule_value
+
+
+def resolve_schedule_value(schedule, counter=0.0, default_end_iter=None):
+    """Resolve the four-value linear schedules stored in ManipLoco metadata."""
+
+    values = [float(value) for value in schedule]
+    if len(values) != 4:
+        raise ValueError(f"Expected [start, end, start_iter, end_iter], got {schedule!r}")
+    start_value, end_value, start_iter, end_iter = values
+    if end_iter <= start_iter and default_end_iter is not None:
+        end_iter = float(default_end_iter)
+    if end_iter <= start_iter:
+        return end_value if counter >= end_iter else start_value
+    alpha = min(max((float(counter) - start_iter) / (end_iter - start_iter), 0.0), 1.0)
+    return start_value + alpha * (end_value - start_value)
 
 
 _FAST_GAIT_UPDATE = None

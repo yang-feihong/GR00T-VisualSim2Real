@@ -20,6 +20,10 @@ experiment_dir: ${base_dir}/${project_name}/${experiment_name}-${timestamp}
 num_envs: 4096
 project_name: b2z1_open_door
 
+callbacks:
+  model_save:
+    save_frequency: ${algo.config.save_interval}
+
 algo:
   config:
     entropy_coef: 0.01
@@ -80,14 +84,15 @@ algo:
 
 simulator:
   config:
+    use_headless_usd_ground: True
     scene:
       replicate_physics: False
       env_spacing: 20.0
     sim:
       physx:
-        num_position_iterations: 8
-        num_velocity_iterations: 4
+        num_position_iterations: 4
+        num_velocity_iterations: 0
 
 robot:
   asset:
-    self_collisions: 1
+    self_collisions: 0

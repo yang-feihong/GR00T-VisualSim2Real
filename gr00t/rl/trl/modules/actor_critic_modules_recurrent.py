@@ -83,7 +83,10 @@ class RecurrentActor(Actor):
         obs_dict = obs_dict.copy()
         if self.running_mean_std is not None:
             with torch.no_grad():
-                obs_dict[self.input_key] = self.running_mean_std(obs_dict[self.input_key])
+                input_obs = obs_dict[self.input_key]
+                obs_dict[self.input_key] = self.running_mean_std(
+                    input_obs, update_stats=input_obs.ndim == 2
+                )
 
         # Pass through memory module
         # For batch training mode, obs_dict[self.input_key] should have shape [batch_size, seq_len, obs_dim]
@@ -334,12 +337,17 @@ class RecurrentCritic(Critic):
         hidden_states=None,
         episode_attnmask=None,
         original_dones=None,
+        update_running_stats=True,
         **kwargs,
     ):
         obs_dict = obs_dict.copy()
         if self.running_mean_std is not None:
             with torch.no_grad():
-                obs_dict["critic_obs"] = self.running_mean_std(obs_dict["critic_obs"])
+                critic_obs = obs_dict["critic_obs"]
+                obs_dict["critic_obs"] = self.running_mean_std(
+                    critic_obs,
+                    update_stats=update_running_stats and critic_obs.ndim == 2,
+                )
 
         # Pass through memory module
         # For batch training mode, obs_dict['critic_obs'] should have shape [batch_size, seq_len, obs_dim]

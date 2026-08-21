@@ -257,7 +257,6 @@ class TRLPPOTrainer(PPOTrainer):
         self._setup_storage()
 
         # Initialize trajectory counter for recurrent policy training
-        self._current_first_traj = 0
 
         if checkpoint is not None:
             self.load_checkpoint(checkpoint)
@@ -800,7 +799,7 @@ class TRLPPOTrainer(PPOTrainer):
                     # We only need to compute the final bootstrapping value
                     critic_obs_dict = {k: v for k, v in obs_dict.items() if k != "actor_obs"}
                     last_values = self.value_model.evaluate(
-                        obs_dict=critic_obs_dict
+                        obs_dict=critic_obs_dict, update_running_stats=False
                     )  # Shape: [num_envs, 1]
                 else:
                     # For non-recurrent critics: compute all values at once
@@ -914,6 +913,8 @@ class TRLPPOTrainer(PPOTrainer):
         # For recurrent policies/critics, pre-split trajectories ONCE globally
         padded_obs_dict = None
         trajectory_masks = None
+        trajectory_offsets = None
+        trajectory_counts = None
         if (hasattr(self.policy_model, "is_recurrent") and self.policy_model.is_recurrent) or (
             hasattr(self.value_model, "is_recurrent") and self.value_model.is_recurrent
         ):
@@ -935,6 +936,13 @@ class TRLPPOTrainer(PPOTrainer):
                     # traj_masks: [max_traj_len, num_trajectories]
                     # Transpose to [num_trajectories, max_traj_len]
                     trajectory_masks = traj_masks.transpose(0, 1)
+            trajectory_counts = dones[:, :-1].bool().sum(dim=1).to(torch.long) + 1
+            trajectory_offsets = torch.cat(
+                [
+                    torch.zeros(1, dtype=torch.long, device=device),
+                    torch.cumsum(trajectory_counts, dim=0)[:-1],
+                ]
+            )
 
         return dict(
             all_obs_dict=all_obs_dict,
@@ -951,6 +959,8 @@ class TRLPPOTrainer(PPOTrainer):
             padding_mask_p1=padding_mask_p1,
             padded_obs_dict=padded_obs_dict,
             trajectory_masks=trajectory_masks,
+            trajectory_offsets=trajectory_offsets,
+            trajectory_counts=trajectory_counts,
         )
 
     def _get_mb_rollout_data(self, rollout_data, micro_batch_inds):
@@ -977,21 +987,25 @@ class TRLPPOTrainer(PPOTrainer):
                 raise RuntimeError(
                     "Recurrent policy requires padded_obs_dict and trajectory_masks in rollout_data! This should have been created in _get_rollout_data."
                 )
-            # Calculate how many trajectories are in this mini-batch
-            last_was_done = torch.zeros_like(mb_dones, dtype=torch.bool)
-            last_was_done[:, 1:] = mb_dones[:, :-1].bool()
-            last_was_done[:, 0] = True
-            num_trajectories = torch.sum(last_was_done).item()
-            # Slice from globally pre-split trajectories using trajectory counter
-            first_traj = self._current_first_traj
-            last_traj = first_traj + num_trajectories
+            trajectory_offsets = rollout_data.get("trajectory_offsets")
+            trajectory_counts = rollout_data.get("trajectory_counts")
+            if trajectory_offsets is None or trajectory_counts is None:
+                raise RuntimeError("Recurrent rollout data is missing trajectory index metadata.")
+            trajectory_indices = torch.cat(
+                [
+                    torch.arange(
+                        trajectory_offsets[env_idx],
+                        trajectory_offsets[env_idx] + trajectory_counts[env_idx],
+                        device=trajectory_offsets.device,
+                    )
+                    for env_idx in micro_batch_inds
+                ]
+            )
             mb_obs_dict = {
-                key: rollout_data["padded_obs_dict"][key][first_traj:last_traj]
+                key: rollout_data["padded_obs_dict"][key].index_select(0, trajectory_indices)
                 for key in rollout_data["padded_obs_dict"].keys()
             }
-            mb_masks = rollout_data["trajectory_masks"][first_traj:last_traj]
-            # Update trajectory counter for next mini-batch
-            self._current_first_traj = last_traj
+            mb_masks = rollout_data["trajectory_masks"].index_select(0, trajectory_indices)
 
             # Extract hidden states at trajectory boundaries if available
             if self.storage.saved_hidden_states_a is not None or self.storage.saved_hidden_states_c is not None:  # type: ignore[attr-defined]
@@ -1298,7 +1312,7 @@ class TRLPPOTrainer(PPOTrainer):
         )
         metrics["val/ratio"] = self.accelerator.gather_for_metrics(self.ratio_stats).mean().item()
         metrics["val/ratio_var"] = (
-            self.accelerator.gather_for_metrics(self.ratio_stats).var().item()
+            self.accelerator.gather_for_metrics(self.ratio_stats).var(unbiased=False).item()
         )
         metrics["objective/entropy"] = metrics["loss/entropy_avg"]
 
@@ -1412,16 +1426,9 @@ class TRLPPOTrainer(PPOTrainer):
             model = self.model
             self._train_mode()
             for ppo_epoch_idx in range(args.num_ppo_epochs):
-                # Reset trajectory counter at start of each epoch for recurrent slicing
-                self._current_first_traj = 0
                 minibatch_idx = 0
                 if self.ppo_shuffle_every_epoch or ppo_epoch_idx == 0:
-                    # Disable shuffling for recurrent policies to keep contiguous env indices
-                    policy_model = self.accelerator.unwrap_model(model).policy
-                    if hasattr(policy_model, "is_recurrent") and policy_model.is_recurrent:
-                        b_inds = torch.arange(args.local_batch_size, device=device)
-                    else:
-                        b_inds = torch.randperm(args.local_batch_size, device=device)
+                    b_inds = torch.randperm(args.local_batch_size, device=device)
                 for mini_batch_start in range(0, args.local_batch_size, args.local_mini_batch_size):
                     mini_batch_end = mini_batch_start + args.local_mini_batch_size
                     mini_batch_inds = b_inds[mini_batch_start:mini_batch_end]
@@ -1929,6 +1936,7 @@ class TRLPPOTrainer(PPOTrainer):
                     rewards, dones = rewards.to(self.accelerator.device), dones.to(
                         self.accelerator.device
                     )
+                    model.policy.reset(dones)
 
                     self.cur_reward_sum += rewards
                     self.cur_episode_length += 1
