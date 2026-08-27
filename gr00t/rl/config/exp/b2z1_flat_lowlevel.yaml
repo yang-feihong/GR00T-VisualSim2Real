@@ -37,4 +37,3 @@ robot:
     lowlevel_leg_control_mode: effort
   asset:
     self_collisions: 0
-    use_runtime_urdf: True

@@ -196,7 +196,7 @@ def write_run_metadata(log_dir: Path, args, env_cfg, train_cfg=None):
         "checkpoint_features": _extract_checkpoint_features(args, env_cfg),
         "cli_args": _json_safe(vars(args)),
         "env": {
-            "robot_urdf_path": env_cfg.robot_urdf_path,
+            "robot_usd_path": env_cfg.robot_usd_path,
             "num_envs": env_cfg.scene.num_envs,
         },
         "env_cfg": _json_safe(_class_to_dict(env_cfg)),

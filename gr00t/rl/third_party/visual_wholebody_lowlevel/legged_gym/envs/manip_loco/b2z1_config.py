@@ -15,7 +15,7 @@ class B2Z1IsaacLabCfg(LeggedRobotIsaacLabCfg):
     torque_clip = 600.0
     contact_force_threshold = 1.5
     numeric_eps = 1.0e-6
-    reset_command = [1.0, 0.0, 0.0]
+    reset_command = [0.0, 0.0, 0.0]
     obs_scales = {
         "lin_vel": 2.0,
         "ang_vel": 0.25,
@@ -71,7 +71,7 @@ class B2Z1IsaacLabCfg(LeggedRobotIsaacLabCfg):
         "RL_hip_joint": 0.2, "RL_thigh_joint": 0.8, "RL_calf_joint": -1.5,
         "RR_hip_joint": -0.2, "RR_thigh_joint": 0.8, "RR_calf_joint": -1.5,
         "joint1": 0.0, "joint2": 1.48, "joint3": -0.63, "joint4": -0.84,
-        "joint5": 0.0, "joint6": 1.57, "jointGripper": -0.785,
+        "joint5": 0.0, "joint6": 0.0, "jointGripper": -0.785,
     }
     B2_stiffness = 360
     B2_damping = 5.0
@@ -152,11 +152,14 @@ class B2Z1IsaacLabCfg(LeggedRobotIsaacLabCfg):
         observe_gait_commands = False
         observe_foot_contacts = True
         zero_observed_foot_contacts = True
-        gait_frequency_min = 2.0
-        gait_frequency_max = 2.0
-        gait_frequency_lin_vel_ref = 1.2
-        gait_frequency_ang_vel_ref = 2.0
-        gait_frequency_ang_vel_weight = 1.0
+        gait_pattern = "adaptive_trot"
+        trot_stance_ratio = 0.5
+        trot_swing_ratio = 0.5
+        trot_swing_duration_max_s = 0.4
+        fixed_trot_frequency = 1.5
+        gait_max_stride_x = 0.4
+        gait_max_stride_y = 0.2
+        gait_transition_duration_s = 0.5
         trunk_follow_arm_obs_mode = "default"
 
     class goal_ee:
@@ -587,6 +590,7 @@ class B2Z1IsaacLabCfg(LeggedRobotIsaacLabCfg):
         curriculum_playback_total_iterations = None
         ang_vel_yaw_clip = 0.5
         lin_vel_x_clip = 0.2
+        lin_vel_y_clip = 0.2
 
     class asset():
         file = "{LEGGED_GYM_ROOT_DIR}/resources/robots/b2z1/urdf/b2z1.urdf"

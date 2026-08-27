@@ -124,7 +124,10 @@ def parse_args():
         / "gr00t/rl/third_party/visual_wholebody_lowlevel/resources/robots/b2z1/urdf"
         / "generated/b2z1_mount_0_x0p22_y0_z0p17.urdf"
     )
-    default_usd = repo_root / "gr00t/rl/data/robots/b2z1/b2z1.usd"
+    default_usd = (
+        repo_root
+        / "gr00t/rl/data/robots/b2z1_lab30/b2z1_mount_0_x0p22_y0_z0p17.usd"
+    )
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--urdf", type=Path, default=default_urdf)
@@ -186,7 +189,7 @@ def convert_with_isaacsim_urdf_importer(args):
         ("set_make_default_prim", True),
         ("set_create_physics_scene", False),
         ("set_density", 0.0),
-        ("set_convex_decomp", False),
+        ("set_convex_decomp", True),
         ("set_collision_from_visuals", False),
         ("set_merge_fixed_joints", bool(args.merge_fixed_joints)),
         ("set_fix_base", False),
@@ -272,6 +275,7 @@ def main():
         make_instanceable=False,
         fix_base=False,
         merge_fixed_joints=bool(args.merge_fixed_joints),
+        collider_type="convex_decomposition",
         joint_drive=UrdfConverterCfg.JointDriveCfg(
             target_type="none",
             gains=UrdfConverterCfg.JointDriveCfg.PDGainsCfg(stiffness=0.0, damping=0.0),

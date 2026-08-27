@@ -447,9 +447,8 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
 
         if self.teleop_arm_control_mode == "joint":
             delta = float(self.cfg.env.teleop_arm_joint_step)
-            # NOTE: use 'v' instead of 'h' to avoid IsaacSim hotkey conflict.
-            if k in "yvujikzxcmbn":
-                mapping = {"y": (0, +delta), "v": (0, -delta), "u": (1, +delta), "j": (1, -delta),
+            if k in "yhujikzxcmbn":
+                mapping = {"y": (0, +delta), "h": (0, -delta), "u": (1, +delta), "j": (1, -delta),
                            "i": (2, +delta), "k": (2, -delta), "z": (3, +delta), "x": (3, -delta),
                            "c": (4, +delta), "m": (4, -delta), "b": (5, +delta), "n": (5, -delta)}
                 idx, dv = mapping[k]
@@ -459,7 +458,7 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         else:
             if k == "y":
                 self.teleop_raw_ee_goal_cart[:, 0] += float(self.cfg.env.teleop_ee_goal_pos_step)
-            elif k == "v":
+            elif k == "h":
                 self.teleop_raw_ee_goal_cart[:, 0] -= float(self.cfg.env.teleop_ee_goal_pos_step)
             elif k == "u":
                 self.teleop_raw_ee_goal_cart[:, 1] += float(self.cfg.env.teleop_ee_goal_pos_step)

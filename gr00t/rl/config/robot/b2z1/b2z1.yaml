@@ -247,6 +247,9 @@ robot:
     lowlevel_dof_pos_scale: 1.0
     lowlevel_dof_vel_scale: 0.05
     lowlevel_command_obs_scale: [2.0, 2.0, 0.25]
+    # Manual/deployment limits from the checkpoint's visual_wholebody config.
+    lowlevel_velocity_command_lower: [-0.8, -0.8, -1.0]
+    lowlevel_velocity_command_upper: [0.8, 0.8, 1.0]
     lowlevel_observe_foot_contacts: True
     lowlevel_zero_observed_foot_contacts: True
     lowlevel_observe_gait_commands: True
@@ -293,8 +296,8 @@ robot:
     lowlevel_arm_joint_names: ["joint1", "joint2", "joint3", "joint4", "joint5", "joint6"]
     lowlevel_policy_model:
       activation: "elu"
-      # lab30 normal-checkpoint playback calls act_inference(hist_encoding=False).
-      latent_mode: "privileged"
+      # Deployment must match visual_wholebody: infer the latent from 10-frame proprio history.
+      latent_mode: "history"
       num_proprio: 71
       num_priv: 18
       history_len: 10
@@ -319,11 +322,9 @@ robot:
     linear_damping: 0.0
     disable_gravity: False
     fix_base_link: False
-    urdf_file: "/workspace/GR00T-VisualSim2Real/gr00t/rl/third_party/visual_wholebody_lowlevel/resources/robots/b2z1/urdf/generated/b2z1_mount_0_x0p22_y0_z0p17.urdf"
-    # Exact Isaac Lab conversion used by visual_wholebody_yfh_lab30.
+    # Generated offline from the lab30-aligned URDF with convex decomposition.
     usd_file: "b2z1_lab30/b2z1_mount_0_x0p22_y0_z0p17.usd"
     xml_file: null
     robot_type: b2z1
     self_collisions: 0
-    use_runtime_urdf: False
     default_dof_drive_mode: 3

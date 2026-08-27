@@ -225,7 +225,7 @@ class ManipLoco_Policy:
         loop_start = time.perf_counter()
         policy_start = time.perf_counter()
         with torch.no_grad():
-            actions = self.policy(self.obs.detach())
+            actions = self.policy(self.obs.detach(), hist_encoding=True)
         policy_dt = time.perf_counter() - policy_start
 
         env_step_start = time.perf_counter()

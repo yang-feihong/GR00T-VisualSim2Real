@@ -1,5 +1,4 @@
 from __future__ import annotations
-import os
 from dataclasses import MISSING, field
 from pathlib import Path
 
@@ -15,7 +14,10 @@ from isaaclab.actuators import ImplicitActuatorCfg
 
 
 _LOW_LEVEL_ROOT = Path(__file__).resolve().parents[3]
-_DEFAULT_B2Z1_URDF = _LOW_LEVEL_ROOT / "resources/robots/b2z1/urdf/b2z1.urdf"
+_DEFAULT_B2Z1_USD = (
+    _LOW_LEVEL_ROOT.parents[1]
+    / "data/robots/b2z1_lab30/b2z1_mount_0_x0p22_y0_z0p17.usd"
+)
 
 
 @configclass
@@ -95,30 +97,13 @@ class LeggedRobotIsaacLabCfg(DirectRLEnvCfg):
         physics_material=sim_utils.RigidBodyMaterialCfg(static_friction=1.0, dynamic_friction=1.0, restitution=0.0),
     )
 
-    # Asset path. Override with --robot_urdf_path or edit here.
-    robot_urdf_path: str = os.environ.get(
-        "LEGGED_GYM_ROBOT_URDF",
-        str(_DEFAULT_B2Z1_URDF),
-    )
+    robot_usd_path: str = str(_DEFAULT_B2Z1_USD)
 
     robot: ArticulationCfg = ArticulationCfg(
         prim_path="/World/envs/env_.*/Robot",
-        spawn=sim_utils.UrdfFileCfg(
-            asset_path="",  # patched at runtime from cfg.robot_urdf_path
+        spawn=sim_utils.UsdFileCfg(
+            usd_path=str(_DEFAULT_B2Z1_USD),
             activate_contact_sensors=True,
-            force_usd_conversion=True,
-            fix_base=False,
-            merge_fixed_joints=True,
-            replace_cylinders_with_capsules=True,
-            self_collision=False,
-            make_instanceable=False,            
-            joint_drive=sim_utils.UrdfConverterCfg.JointDriveCfg(
-                target_type="none",
-                gains=sim_utils.UrdfConverterCfg.JointDriveCfg.PDGainsCfg(
-                    stiffness=0.0,
-                    damping=0.0,
-                ),    
-            ),        
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
                 disable_gravity=False,
                 max_linear_velocity=1000.0,
@@ -130,7 +115,7 @@ class LeggedRobotIsaacLabCfg(DirectRLEnvCfg):
                 rest_offset=0.0,
             ),
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-                enabled_self_collisions=False,
+                enabled_self_collisions=True,
                 solver_position_iteration_count=4,
                 solver_velocity_iteration_count=0,
             ),
@@ -141,8 +126,16 @@ class LeggedRobotIsaacLabCfg(DirectRLEnvCfg):
             # Keep stiffness/damping 0 to avoid double PD.
             "legs": ImplicitActuatorCfg(
                 joint_names_expr=[".*hip_joint", ".*thigh_joint", ".*calf_joint"],
-                effort_limit_sim=600.0,
-                velocity_limit_sim=100.0,
+                effort_limit_sim={
+                    ".*hip_joint": 200.0,
+                    ".*thigh_joint": 200.0,
+                    ".*calf_joint": 320.0,
+                },
+                velocity_limit_sim={
+                    ".*hip_joint": 23.0,
+                    ".*thigh_joint": 23.0,
+                    ".*calf_joint": 14.0,
+                },
                 stiffness=0,
                 damping=0,
             ),            
@@ -217,6 +210,10 @@ class LeggedRobotIsaacLabCfg(DirectRLEnvCfg):
     scene_usd_path: str = ""
     scene_prim_path: str = "/World/ImportedScene"
     scene_position: list = field(default_factory=list)
+    enable_doorman_scene: bool = False
+    doorman_randomize_robot_init: bool = True
+    doorman_randomize_door_init_state: bool = False
+    doorman_door: ArticulationCfg | None = None
     rgb_camera_specs: list = field(default_factory=list)
     rgb_camera_draw_in_viewer: bool = False
     rgb_camera_backend: str = "auto"

@@ -689,110 +689,36 @@ class IsaacSim(BaseSimulator):
             self.robot_config.get("asset", {}).get("robot_type", None) == "b2z1"
             and lowlevel_cmd_cfg.get("lowlevel_leg_control_mode", "effort") == "effort"
         )
-        use_runtime_urdf = bool(
-            self.robot_config.get("asset", {}).get("use_runtime_urdf", False)
-        )
         asset_abs_path = os.path.abspath(os.path.join(asset_root, asset_path))
-        if not (b2z1_manual_leg_pd and use_runtime_urdf):
-            assert os.path.isfile(asset_abs_path)
+        assert os.path.isfile(asset_abs_path)
         logger.warning(
             f"num_position_iterations: {self.simulator_config.sim.physx.num_position_iterations}"
         )
         logger.warning(
             f"num_velocity_iterations: {self.simulator_config.sim.physx.num_velocity_iterations}"
         )
-        # import ipdb; ipdb.set_trace()
-        if b2z1_manual_leg_pd and use_runtime_urdf:
-            urdf_path = self.robot_config.asset.urdf_file
-            urdf_abs_path = os.path.abspath(os.path.join(asset_root, urdf_path))
-            assert os.path.isfile(urdf_abs_path), urdf_abs_path
-            spawn = sim_utils.UrdfFileCfg(
-                asset_path=urdf_abs_path,
-                activate_contact_sensors=True,
-                force_usd_conversion=True,
-                fix_base=False,
-                merge_fixed_joints=True,
-                replace_cylinders_with_capsules=True,
-                self_collision=False,
-                make_instanceable=False,
-                joint_drive=sim_utils.UrdfConverterCfg.JointDriveCfg(
-                    target_type="none",
-                    gains=sim_utils.UrdfConverterCfg.JointDriveCfg.PDGainsCfg(
-                        stiffness=0.0,
-                        damping=0.0,
-                    ),
-                ),
-                rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                    disable_gravity=False,
-                    retain_accelerations=False,
-                    linear_damping=0.0,
-                    angular_damping=0.0,
-                    max_linear_velocity=1000.0,
-                    max_angular_velocity=1000.0,
-                    max_depenetration_velocity=1.0,
-                ),
-                collision_props=sim_utils.CollisionPropertiesCfg(
-                    contact_offset=0.01,
-                    rest_offset=0.0,
-                ),
-                articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-                    enabled_self_collisions=bool(self.env_config.robot.asset.self_collisions),
-                    solver_position_iteration_count=self.simulator_config.sim.physx.num_position_iterations,
-                    solver_velocity_iteration_count=self.simulator_config.sim.physx.num_velocity_iterations,
-                ),
-            )
-        else:
-            spawn = sim_utils.UsdFileCfg(
-                usd_path=asset_abs_path,
-                activate_contact_sensors=True,
-                rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                    disable_gravity=False,
-                    retain_accelerations=False,
-                    linear_damping=0.0,
-                    angular_damping=0.0,
-                    max_linear_velocity=1000.0,
-                    max_angular_velocity=1000.0,
-                    max_depenetration_velocity=1.0,
-                ),
-                collision_props=sim_utils.CollisionPropertiesCfg(
-                    contact_offset=0.01,
-                    rest_offset=0.0,
-                ),
-                articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-                    enabled_self_collisions=bool(self.env_config.robot.asset.self_collisions),
-                    solver_position_iteration_count=self.simulator_config.sim.physx.num_position_iterations,
-                    solver_velocity_iteration_count=self.simulator_config.sim.physx.num_velocity_iterations,
-                ),
-            )
-
-        # urdf_path = self.robot_config.asset.urdf_file
-        # asset_abs_path = os.path.abspath(os.path.join(asset_root, urdf_path))
-        # # import ipdb; ipdb.set_trace()
-        # assert(os.path.isfile(asset_abs_path))
-        # spawn=sim_utils.UrdfFileCfg(
-        #     fix_base=False,
-        #     replace_cylinders_with_capsules=True,
-        #     asset_path=asset_abs_path,
-        #     activate_contact_sensors=True,
-        #     rigid_props=sim_utils.RigidBodyPropertiesCfg(
-        #         disable_gravity=False,
-        #         retain_accelerations=False,
-        #         linear_damping=0.0,
-        #         angular_damping=0.0,
-        #         max_linear_velocity=1000.0,
-        #         max_angular_velocity=1000.0,
-        #         max_depenetration_velocity=1.0,
-        #     ),
-        #     articulation_props=sim_utils.ArticulationRootPropertiesCfg(
-        #         enabled_self_collisions=not bool(self.env_config.robot.asset.self_collisions),
-        #         solver_position_iteration_count=self.simulator_config.sim.physx.num_position_iterations,
-        #         solver_velocity_iteration_count=self.simulator_config.sim.physx.num_velocity_iterations
-        #     ),
-        #     joint_drive=sim_utils.UrdfConverterCfg.JointDriveCfg(
-        #     gains=sim_utils.UrdfConverterCfg.JointDriveCfg.PDGainsCfg(stiffness=0, damping=0)
-        #     ),
-        #     # merge_fixed_joints=False
-        # )
+        spawn = sim_utils.UsdFileCfg(
+            usd_path=asset_abs_path,
+            activate_contact_sensors=True,
+            rigid_props=sim_utils.RigidBodyPropertiesCfg(
+                disable_gravity=False,
+                retain_accelerations=False,
+                linear_damping=0.0,
+                angular_damping=0.0,
+                max_linear_velocity=1000.0,
+                max_angular_velocity=1000.0,
+                max_depenetration_velocity=1.0,
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(
+                contact_offset=0.01,
+                rest_offset=0.0,
+            ),
+            articulation_props=sim_utils.ArticulationRootPropertiesCfg(
+                enabled_self_collisions=bool(self.env_config.robot.asset.self_collisions),
+                solver_position_iteration_count=self.simulator_config.sim.physx.num_position_iterations,
+                solver_velocity_iteration_count=self.simulator_config.sim.physx.num_velocity_iterations,
+            ),
+        )
 
         # prepare to override the articulation configuration in groot/rl/simulator/isaacsim_articulation_cfg.py
         default_joint_angles = copy.deepcopy(self.robot_config.init_state.default_joint_angles)
@@ -1811,17 +1737,17 @@ class IsaacSim(BaseSimulator):
             self.robot_config.body_names, preserve_order=True
         )
 
-        task_contact_prim_names = self.robot_config.get("task_contact_prim_names", [])
-        if task_contact_prim_names:
+        task_contact_body_names = self.robot_config.get("task_contact_body_names", [])
+        if task_contact_body_names:
             (
                 self.task_contact_prim_body_ids,
-                resolved_task_contact_prim_names,
-            ) = self._robot.find_bodies(task_contact_prim_names, preserve_order=True)
-            if resolved_task_contact_prim_names != list(task_contact_prim_names):
+                resolved_task_contact_body_names,
+            ) = self._robot.find_bodies(task_contact_body_names, preserve_order=True)
+            if resolved_task_contact_body_names != list(task_contact_body_names):
                 raise RuntimeError(
-                    "Resolved task contact bodies do not match robot.task_contact_prim_names: "
-                    f"expected {list(task_contact_prim_names)}, "
-                    f"got {resolved_task_contact_prim_names}"
+                    "Resolved task contact bodies do not match robot.task_contact_body_names: "
+                    f"expected {list(task_contact_body_names)}, "
+                    f"got {resolved_task_contact_body_names}"
                 )
 
         self.contact_to_body_idx = [

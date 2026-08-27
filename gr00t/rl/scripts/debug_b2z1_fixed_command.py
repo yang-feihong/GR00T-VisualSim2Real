@@ -1,14 +1,14 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Run B2Z1 door env with a fixed 10D high-level command.
+"""Run the B2Z1 low-level policy with a fixed physical velocity command.
 
 Example:
 
     ./isaac-sim/python.sh gr00t/rl/scripts/debug_b2z1_fixed_command.py \
-        +exp=wbmanip/door_open_b2z1_lstm \
+        +exp=b2z1_flat_lowlevel \
         num_envs=1 headless=False \
-        +fixed_command='[0.2,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,-1.0]' \
+        +velocity_command='[0.2,0.0,0.0]' \
         +num_debug_steps=1000
 """
 
@@ -121,7 +121,7 @@ def run_open_loop(env, trace_path: str, num_substeps: int, root_height: float):
     env._set_lowlevel_fixed_trot_stopped(gait_reset_mask)
     policy_obs = env._build_lowlevel_obs().clone()
     with torch.no_grad():
-        policy_output = env._lowlevel_policy(policy_obs)
+        policy_output = env._lowlevel_policy(policy_obs, hist_encoding=True)
 
     env.actions_after_delay.zero_()
     env.actions_after_delay[:, env._lowlevel_policy_joint_indices] = tensor(
@@ -388,15 +388,29 @@ def main(config: OmegaConf):
             simulation_app.close()
         return
 
-    fixed_command = torch.tensor(
-        config.get("fixed_command", [0.0] * 10),
+    if config.get("fixed_command", None) is not None:
+        raise ValueError(
+            "fixed_command used normalized high-level actions and is no longer supported; "
+            "use velocity_command=[vx,vy,wz] in m/s, m/s, rad/s."
+        )
+    velocity_command = torch.tensor(
+        config.get("velocity_command", [0.0, 0.0, 0.0]),
         device=env.device,
         dtype=torch.float32,
-    ).view(1, 10)
-    actions = fixed_command.repeat(env.num_envs, 1)
+    ).view(1, 3)
+    physical_commands = torch.zeros(
+        env.num_envs, env.COMMAND_DIM, device=env.device, dtype=torch.float32
+    )
+    physical_commands[:, :3] = velocity_command
+    physical_commands[:, 9] = float(config.get("gripper_command", -1.0))
     num_steps = int(config.get("num_debug_steps", 1000))
 
-    logger.info(f"Running B2Z1 fixed command for {num_steps} steps: {fixed_command[0].tolist()}")
+    logger.info(
+        "Running B2Z1 low-level policy for {} steps with physical velocity "
+        "[vx_mps, vy_mps, yaw_rate_radps]={}".format(
+            num_steps, velocity_command[0].tolist()
+        )
+    )
     initial_root_w = None
     final_root_w = None
     reset_count = 0
@@ -419,14 +433,17 @@ def main(config: OmegaConf):
             trace["meta"]["policy_joint_names"] = [env.dof_names[i] for i in policy_joint_indices]
     for step in range(num_steps):
         if debug_stage_cycle:
+            if not hasattr(env, "stage_buf"):
+                raise ValueError("debug_stage_cycle requires an environment with stage_buf")
             env.stage_buf.fill_(step % env.num_stages)
-        obs, rew, reset, extras = env.step({"actions": actions.clone()})
+        obs, rew, reset, extras = env.step_physical_b2z1_commands(
+            physical_commands.clone()
+        )
         env.render_results()
         if skeleton_video_path is not None and step % skeleton_stride == 0:
             skeleton_frames.append(env.simulator._rigid_body_pos[0].detach().cpu().clone())
         if trace is not None and step in trace_steps:
             step_trace = {
-                "stage": env.stage_buf[0].detach().cpu(),
                 "reward": rew[0].detach().cpu(),
                 "commands": env.get_physical_b2z1_commands()[0].detach().cpu(),
                 "dof_pos": env.simulator.dof_pos[0].detach().cpu(),
@@ -437,39 +454,6 @@ def main(config: OmegaConf):
                 "root_state": env.simulator.robot_root_states[0].detach().cpu(),
                 "rigid_body_pos": env.simulator._rigid_body_pos[0].detach().cpu(),
                 "rigid_body_rot": env.simulator._rigid_body_rot[0].detach().cpu(),
-                "task_contact_prim_rot_wxyz": (
-                    env.simulator.task_contact_prim_rot_wxyz[0].detach().cpu()
-                ),
-                "hand_target_pos_source": (
-                    env.simulator.hand_transform_pos[0].detach().cpu()
-                ),
-                "hand_target_quat_source_wxyz": (
-                    env.simulator.hand_transform_rot[0].detach().cpu()
-                ),
-                "hand_source_pos_w": (
-                    env.simulator.scene.sensors["hand_frame_transformer"]
-                    .data.source_pos_w[0]
-                    .detach()
-                    .cpu()
-                ),
-                "hand_source_quat_wxyz": (
-                    env.simulator.scene.sensors["hand_frame_transformer"]
-                    .data.source_quat_w[0]
-                    .detach()
-                    .cpu()
-                ),
-                "grasp_target_pos_w": (
-                    env.simulator.scene.sensors["hand_frame_transformer"]
-                    .data.target_pos_w[0]
-                    .detach()
-                    .cpu()
-                ),
-                "grasp_target_quat_wxyz": (
-                    env.simulator.scene.sensors["hand_frame_transformer"]
-                    .data.target_quat_w[0]
-                    .detach()
-                    .cpu()
-                ),
                 "torques": env.torques[0].detach().cpu(),
                 "actions_after_delay": env.actions_after_delay[0].detach().cpu(),
                 "arm_pos_targets": env._b2z1_arm_pos_targets[0].detach().cpu(),
@@ -477,6 +461,25 @@ def main(config: OmegaConf):
                     env.simulator._robot.data.joint_pos_target[0].detach().cpu()
                 ),
             }
+            if hasattr(env, "stage_buf"):
+                step_trace["stage"] = env.stage_buf[0].detach().cpu()
+            for key, attr_name in (
+                ("task_contact_prim_rot_wxyz", "task_contact_prim_rot_wxyz"),
+                ("hand_target_pos_source", "hand_transform_pos"),
+                ("hand_target_quat_source_wxyz", "hand_transform_rot"),
+            ):
+                if hasattr(env.simulator, attr_name):
+                    step_trace[key] = getattr(env.simulator, attr_name)[0].detach().cpu()
+            hand_sensor = env.simulator.scene.sensors.get("hand_frame_transformer")
+            if hand_sensor is not None:
+                step_trace.update(
+                    {
+                        "hand_source_pos_w": hand_sensor.data.source_pos_w[0].detach().cpu(),
+                        "hand_source_quat_wxyz": hand_sensor.data.source_quat_w[0].detach().cpu(),
+                        "grasp_target_pos_w": hand_sensor.data.target_pos_w[0].detach().cpu(),
+                        "grasp_target_quat_wxyz": hand_sensor.data.target_quat_w[0].detach().cpu(),
+                    }
+                )
             if hasattr(env, "_lowlevel_policy_joint_indices"):
                 policy_ids = env._lowlevel_policy_joint_indices
                 step_trace["policy_dof_pos"] = env.simulator.dof_pos[0, policy_ids].detach().cpu()
@@ -540,7 +543,7 @@ def main(config: OmegaConf):
     if initial_root_w is not None and final_root_w is not None:
         delta = final_root_w - initial_root_w
         logger.info(
-            "B2Z1 fixed-command summary: initial_root_w={} final_root_w={} delta_root_w={} reset_count={}".format(
+            "B2Z1 low-level summary: initial_root_w={} final_root_w={} delta_root_w={} reset_count={}".format(
                 initial_root_w.tolist(),
                 final_root_w.tolist(),
                 delta.tolist(),
@@ -564,7 +567,7 @@ def main(config: OmegaConf):
         logger.info(f"Wrote B2Z1 debug trace to {trace_file}")
 
     if no_render_headless:
-        logger.info("Completed B2Z1 fixed-command debug run; skipping Kit shutdown in no-render mode.")
+        logger.info("Completed B2Z1 low-level run; skipping Kit shutdown in no-render mode.")
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(0)

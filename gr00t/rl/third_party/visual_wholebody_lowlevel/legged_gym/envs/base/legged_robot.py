@@ -87,16 +87,15 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         )
         self.uses_goal_height_reference_mask = observes_goal_height_reference_mask
         self.observes_goal_height_reference_mask = observes_goal_height_reference_mask
-        if cfg.robot_urdf_path:
-            cfg.robot.spawn.robot_urdf_path = cfg.robot_urdf_path
-        if not cfg.robot.spawn.robot_urdf_path:
-            raise ValueError(
-                "cfg.robot_usd_path is empty. Convert your URDF to USD and set LEGGED_GYM_ROBOT_USD=/abs/path/robot.usd "
-                "or pass cfg.robot_usd_path before constructing the env."
-            )
+        if not cfg.robot_usd_path:
+            raise ValueError("cfg.robot_usd_path must point to the converted B2Z1 USD asset.")
+        cfg.robot.spawn.usd_path = cfg.robot_usd_path
         self.body_names_to_idx = {}
         self.reset_init_ee_sphere = None
         super().__init__(cfg, render_mode, **kwargs)
+
+        from legged_gym.utils.isaaclab_app import apply_renderer_feature_settings
+        apply_renderer_feature_settings()
 
         self.num_actions = int(cfg.action_space)
         self.num_obs = int(cfg.observation_space)
@@ -124,20 +123,26 @@ class LeggedRobotIsaacLab(DirectRLEnv):
                                         requires_grad=False)
         self.gait_frequencies = torch.zeros(self.num_envs, dtype=torch.float, device=self.device,
                                             requires_grad=False)
+        self.gait_stance_durations = torch.ones(self.num_envs, dtype=torch.float, device=self.device)
+        self.gait_pair_phases = torch.zeros(self.num_envs, 2, dtype=torch.float, device=self.device)
+        self.gait_pair_phases[:, 0] = 0.25
+        self.gait_transition_active = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.gait_transition_elapsed_s = torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+        self.gait_transition_start_frequency = torch.zeros_like(self.gait_frequencies)
+        self.gait_transition_target_frequency = torch.zeros_like(self.gait_frequencies)
+        self.gait_transition_start_stance_duration = torch.ones_like(self.gait_stance_durations)
+        self.gait_transition_target_stance_duration = torch.ones_like(self.gait_stance_durations)
+        self.gait_frequency_commands = torch.full_like(self.commands[:, :3], float("nan"))
+        self.gait_requested_frequencies = torch.zeros_like(self.gait_frequencies)
+        self.velocity_command_changed = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+        self.last_velocity_command = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device)
         self.clock_inputs = torch.zeros(self.num_envs, num_feet, dtype=torch.float, device=self.device,
                                         requires_grad=False)
         self.doubletime_clock_inputs = torch.zeros(self.num_envs, num_feet, dtype=torch.float, device=self.device,
                                                    requires_grad=False)
         self.halftime_clock_inputs = torch.zeros(self.num_envs, num_feet, dtype=torch.float, device=self.device,
                                                  requires_grad=False)
-        self._gait_phase_offsets = torch.tensor(
-            [
-                0.5 if foot_name in ("FL_foot", "RR_foot") else 0.0
-                for foot_name in self.cfg.asset.policy_foot_names
-            ],
-            dtype=torch.float,
-            device=self.device,
-        )
+        self.foot_indices = torch.zeros(self.num_envs, num_feet, dtype=torch.float, device=self.device)
 
 
         schedule_counter = float(self.cfg.commands.curriculum_playback_counter)
@@ -173,6 +178,15 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         #########################################################################
 
         self._build_joint_maps()
+        hip_body_names = [name.replace("_foot", "_hip") for name in self.cfg.asset.policy_foot_names]
+        missing_hip_body_names = [name for name in hip_body_names if name not in self.body_names_to_idx]
+        if missing_hip_body_names:
+            raise RuntimeError(f"No hip body found for policy feet: {missing_hip_body_names}")
+        self.hip_body_indices = torch.tensor(
+            [self.body_names_to_idx[name] for name in hip_body_names],
+            dtype=torch.long,
+            device=self.device,
+        )
         self._init_policy_compat_buffers()
         self._init_reward_compat()
         self._resample_commands(torch.arange(self.num_envs, device=self.device))
@@ -343,7 +357,15 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         self.robot = Articulation(self.cfg.robot)
         self.scene.articulations["robot"] = self.robot
 
-        self.door = None
+        if self.cfg.enable_doorman_scene:
+            if self.cfg.doorman_door is None:
+                raise RuntimeError("cfg.doorman_door must be set when cfg.enable_doorman_scene is True.")
+            self.door = Articulation(self.cfg.doorman_door)
+            self.scene.articulations["door"] = self.door
+            dome_light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.98, 0.95, 0.88))
+            self.scene.extras["dome_light"] = dome_light_cfg.func("/World/DomeLight", dome_light_cfg)
+        else:
+            self.door = None
 
         if bool(self.cfg.enable_contact_sensor):
             self.contact_sensor = ContactSensor(self.cfg.contact_sensor)
@@ -850,6 +872,12 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         elif joint_pos_limits.dim() == 3:
             joint_pos_limits = joint_pos_limits[0]
         self.dof_pos_limits = joint_pos_limits.to(device=self.device, dtype=torch.float32)
+        joint_effort_limits = self.robot.data.joint_effort_limits
+        if joint_effort_limits.dim() == 2:
+            joint_effort_limits = joint_effort_limits[0]
+        self.torque_limits = joint_effort_limits.to(device=self.device, dtype=torch.float32)
+        if not torch.all(torch.isfinite(self.torque_limits)) or torch.any(self.torque_limits <= 0.0):
+            raise RuntimeError(f"Invalid joint effort limits: {self.torque_limits.detach().cpu().tolist()}")
 
         self.p_gains = torch.zeros(self.num_dofs, device=self.device)
         self.d_gains = torch.zeros(self.num_dofs, device=self.device)
@@ -1252,8 +1280,9 @@ class LeggedRobotIsaacLab(DirectRLEnv):
             leg_torques.mul_(self._p_gains_view[:, leg_slice])
             leg_torques.addcmul_(self.dof_vel[:, leg_slice], self._d_gains_view[:, leg_slice], value=-1.0)
 
-            torque_clip = float(self.cfg.torque_clip)
-            torch.clamp(leg_torques, -torque_clip, torque_clip, out=self.torques[:, leg_slice])
+            leg_torque_limits = self.torque_limits[leg_slice]
+            torch.maximum(leg_torques, -leg_torque_limits, out=self.torques[:, leg_slice])
+            torch.minimum(self.torques[:, leg_slice], leg_torque_limits, out=self.torques[:, leg_slice])
             return self.torques
 
         # Per-action scale from checkpoint metadata.
@@ -1296,10 +1325,9 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         if self.gripper_joint_ids.numel() > 0:
             torques_unclipped[:, self.gripper_joint_ids] = 0.0
 
-        # Constant clamp for bring-up.
-        torque_clip = float(self.cfg.torque_clip)
         torques = self.torques
-        torch.clamp(torques_unclipped, -torque_clip, torque_clip, out=torques)
+        torch.maximum(torques_unclipped, -self.torque_limits, out=torques)
+        torch.minimum(torques, self.torque_limits, out=torques)
 
         return torques 
 
@@ -1649,78 +1677,392 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         self._profile_step_end()
         return {"policy": policy_obs_buf}
 
+    def get_gait_phase_ratios(self):
+        stance_ratio = float(self.cfg.env.trot_stance_ratio)
+        swing_ratio = float(self.cfg.env.trot_swing_ratio)
+        return max(stance_ratio, 1e-6), max(swing_ratio, 1e-6)
+
+    def get_gait_swing_duration_max_s(self):
+        return float(self.cfg.env.trot_swing_duration_max_s)
+
+    def get_gait_stance_duration(self, frequencies=None):
+        stance_ratio, swing_ratio = self.get_gait_phase_ratios()
+        relative_swing_duration = swing_ratio / (stance_ratio + swing_ratio)
+        max_swing_duration_s = max(self.get_gait_swing_duration_max_s(), 0.0)
+        if max_swing_duration_s <= 0.0:
+            swing_duration = relative_swing_duration
+        else:
+            if frequencies is None:
+                frequencies = self.gait_frequencies
+            max_swing_duration = torch.clamp(frequencies * max_swing_duration_s, min=0.0, max=1.0)
+            swing_duration = torch.minimum(
+                torch.full_like(max_swing_duration, relative_swing_duration),
+                max_swing_duration,
+            )
+        return 1.0 - swing_duration
+
+    def _reset_gait_state(self, env_ids):
+        self.gait_frequencies[env_ids] = 0.0
+        self.gait_transition_active[env_ids] = False
+        self.gait_transition_elapsed_s[env_ids] = 0.0
+        self.gait_transition_start_frequency[env_ids] = 0.0
+        self.gait_transition_target_frequency[env_ids] = 0.0
+        self.gait_frequency_commands[env_ids] = float("nan")
+        self.gait_requested_frequencies[env_ids] = 0.0
+
+        gait_pattern = str(self.cfg.env.gait_pattern).lower()
+        if gait_pattern == "adaptive_trot":
+            reset_gait_index = 0.25
+            reset_stance_duration = torch.ones_like(self.gait_frequencies[env_ids])
+            reset_pair_phases = (0.375, 0.125)
+            reset_foot_phases = {
+                "FL_foot": 0.375,
+                "FR_foot": 0.125,
+                "RL_foot": 0.125,
+                "RR_foot": 0.375,
+            }
+            zero_clock_inputs = False
+        elif gait_pattern == "fixed_trot":
+            fixed_frequency = torch.full_like(
+                self.gait_frequencies[env_ids],
+                float(self.cfg.env.fixed_trot_frequency),
+            )
+            reset_gait_index = 0.0
+            reset_stance_duration = self.get_gait_stance_duration(fixed_frequency)
+            reset_pair_phases = (0.5, 0.0)
+            reset_foot_phases = {
+                "FL_foot": 0.5,
+                "FR_foot": 0.0,
+                "RL_foot": 0.0,
+                "RR_foot": 0.5,
+            }
+            zero_clock_inputs = True
+        else:
+            raise ValueError(f"Unsupported gait_pattern: {self.cfg.env.gait_pattern}")
+
+        policy_foot_names = list(self.cfg.asset.policy_foot_names)
+        reset_foot_phases = torch.tensor(
+            [reset_foot_phases[name] for name in policy_foot_names],
+            dtype=self.clock_inputs.dtype,
+            device=self.device,
+        )
+        self.gait_indices[env_ids] = reset_gait_index
+        self.gait_stance_durations[env_ids] = reset_stance_duration
+        self.gait_pair_phases[env_ids, 0] = reset_pair_phases[0]
+        self.gait_pair_phases[env_ids, 1] = reset_pair_phases[1]
+        self.gait_transition_start_stance_duration[env_ids] = reset_stance_duration
+        self.gait_transition_target_stance_duration[env_ids] = reset_stance_duration
+        if hasattr(self, "foot_indices"):
+            self.foot_indices[env_ids] = reset_foot_phases
+
+        if zero_clock_inputs:
+            self.clock_inputs[env_ids] = 0.0
+            self.doubletime_clock_inputs[env_ids] = 0.0
+            self.halftime_clock_inputs[env_ids] = 0.0
+        else:
+            self.clock_inputs[env_ids] = torch.sin(2.0 * np.pi * reset_foot_phases)
+            self.doubletime_clock_inputs[env_ids] = torch.sin(4.0 * np.pi * reset_foot_phases)
+            self.halftime_clock_inputs[env_ids] = torch.sin(np.pi * reset_foot_phases)
+        self.desired_contact_states[env_ids] = 1.0
+
+    def _set_fixed_trot_stopped_state(self, env_ids):
+        if len(env_ids) == 0:
+            return
+        fixed_frequency = torch.full_like(
+            self.gait_frequencies[env_ids],
+            float(self.cfg.env.fixed_trot_frequency),
+        )
+        fixed_stance_duration = self.get_gait_stance_duration(fixed_frequency)
+        self.gait_indices[env_ids] = 0.0
+        self.gait_stance_durations[env_ids] = fixed_stance_duration
+        self.gait_transition_start_stance_duration[env_ids] = fixed_stance_duration
+        self.gait_transition_target_stance_duration[env_ids] = fixed_stance_duration
+        self.gait_pair_phases[env_ids, 0] = 0.5
+        self.gait_pair_phases[env_ids, 1] = 0.0
+        fixed_foot_phases = {
+            "FL_foot": 0.5,
+            "FR_foot": 0.0,
+            "RL_foot": 0.0,
+            "RR_foot": 0.5,
+        }
+        for index, foot_name in enumerate(self.cfg.asset.policy_foot_names):
+            self.foot_indices[env_ids, index] = fixed_foot_phases[foot_name]
+        self.clock_inputs[env_ids] = 0.0
+        self.doubletime_clock_inputs[env_ids] = 0.0
+        self.halftime_clock_inputs[env_ids] = 0.0
+        self.desired_contact_states[env_ids] = 1.0
+
+    @staticmethod
+    def _uniform_to_gait_pair_phases(uniform_phases, stance_durations):
+        stance_durations = stance_durations.unsqueeze(1)
+        swing_durations = (1.0 - stance_durations).clamp(min=1e-6)
+        return torch.where(
+            uniform_phases <= stance_durations,
+            uniform_phases / (2.0 * stance_durations.clamp(min=1e-6)),
+            0.5 + (uniform_phases - stance_durations) / (2.0 * swing_durations),
+        )
+
+    def _start_gait_transitions(self, env_mask, target_frequencies):
+        if not torch.any(env_mask):
+            return
+        self.gait_transition_active[env_mask] = True
+        self.gait_transition_elapsed_s[env_mask] = 0.0
+        self.gait_transition_start_frequency[env_mask] = self.gait_frequencies[env_mask]
+        self.gait_transition_target_frequency[env_mask] = target_frequencies[env_mask]
+        self.gait_transition_start_stance_duration[env_mask] = self.gait_stance_durations[env_mask]
+        self.gait_transition_target_stance_duration[env_mask] = self.get_gait_stance_duration(
+            target_frequencies[env_mask]
+        )
+
+    def _advance_gait_transitions(self, env_mask, duration_s):
+        if not torch.any(env_mask):
+            return
+        transition_duration = max(float(self.cfg.env.gait_transition_duration_s), self.dt)
+        if not torch.is_tensor(duration_s):
+            duration_s = torch.full(
+                (int(torch.sum(env_mask).item()),),
+                float(duration_s),
+                dtype=torch.float,
+                device=self.device,
+            )
+        previous_frequency = self.gait_frequencies[env_mask]
+        elapsed = self.gait_transition_elapsed_s[env_mask] + duration_s
+        progress = torch.clamp(elapsed / transition_duration, 0.0, 1.0)
+        start_frequency = self.gait_transition_start_frequency[env_mask]
+        target_frequency = self.gait_transition_target_frequency[env_mask]
+        frequencies = torch.lerp(start_frequency, target_frequency, progress)
+        mean_frequency = 0.5 * (previous_frequency + frequencies)
+        self.gait_indices[env_mask] = torch.remainder(
+            self.gait_indices[env_mask] + mean_frequency * duration_s,
+            1.0,
+        )
+        self.gait_frequencies[env_mask] = frequencies
+        self.gait_stance_durations[env_mask] = torch.lerp(
+            self.gait_transition_start_stance_duration[env_mask],
+            self.gait_transition_target_stance_duration[env_mask],
+            progress,
+        )
+        self.gait_transition_elapsed_s[env_mask] = elapsed
+        completed_local = progress >= 1.0
+        if torch.any(completed_local):
+            completed_ids = env_mask.nonzero(as_tuple=False).flatten()[completed_local]
+            self.gait_transition_active[completed_ids] = False
+            self.gait_transition_elapsed_s[completed_ids] = transition_duration
+            self.gait_frequencies[completed_ids] = self.gait_transition_target_frequency[completed_ids]
+            self.gait_stance_durations[completed_ids] = self.gait_transition_target_stance_duration[
+                completed_ids
+            ]
+
+    def _stop_gait_at_shared_stance(self, env_mask):
+        if not torch.any(env_mask):
+            return
+        self.gait_frequencies[env_mask] = 0.0
+        self.gait_transition_active[env_mask] = False
+        self.gait_transition_elapsed_s[env_mask] = 0.0
+        self.gait_transition_start_frequency[env_mask] = 0.0
+        self.gait_transition_target_frequency[env_mask] = 0.0
+        self.gait_transition_start_stance_duration[env_mask] = self.gait_stance_durations[env_mask]
+        self.gait_transition_target_stance_duration[env_mask] = self.gait_stance_durations[env_mask]
+
+    def _advance_constant_gait_frequency(self, env_mask, duration_s):
+        if not torch.any(env_mask):
+            return
+        if not torch.is_tensor(duration_s):
+            duration_s = torch.full(
+                (int(torch.sum(env_mask).item()),),
+                float(duration_s),
+                dtype=torch.float,
+                device=self.device,
+            )
+        self.gait_indices[env_mask] = torch.remainder(
+            self.gait_indices[env_mask] + self.gait_frequencies[env_mask] * duration_s,
+            1.0,
+        )
+
+    def _refresh_gait_pair_phases(self):
+        uniform_pair_phases = torch.stack(
+            (torch.remainder(self.gait_indices + 0.5, 1.0), self.gait_indices),
+            dim=1,
+        )
+        self.gait_pair_phases[:] = self._uniform_to_gait_pair_phases(
+            uniform_pair_phases, self.gait_stance_durations
+        )
+
+    def get_gait_swing_permission_mask(self):
+        if not self.cfg.env.observe_gait_commands:
+            return torch.zeros_like(self.foot_contacts_from_sensor)
+        return self.foot_indices > 0.5
+
     def _step_contact_targets(self):
         profile_start = time.perf_counter()
-        if self.cfg.env.observe_gait_commands:
-            if not bool(self.cfg.compute_rewards):
-                min_frequency = float(self.cfg.env.gait_frequency_min)
-                max_frequency = float(self.cfg.env.gait_frequency_max)
-                if max_frequency < min_frequency:
-                    min_frequency, max_frequency = max_frequency, min_frequency
-                self.gait_indices, self.clock_inputs, self.gait_frequencies = _fast_gait_update(
-                    self.gait_indices,
-                    self.commands,
-                    self._gait_phase_offsets,
-                    float(self.dt),
-                    min_frequency,
-                    max_frequency,
-                    max(float(self.cfg.env.gait_frequency_lin_vel_ref), float(self.cfg.numeric_eps)),
-                    max(float(self.cfg.env.gait_frequency_ang_vel_ref), float(self.cfg.numeric_eps)),
-                    max(float(self.cfg.env.gait_frequency_ang_vel_weight), 0.0),
-                    float(self.cfg.commands.lin_vel_x_clip),
-                    float(self.cfg.commands.ang_vel_yaw_clip),
-                )
-                self._profile_record("gait", time.perf_counter() - profile_start)
-                return
+        self.velocity_command_changed[:] = torch.any(
+            torch.abs(self.commands[:, :3] - self.last_velocity_command) > 1e-6,
+            dim=1,
+        )
+        self.last_velocity_command[:] = self.commands[:, :3]
+        if not self.cfg.env.observe_gait_commands:
+            self._profile_record("gait", time.perf_counter() - profile_start)
+            return
 
-            frequencies, walking_mask = self._get_gait_frequencies()
-            self.gait_indices = torch.remainder(self.gait_indices + self.dt * frequencies, 1.0)
-            self.gait_indices.masked_fill_(~walking_mask, 0.0)
+        gait_pattern = str(self.cfg.env.gait_pattern).lower()
+        if gait_pattern not in ("adaptive_trot", "fixed_trot"):
+            raise ValueError(f"Unsupported gait_pattern: {self.cfg.env.gait_pattern}")
+        command_changed = torch.any(
+            torch.isnan(self.gait_frequency_commands)
+            | (torch.abs(self.commands[:, :3] - self.gait_frequency_commands) > 1e-6),
+            dim=1,
+        )
+        if torch.any(command_changed):
+            requested_frequencies = self._get_gait_frequency_targets()
+            self.gait_requested_frequencies[command_changed] = requested_frequencies[command_changed]
+            self.gait_frequency_commands[command_changed] = self.commands[command_changed, :3]
+        target_frequencies = self.gait_requested_frequencies
+        target_changed_during_transition = self.gait_transition_active & (
+            torch.abs(target_frequencies - self.gait_transition_target_frequency) > 1e-6
+        )
+        changed_to_stop = target_changed_during_transition & (target_frequencies <= 1e-6)
+        self.gait_transition_active[changed_to_stop] = False
+        self.gait_transition_elapsed_s[changed_to_stop] = 0.0
+        self._start_gait_transitions(
+            target_changed_during_transition & (~changed_to_stop), target_frequencies
+        )
 
-            foot_phase = self._gait_phase_buf
-            torch.add(self.gait_indices.unsqueeze(1), self._gait_phase_offsets.unsqueeze(0), out=foot_phase)
-            torch.remainder(foot_phase, 1.0, out=foot_phase)
-            torch.mul(foot_phase, float(2 * np.pi), out=self._gait_phase_scaled_buf)
-            torch.sin(self._gait_phase_scaled_buf, out=self.clock_inputs)
+        handled = self.gait_transition_active.clone()
+        self._advance_gait_transitions(handled, self.dt)
+        pending = (~handled) & (torch.abs(target_frequencies - self.gait_frequencies) > 1e-6)
+        stopping = pending & (target_frequencies <= 1e-6)
+        non_stopping = pending & (~stopping)
+        self._start_gait_transitions(non_stopping, target_frequencies)
+        self._advance_gait_transitions(non_stopping, self.dt)
+        handled |= non_stopping
 
-            self.foot_indices = foot_phase
-            torch.mul(foot_phase, float(4 * np.pi), out=self._gait_phase_scaled_buf)
-            torch.sin(self._gait_phase_scaled_buf, out=self.doubletime_clock_inputs)
-            torch.mul(foot_phase, float(np.pi), out=self._gait_phase_scaled_buf)
-            torch.sin(self._gait_phase_scaled_buf, out=self.halftime_clock_inputs)
+        self._refresh_gait_pair_phases()
+        both_stance = torch.all(self.gait_pair_phases <= 0.5, dim=1)
+        start_now = stopping & both_stance
+        self._stop_gait_at_shared_stance(start_now)
+        handled |= start_now
+        waiting = stopping & (~both_stance)
+        if torch.any(waiting):
+            waiting_durations = self.gait_stance_durations[waiting]
+            waiting_indices = self.gait_indices[waiting]
+            frequencies = self.gait_frequencies[waiting].clamp(min=1e-6)
+            first_pair_swing = (
+                (waiting_indices > (waiting_durations - 0.5)) & (waiting_indices < 0.5)
+            )
+            time_to_shared_stance = torch.where(
+                first_pair_swing,
+                (0.5 - waiting_indices) / frequencies,
+                (1.0 - waiting_indices) / frequencies,
+            )
+            crosses_shared_stance_local = time_to_shared_stance <= self.dt
+            if torch.any(crosses_shared_stance_local):
+                waiting_ids = waiting.nonzero(as_tuple=False).flatten()
+                crossing_ids = waiting_ids[crosses_shared_stance_local]
+                crossing_mask = torch.zeros_like(waiting)
+                crossing_mask[crossing_ids] = True
+                crossing_times = time_to_shared_stance[crosses_shared_stance_local]
+                self._advance_constant_gait_frequency(crossing_mask, crossing_times)
+                self._stop_gait_at_shared_stance(crossing_mask)
+                handled |= crossing_mask
 
-            def _compute_smoothing_multiplier(idxs):
-                phase = torch.remainder(idxs, 1.0)
-                return (
-                    smoothing_cdf_start(phase) * (1 - smoothing_cdf_start(phase - 0.5))
-                    + smoothing_cdf_start(phase - 1) * (1 - smoothing_cdf_start(phase - 1.5))
-                )
+        self._advance_constant_gait_frequency(~handled, self.dt)
+        self._refresh_gait_pair_phases()
+        shaped_foot_indices = {
+            "FL_foot": self.gait_pair_phases[:, 0],
+            "FR_foot": self.gait_pair_phases[:, 1],
+            "RL_foot": self.gait_pair_phases[:, 1],
+            "RR_foot": self.gait_pair_phases[:, 0],
+        }
+        self.foot_indices = torch.cat(
+            [shaped_foot_indices[name].unsqueeze(1) for name in self.cfg.asset.policy_foot_names],
+            dim=1,
+        )
+        for index, foot_name in enumerate(self.cfg.asset.policy_foot_names):
+            phases = shaped_foot_indices[foot_name]
+            self.clock_inputs[:, index] = torch.sin(2 * np.pi * phases)
+            self.doubletime_clock_inputs[:, index] = torch.sin(4 * np.pi * phases)
+            self.halftime_clock_inputs[:, index] = torch.sin(np.pi * phases)
 
-            kappa = self.cfg.rewards.kappa_gait_probs
-            smoothing_cdf_start = torch.distributions.normal.Normal(0, kappa).cdf
-            self.desired_contact_states[:] = _compute_smoothing_multiplier(foot_phase)
+        def _compute_smoothing_multiplier(phases):
+            phases = torch.remainder(phases, 1.0)
+            return (
+                smoothing_cdf_start(phases) * (1 - smoothing_cdf_start(phases - 0.5))
+                + smoothing_cdf_start(phases - 1) * (1 - smoothing_cdf_start(phases - 1.5))
+            )
+
+        smoothing_cdf_start = torch.distributions.normal.Normal(
+            0, self.cfg.rewards.kappa_gait_probs
+        ).cdf
+        for index, foot_name in enumerate(self.cfg.asset.policy_foot_names):
+            self.desired_contact_states[:, index] = _compute_smoothing_multiplier(
+                shaped_foot_indices[foot_name]
+            )
+
+        fixed_trot_stopped = (
+            (gait_pattern == "fixed_trot")
+            & (target_frequencies <= 1e-6)
+            & (self.gait_frequencies <= 1e-6)
+        )
+        if torch.any(fixed_trot_stopped):
+            self._set_fixed_trot_stopped_state(
+                torch.nonzero(fixed_trot_stopped, as_tuple=False).flatten()
+            )
         self._profile_record("gait", time.perf_counter() - profile_start)
 
-    def _get_gait_frequencies(self):
-        min_frequency = float(self.cfg.env.gait_frequency_min)
-        max_frequency = float(self.cfg.env.gait_frequency_max)
-        if max_frequency < min_frequency:
-            min_frequency, max_frequency = max_frequency, min_frequency
-
-        lin_vel_ref = max(float(self.cfg.env.gait_frequency_lin_vel_ref), float(self.cfg.numeric_eps))
-        ang_vel_ref = max(float(self.cfg.env.gait_frequency_ang_vel_ref), float(self.cfg.numeric_eps))
-        ang_vel_weight = max(float(self.cfg.env.gait_frequency_ang_vel_weight), 0.0)
-
-        lin_cmd = self.commands[:, :2]
-        lin_cmd_level = torch.sqrt(lin_cmd[:, 0].square() + lin_cmd[:, 1].square()) / lin_vel_ref
-        yaw_cmd_level = torch.abs(self.commands[:, 2]) / ang_vel_ref
-        gait_level = torch.clamp(lin_cmd_level + ang_vel_weight * yaw_cmd_level, 0.0, 1.0)
-
-        frequencies = min_frequency + (max_frequency - min_frequency) * gait_level
+    def _get_gait_frequency_targets(self):
+        gait_pattern = str(self.cfg.env.gait_pattern).lower()
         walking_mask = self._get_walking_cmd_mask()
-        self.gait_frequencies.copy_(frequencies)
-        self.gait_frequencies.masked_fill_(~walking_mask, 0.0)
-        return self.gait_frequencies, walking_mask
+        if gait_pattern == "fixed_trot":
+            fixed_frequency = float(self.cfg.env.fixed_trot_frequency)
+            if fixed_frequency <= 0.0:
+                raise ValueError(
+                    f"cfg.env.fixed_trot_frequency must be positive, got {fixed_frequency}"
+                )
+            return torch.where(
+                walking_mask,
+                torch.full_like(self.gait_frequencies, fixed_frequency),
+                torch.zeros_like(self.gait_frequencies),
+            )
+        if gait_pattern != "adaptive_trot":
+            raise ValueError(f"Unsupported gait_pattern: {self.cfg.env.gait_pattern}")
+        max_stride_x = max(float(self.cfg.env.gait_max_stride_x), 1e-6)
+        max_stride_y = max(float(self.cfg.env.gait_max_stride_y), 1e-6)
+        commanded_hip_velocities = self._get_commanded_hip_velocities()
+        hip_cycle_frequencies = torch.linalg.norm(
+            torch.stack(
+                (
+                    commanded_hip_velocities[:, :, 0] / max_stride_x,
+                    commanded_hip_velocities[:, :, 1] / max_stride_y,
+                ),
+                dim=-1,
+            ),
+            dim=-1,
+        )
+        frequencies = torch.amax(hip_cycle_frequencies, dim=1)
+        return torch.where(walking_mask, frequencies, torch.zeros_like(frequencies))
+
+    def _get_commanded_hip_velocities(self):
+        hip_xy_world = self.rigid_body_state[:, self.hip_body_indices, :2]
+        yaw = euler_from_quat(self.base_quat)[2]
+        cos_yaw = torch.cos(yaw).unsqueeze(1)
+        sin_yaw = torch.sin(yaw).unsqueeze(1)
+        base_xy_world = self.root_states[:, :2].unsqueeze(1)
+        hip_from_base_world = hip_xy_world - base_xy_world
+        hip_from_base_xy = torch.stack(
+            (
+                cos_yaw * hip_from_base_world[:, :, 0] + sin_yaw * hip_from_base_world[:, :, 1],
+                -sin_yaw * hip_from_base_world[:, :, 0] + cos_yaw * hip_from_base_world[:, :, 1],
+            ),
+            dim=-1,
+        )
+        yaw_rate = self.commands[:, 2].view(-1, 1)
+        return torch.stack(
+            (
+                self.commands[:, 0].unsqueeze(1) - yaw_rate * hip_from_base_xy[:, :, 1],
+                self.commands[:, 1].unsqueeze(1) + yaw_rate * hip_from_base_xy[:, :, 0],
+            ),
+            dim=-1,
+        )
     
     def _get_walking_cmd_mask(self, env_ids=None, return_all=False):
         if env_ids is None:
@@ -1886,13 +2228,61 @@ class LeggedRobotIsaacLab(DirectRLEnv):
 
         root_state = self.robot.data.default_root_state[env_ids].clone()
         root_state[:, :3] += self.scene.env_origins[env_ids]
-        root_state[:, :2] += torch_rand_float(-0.5, 0.5, (len(env_ids), 2), self.device)
+        if self.cfg.enable_doorman_scene and self.cfg.doorman_randomize_robot_init:
+            root_state[:, 0:1] = (
+                self.scene.env_origins[env_ids, 0:1]
+                + torch_rand_float(-1.5, -0.6, (len(env_ids), 1), self.device)
+            )
+            root_state[:, 1:2] = (
+                self.scene.env_origins[env_ids, 1:2]
+                + torch_rand_float(-0.5, 0.5, (len(env_ids), 1), self.device)
+            )
+            random_yaw = torch_rand_float(
+                -torch.pi / 4, torch.pi / 4, (len(env_ids), 1), self.device
+            ).squeeze(-1)
+            zero_angle = torch.zeros_like(random_yaw)
+            root_state[:, 3:7] = quat_from_euler_xyz(zero_angle, zero_angle, random_yaw)
+        elif not self.cfg.enable_doorman_scene:
+            root_state[:, :2] += torch_rand_float(-0.5, 0.5, (len(env_ids), 2), self.device)
         self.robot.write_root_pose_to_sim(root_state[:, :7], env_ids=env_ids)
         self.robot.write_root_velocity_to_sim(root_state[:, 7:], env_ids=env_ids)
+        self._reset_doorman_door_states(env_ids)
         self._reset_task_specific_buffers_on_reset(env_ids)
         self._resample_commands(env_ids)
-        reset_command = torch.tensor(self.cfg.reset_command, dtype=self.commands.dtype, device=self.device)
-        self.commands[env_ids, : reset_command.numel()] = reset_command.unsqueeze(0)
+        if self.cfg.env.teleop_mode:
+            self.commands[env_ids] = self.teleop_raw_commands[env_ids]
+        else:
+            reset_command = torch.tensor(
+                self.cfg.reset_command, dtype=self.commands.dtype, device=self.device
+            )
+            self.commands[env_ids, : reset_command.numel()] = reset_command.unsqueeze(0)
+        self.last_velocity_command[env_ids] = self.commands[env_ids, :3]
+        self.velocity_command_changed[env_ids] = False
+        self._reset_gait_state(env_ids)
+
+    def _reset_doorman_door_states(self, env_ids: torch.Tensor):
+        if not self.cfg.enable_doorman_scene:
+            return
+        if self.door is None:
+            raise RuntimeError("self.door is not initialized while cfg.enable_doorman_scene is True.")
+
+        root_state = self.door.data.default_root_state[env_ids].clone()
+        root_state[:, :3] += self.scene.env_origins[env_ids]
+        self.door.write_root_pose_to_sim(root_state[:, :7], env_ids=env_ids)
+        self.door.write_root_velocity_to_sim(root_state[:, 7:], env_ids=env_ids)
+
+        joint_pos = self.door.data.default_joint_pos[env_ids].clone()
+        joint_vel = torch.zeros_like(joint_pos)
+        if self.cfg.doorman_randomize_door_init_state:
+            rand_count = int(env_ids.numel() // 3)
+            if rand_count > 0 and joint_pos.shape[1] > 0:
+                selected = torch.randperm(env_ids.numel(), device=self.device)[:rand_count]
+                joint_pos[selected, 0] = torch_rand_float(
+                    0.261799, 1.74533, (rand_count, 1), self.device
+                ).squeeze(-1)
+
+        self.door.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+        self.door.set_joint_position_target(joint_pos, env_ids=env_ids)
 
 
     def _resample_commands(self, env_ids):

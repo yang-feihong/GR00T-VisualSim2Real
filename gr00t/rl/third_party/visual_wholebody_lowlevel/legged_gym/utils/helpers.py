@@ -14,7 +14,6 @@ for p in [str(LOW_LEVEL_ROOT)]:
     sys.path.insert(0, p)
 
 from legged_gym.utils import isaaclab_app, run_metadata
-from legged_gym.utils.b2z1_mount import MOUNT_URDF_SPECS, ensure_mount_urdf
 
 OBSERVATION_BASE_PROPRIO = 2 + 3 + 18 + 18 + 12 + 3 + 3 + 3
 COMMAND_SCHEDULE_NAMES = (
@@ -31,6 +30,7 @@ GAIT_FREQUENCY_FEATURE_NAMES = (
     "gait_frequency_ang_vel_ref",
     "gait_frequency_ang_vel_weight",
 )
+GAIT_PATTERNS = ("fixed_trot", "adaptive_trot")
 
 
 def str_to_bool(value):
@@ -120,14 +120,10 @@ def build_common_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scene_usd_path", type=str, default=None)
     parser.add_argument("--scene_prim_path", type=str, default=None)
     parser.add_argument("--scene_position", type=float, nargs=3, default=None)
-    parser.add_argument("--robot_urdf_path", type=str, default=None)
-    parser.add_argument("--base_robot", type=str, default=None, choices=["b2z1"])
-    parser.add_argument("--mount_deg", type=float, default=0.0)
-    parser.add_argument("--mount_x", type=float, default=None)
-    parser.add_argument("--mount_y", type=float, default=None)
-    parser.add_argument("--mount_z", type=float, default=None)
-    parser.add_argument("--mount_xyz", type=float, nargs=3, default=None)
-    parser.add_argument("--robot_collision_profile", type=str, default="full", choices=["full", "feet_gripper"])
+    parser.add_argument("--enable_doorman_scene", action="store_true")
+    parser.add_argument("--doorman_randomize_robot_init", type=str_to_bool, nargs="?", const=True, default=True)
+    parser.add_argument("--doorman_randomize_door_init_state", type=str_to_bool, nargs="?", const=True, default=False)
+    parser.add_argument("--robot_usd_path", type=str, default=None)
     parser.add_argument("--ee_goal_obs_mode", type=str, default=None)
     parser.add_argument(
         "--ee_goal_sampling_mode",
@@ -202,14 +198,57 @@ def _apply_checkpoint_observation_dim_args(cfg, metadata: dict):
     cfg.env.history_len = int(env_metadata["history_len"])
 
 
-def _apply_checkpoint_gait_args(cfg, features: dict, metadata: dict):
-    env_metadata = metadata["env_cfg"]["env"]
-    for name in GAIT_FREQUENCY_FEATURE_NAMES:
-        value = features.get(name, env_metadata.get(name))
-        if value is None and name in ("gait_frequency_min", "gait_frequency_max"):
-            value = features.get("fixed_trot_frequency", env_metadata.get("fixed_trot_frequency"))
-        if value is not None:
-            setattr(cfg.env, name, float(value))
+def _apply_checkpoint_policy_control_args(cfg, metadata: dict):
+    saved_cfg = metadata["env_cfg"]
+    env_metadata = saved_cfg["env"]
+    control_metadata = saved_cfg["control"]
+    normalization_metadata = saved_cfg["normalization"]
+
+    saved_default_joint_angles = saved_cfg["init_state"]["default_joint_angles"]
+    for joint_name in cfg.policy_joint_names[:12]:
+        cfg.default_joint_angles[joint_name] = float(saved_default_joint_angles[joint_name])
+    cfg.decimation = int(control_metadata["decimation"])
+    cfg.control.action_scale = [float(value) for value in control_metadata["action_scale"]]
+    cfg.control.stiffness = {
+        str(name): float(value) for name, value in control_metadata["stiffness"].items()
+    }
+    cfg.control.damping = {
+        str(name): float(value) for name, value in control_metadata["damping"].items()
+    }
+    cfg.control.clip_actions = float(normalization_metadata["clip_actions"])
+    cfg.control.clip_observations = float(normalization_metadata["clip_observations"])
+    cfg.obs_scales = {
+        name: float(normalization_metadata["obs_scales"][name])
+        for name in ("lin_vel", "ang_vel", "dof_pos", "dof_vel")
+    }
+    cfg.commands_scale = [
+        cfg.obs_scales["lin_vel"],
+        cfg.obs_scales["lin_vel"],
+        cfg.obs_scales["ang_vel"],
+    ]
+    cfg.action_delay = int(env_metadata["action_delay"])
+    cfg.env.action_delay = int(env_metadata["action_delay"])
+    cfg.action_delay_mode = str(env_metadata["action_delay_mode"])
+    cfg.env.action_delay_mode = str(env_metadata["action_delay_mode"])
+
+
+def _apply_checkpoint_gait_args(cfg, features: dict):
+    gait_pattern = str(features["gait_pattern"]).lower()
+    if gait_pattern not in GAIT_PATTERNS:
+        raise ValueError(f"Unsupported checkpoint gait_pattern: {features['gait_pattern']}")
+    cfg.env.gait_pattern = gait_pattern
+    if "trot_swing_duration_max_s" in features:
+        cfg.env.trot_swing_duration_max_s = float(features["trot_swing_duration_max_s"])
+    if "gait_transition_duration_s" in features:
+        cfg.env.gait_transition_duration_s = float(features["gait_transition_duration_s"])
+    if gait_pattern == "adaptive_trot":
+        cfg.env.gait_max_stride_x = float(features["gait_max_stride_x"])
+        cfg.env.gait_max_stride_y = float(features["gait_max_stride_y"])
+    else:
+        fixed_frequency = float(features["fixed_trot_frequency"])
+        if fixed_frequency <= 0.0:
+            raise ValueError(f"fixed_trot_frequency must be positive, got {fixed_frequency}")
+        cfg.env.fixed_trot_frequency = fixed_frequency
 
 
 def _apply_checkpoint_command_schedule_args(cfg, metadata: dict):
@@ -218,68 +257,6 @@ def _apply_checkpoint_command_schedule_args(cfg, metadata: dict):
         parsed = parse_float_schedule(commands_metadata[name])
         if parsed is not None:
             setattr(cfg.commands, name, parsed)
-
-
-def resolve_mount_xyz(args, features, base_robot):
-    if args.mount_xyz is not None:
-        return args.mount_xyz
-
-    if features is None:
-        default_xyz = list(MOUNT_URDF_SPECS[base_robot]["default_xyz"])
-    else:
-        default_xyz = [features["mount_x"], features["mount_y"], features["mount_z"]]
-
-    if args.mount_x is not None:
-        default_xyz[0] = args.mount_x
-    if args.mount_y is not None:
-        default_xyz[1] = args.mount_y
-    if args.mount_z is not None:
-        default_xyz[2] = args.mount_z
-    return default_xyz
-
-
-def resolve_robot_urdf_path(args, require_checkpoint_metadata=False, checkpoint_features=None) -> str:
-    if args.robot_urdf_path is not None:
-        return args.robot_urdf_path
-
-    base_robot = args.base_robot or args.task
-    features = checkpoint_features
-    if checkpoint_features is None and (require_checkpoint_metadata or args.ckpt_path or args.exptid):
-        try:
-            features = run_metadata.load_checkpoint_features(args)
-            if len(features) == 0:
-                features = None
-        except (FileNotFoundError, ValueError):
-            features = None
-
-    mount_deg = float(args.mount_deg if features is None else features["mount_deg"])
-    mount_xyz = resolve_mount_xyz(args, features, base_robot)
-    collision_profile = str(args.robot_collision_profile).strip().lower()
-    mount_kwargs = {}
-    if collision_profile == "feet_gripper":
-        mount_kwargs = {
-            "variant_token": "feet_gripper_collision",
-            "keep_collision_links": {
-                "base_link",
-                "FL_foot",
-                "FR_foot",
-                "RL_foot",
-                "RR_foot",
-                "gripperStator",
-                "gripperMover",
-                "gripper_link",
-            },
-        }
-    urdf_rel = ensure_mount_urdf(
-        root_dir=str(LOW_LEVEL_ROOT),
-        generator_name=base_robot,
-        mount_deg=mount_deg,
-        mount_xyz=mount_xyz,
-        **mount_kwargs,
-    )
-    urdf_path = str((LOW_LEVEL_ROOT / urdf_rel).resolve())
-    print(f"[urdf] auto-generated: {urdf_path}")
-    return urdf_path
 
 
 def _apply_cli_basic_env_args(cfg, args):
@@ -294,21 +271,32 @@ def _apply_cli_basic_env_args(cfg, args):
 
 
 def _apply_cli_scene_args(cfg, args):
+    if args.enable_doorman_scene and args.scene_usd_path:
+        raise ValueError("--enable_doorman_scene and --scene_usd_path cannot be used together")
     if args.scene_usd_path is not None:
         cfg.scene_usd_path = args.scene_usd_path
     if args.scene_prim_path is not None:
         cfg.scene_prim_path = args.scene_prim_path
     if args.scene_position is not None:
         cfg.scene_position = [float(value) for value in args.scene_position]
+    if args.enable_doorman_scene:
+        from legged_gym.envs.manip_loco.training_doorman_scene import build_training_doorman_door_cfg
+
+        cfg.enable_doorman_scene = True
+        cfg.scene.replicate_physics = False
+        cfg.doorman_randomize_robot_init = bool(args.doorman_randomize_robot_init)
+        cfg.doorman_randomize_door_init_state = bool(args.doorman_randomize_door_init_state)
+        cfg.doorman_door = build_training_doorman_door_cfg(args.num_envs)
+        print("[doorman] using the high-level training DoorSpawner configuration")
 
 
 def _apply_cli_robot_args(cfg, args, for_play: bool, checkpoint_features):
-    cfg.robot_urdf_path = resolve_robot_urdf_path(
-        args,
-        require_checkpoint_metadata=for_play,
-        checkpoint_features=checkpoint_features,
-    )
-    cfg.robot.spawn.asset_path = cfg.robot_urdf_path
+    del for_play, checkpoint_features
+    if args.robot_usd_path is not None:
+        cfg.robot_usd_path = str(Path(args.robot_usd_path).resolve())
+    if not Path(cfg.robot_usd_path).is_file():
+        raise FileNotFoundError(f"B2Z1 USD not found: {cfg.robot_usd_path}")
+    cfg.robot.spawn.usd_path = cfg.robot_usd_path
 
 
 def _apply_cli_goal_and_observation_args(cfg, args):
@@ -393,7 +381,8 @@ def build_env_cfg(args, for_play=False):
         _validate_checkpoint_robot_args(checkpoint_features)
         _apply_checkpoint_goal_and_observation_args(cfg, checkpoint_features)
         _apply_checkpoint_observation_dim_args(cfg, metadata)
-        _apply_checkpoint_gait_args(cfg, checkpoint_features, metadata)
+        _apply_checkpoint_gait_args(cfg, checkpoint_features)
+        _apply_checkpoint_policy_control_args(cfg, metadata)
         _apply_checkpoint_command_schedule_args(cfg, metadata)
 
     _apply_cli_basic_env_args(cfg, args)
@@ -508,6 +497,7 @@ def load_policy_from_checkpoint(ckpt_path: str, device):
         "num_leg_actions": int(actor_critic_kwargs["num_leg_actions"]),
         "num_arm_actions": int(actor_critic_kwargs["num_arm_actions"]),
         "output_tanh": bool(actor_critic_kwargs["output_tanh"]),
+        "latent_mode": "history",
     }
     policy = _B2Z1LowLevelPolicy(policy_cfg).to(device)
     incompatible = policy.load_state_dict(ckpt["model_state_dict"], strict=False)

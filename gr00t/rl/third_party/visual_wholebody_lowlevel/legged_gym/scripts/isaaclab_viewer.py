@@ -106,6 +106,8 @@ class IsaacLabViewerController:
                 "KEY_9": "9",
                 "LEFT_BRACKET": "[",
                 "RIGHT_BRACKET": "]",
+                "COMMA": ",",
+                "PERIOD": ".",
                 "LEFT": "left",
                 "RIGHT": "right",
                 "UP": "up",
@@ -133,11 +135,13 @@ class IsaacLabViewerController:
             "escape": "esc",
             "left_bracket": "[",
             "right_bracket": "]",
+            "comma": ",",
+            "period": ".",
             "page_up": "pageup",
             "page_down": "pagedown",
         }
         text = replacements.get(text, text)
-        if text in {"esc", "space", "v", "f", "[", "]", "left", "right", "up", "down", "pageup", "pagedown"}:
+        if text in {"esc", "space", "v", "f", "[", "]", ",", ".", "left", "right", "up", "down", "pageup", "pagedown"}:
             return text
         if len(text) == 1 and (text.isdigit() or text.isalpha()):
             return text

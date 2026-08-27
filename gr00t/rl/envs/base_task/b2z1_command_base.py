@@ -65,7 +65,7 @@ class _B2Z1LowLevelActor(nn.Module):
         self.num_prop = num_prop
         self.num_priv = num_priv
         self.num_hist = num_hist
-        self.latent_mode = str(cfg.get("latent_mode", "privileged"))
+        self.latent_mode = str(cfg.get("latent_mode", "history"))
         if self.latent_mode not in ("privileged", "history"):
             raise ValueError(
                 f"Unsupported B2Z1 low-level latent_mode: {self.latent_mode}"
@@ -110,9 +110,10 @@ class _B2Z1LowLevelActor(nn.Module):
         hist = obs[:, -self.num_hist * self.num_prop :]
         return self.history_encoder(hist.view(-1, self.num_hist, self.num_prop))
 
-    def forward(self, obs):
+    def forward(self, obs, hist_encoding=None):
         obs_prop = obs[:, : self.num_prop]
-        if self.latent_mode == "history":
+        use_history = self.latent_mode == "history" if hist_encoding is None else bool(hist_encoding)
+        if use_history:
             latent = self.infer_hist_latent(obs)
         else:
             obs_priv = obs[:, self.num_prop : self.num_prop + self.num_priv]
@@ -133,8 +134,8 @@ class _B2Z1LowLevelPolicy(nn.Module):
         super().__init__()
         self.actor = _B2Z1LowLevelActor(cfg)
 
-    def forward(self, obs):
-        return self.actor(obs)
+    def forward(self, obs, hist_encoding=None):
+        return self.actor(obs, hist_encoding=hist_encoding)
 
 
 class B2Z1CommandBase(LeggedRobotBase):
@@ -295,6 +296,16 @@ class B2Z1CommandBase(LeggedRobotBase):
         )
         self._lowlevel_command_obs_scale = torch.tensor(
             cmd_cfg.get("lowlevel_command_obs_scale", [2.0, 2.0, 0.25]),
+            device=self.device,
+            dtype=torch.float32,
+        ).view(1, 3)
+        self._lowlevel_velocity_command_lower = torch.tensor(
+            cmd_cfg.get("lowlevel_velocity_command_lower", [-0.8, -0.8, -1.0]),
+            device=self.device,
+            dtype=torch.float32,
+        ).view(1, 3)
+        self._lowlevel_velocity_command_upper = torch.tensor(
+            cmd_cfg.get("lowlevel_velocity_command_upper", [0.8, 0.8, 1.0]),
             device=self.device,
             dtype=torch.float32,
         ).view(1, 3)
@@ -471,11 +482,32 @@ class B2Z1CommandBase(LeggedRobotBase):
                 torch.arange(self.num_envs, device=self.device), self.action_delay_idx
             ]
 
-        self._last_b2z1_commands[:] = self._b2z1_commands
-        self._b2z1_commands_unclipped[:] = highlevel_actions * self._command_scale
-        self._b2z1_commands[:] = torch.maximum(
-            torch.minimum(self._b2z1_commands_unclipped, self._command_upper),
+        return self._step_b2z1_commands(
+            highlevel_actions * self._command_scale,
             self._command_lower,
+            self._command_upper,
+        )
+
+    def step_physical_b2z1_commands(self, physical_commands):
+        """Step with B2Z1 deployment commands in physical units."""
+        if physical_commands.shape[-1] != self.COMMAND_DIM:
+            raise ValueError(
+                f"B2Z1 physical command must be {self.COMMAND_DIM}D, "
+                f"got {physical_commands.shape[-1]}"
+            )
+
+        command_lower = self._command_lower.clone()
+        command_upper = self._command_upper.clone()
+        command_lower[:, :3] = self._lowlevel_velocity_command_lower
+        command_upper[:, :3] = self._lowlevel_velocity_command_upper
+        return self._step_b2z1_commands(physical_commands, command_lower, command_upper)
+
+    def _step_b2z1_commands(self, physical_commands, command_lower, command_upper):
+        self._last_b2z1_commands[:] = self._b2z1_commands
+        self._b2z1_commands_unclipped[:] = physical_commands
+        self._b2z1_commands[:] = torch.maximum(
+            torch.minimum(self._b2z1_commands_unclipped, command_upper),
+            command_lower,
         )
         self._project_b2z1_ee_command_to_workspace()
         self._b2z1_joint_actions[:] = self._compute_b2z1_joint_actions()
@@ -491,7 +523,7 @@ class B2Z1CommandBase(LeggedRobotBase):
 
         lowlevel_obs = self._build_lowlevel_obs()
         with torch.no_grad():
-            lowlevel_actions = self._lowlevel_policy(lowlevel_obs)
+            lowlevel_actions = self._lowlevel_policy(lowlevel_obs, hist_encoding=True)
         lowlevel_actions = torch.clamp(
             lowlevel_actions[:, : self._num_lowlevel_actions],
             -self._lowlevel_action_clip,
@@ -970,7 +1002,8 @@ class B2Z1CommandBase(LeggedRobotBase):
         if orn_delta is None:
             orn_delta = torch.zeros_like(ee_goal_cart)
         sphere = self._cart_to_sphere(ee_goal_cart)
-        roll = orn_delta[:, 0] - 1.5707963267948966
+        # ManipLoco/lab30 defines the gripper's nominal roll as +pi/2.
+        roll = orn_delta[:, 0] + 1.5707963267948966
         pitch = -sphere[:, 1] + self._b2z1_arm_induced_pitch + orn_delta[:, 1]
         goal_yaw = sphere[:, 2] + orn_delta[:, 2]
         goal_quat_local = self._quat_from_euler_xyz_xyzw(roll, pitch, goal_yaw)

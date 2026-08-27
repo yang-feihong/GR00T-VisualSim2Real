@@ -119,7 +119,7 @@ def run_open_loop(env, policy, trace_path: str, num_substeps: int, root_height: 
     env._reset_gait_state(torch.arange(env.num_envs, device=env.device))
     policy_obs = env._get_observations()["policy"].clone()
     with torch.no_grad():
-        policy_output = policy(policy_obs)
+        policy_output = policy(policy_obs, hist_encoding=True)
 
     actions = tensor(POLICY_ACTION, env.device)
     records = []
@@ -167,6 +167,7 @@ def main():
     parser = build_arg_parser()
     add_app_launcher_args(parser)
     parser.add_argument("--num_steps", type=int, default=120)
+    parser.add_argument("--velocity_command", type=float, nargs=3, default=[0.0, 0.0, 0.0])
     parser.add_argument("--trace_path", type=str, default="/tmp/b2z1_third_party_lowlevel_trace.pt")
     parser.add_argument("--trace_steps", type=str, default="0,1,2,3,4,5,10,20,50,100")
     parser.add_argument("--zero_initial_command_obs", action="store_true")
@@ -201,6 +202,7 @@ def main():
         history[:, :, command_slice] = 0.0
 
     trace_steps = {int(part) for part in args.trace_steps.split(",") if part.strip()}
+    velocity_command = torch.tensor(args.velocity_command, device=env.device, dtype=torch.float32)
     trace = {
         "meta": {
             "dof_names": list(env.dof_names),
@@ -213,11 +215,11 @@ def main():
     }
 
     for step in range(int(args.num_steps)):
-        env.commands[:, :3] = 0.0
+        env.commands[:, :3] = velocity_command
         with torch.no_grad():
-            actions = runner.policy(runner.obs.detach())
+            actions = runner.policy(runner.obs.detach(), hist_encoding=True)
         runner.obs, *_ = env.step(actions.detach())
-        env.commands[:, :3] = 0.0
+        env.commands[:, :3] = velocity_command
         if step in trace_steps:
             trace["steps"][step] = {
                 "root_state": env.root_states[0].detach().cpu(),

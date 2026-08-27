@@ -26,6 +26,18 @@ _RENDERER_MULTI_GPU_KIT_ARGS = (
     "--/renderer/multiGpu/autoEnable=true",
     "--/renderer/multiGPU/autoEnable=true",
 )
+_renderer_feature_settings = None
+
+
+def _parse_bool(value):
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on"}:
+        return True
+    if text in {"0", "false", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Expected a boolean, got {value!r}")
 
 
 def add_app_launcher_args(parser):
@@ -35,6 +47,15 @@ def add_app_launcher_args(parser):
     parser.set_defaults(headless=True)
     if "--no-headless" not in parser._option_string_actions:
         parser.add_argument("--no-headless", dest="headless", action="store_false", default=argparse.SUPPRESS)
+    renderer_group = parser.add_argument_group("RTX renderer features")
+    renderer_group.add_argument("--rtx_reflections", type=_parse_bool, default=False)
+    renderer_group.add_argument("--rtx_translucency", type=_parse_bool, default=False)
+    renderer_group.add_argument("--rtx_subsurface_scattering", type=_parse_bool, default=False)
+    renderer_group.add_argument("--rtx_caustics", type=_parse_bool, default=False)
+    renderer_group.add_argument("--rtx_indirect_diffuse", type=_parse_bool, default=False)
+    renderer_group.add_argument("--rtx_ambient_occlusion", type=_parse_bool, default=False)
+    renderer_group.add_argument("--rtx_direct_lighting_spp", type=int, default=1)
+    renderer_group.add_argument("--rtx_reflections_spp", type=int, default=1)
 
 
 def load_rgb_camera_specs(config_path):
@@ -122,6 +143,50 @@ def _apply_renderer_multi_gpu_settings():
         print(f"[renderer][warn] failed to enable renderer multi-GPU: {exc}")
 
 
+def _capture_renderer_feature_settings(args):
+    global _renderer_feature_settings
+    direct_spp = int(args.rtx_direct_lighting_spp)
+    reflections_spp = int(args.rtx_reflections_spp)
+    if direct_spp < 1 or reflections_spp < 1:
+        raise ValueError("RTX samples per pixel must be at least 1")
+    _renderer_feature_settings = {
+        "/rtx/reflections/enabled": bool(args.rtx_reflections),
+        "/rtx/translucency/enabled": bool(args.rtx_translucency),
+        "/rtx/raytracing/subsurface/enabled": bool(args.rtx_subsurface_scattering),
+        "/rtx/caustics/enabled": bool(args.rtx_caustics),
+        "/rtx/indirectDiffuse/enabled": bool(args.rtx_indirect_diffuse),
+        "/rtx/ambientOcclusion/enabled": bool(args.rtx_ambient_occlusion),
+        "/rtx/directLighting/sampledLighting/samplesPerPixel": direct_spp,
+        "/rtx/reflections/sampledLighting/samplesPerPixel": reflections_spp,
+    }
+
+
+def apply_renderer_feature_settings():
+    """Reapply requested RTX features after SimulationContext loads its preset."""
+    if _renderer_feature_settings is None:
+        return
+    try:
+        import carb.settings
+
+        settings = carb.settings.get_settings()
+        for setting_path, value in _renderer_feature_settings.items():
+            settings.set(setting_path, value)
+        labels = {
+            "/rtx/reflections/enabled": "reflections",
+            "/rtx/translucency/enabled": "translucency",
+            "/rtx/raytracing/subsurface/enabled": "subsurface_scattering",
+            "/rtx/caustics/enabled": "caustics",
+            "/rtx/indirectDiffuse/enabled": "indirect_diffuse",
+            "/rtx/ambientOcclusion/enabled": "ambient_occlusion",
+            "/rtx/directLighting/sampledLighting/samplesPerPixel": "direct_lighting_spp",
+            "/rtx/reflections/sampledLighting/samplesPerPixel": "reflections_spp",
+        }
+        summary = ", ".join(f"{labels[path]}={value}" for path, value in _renderer_feature_settings.items())
+        print(f"[renderer] applied RTX camera settings: {summary}")
+    except Exception as exc:
+        print(f"[renderer][warn] failed to apply RTX camera settings: {exc}")
+
+
 def _rgb_camera_config_has_enabled_cameras(config_path: str) -> bool:
     try:
         parsed = load_rgb_camera_specs(config_path)
@@ -142,6 +207,7 @@ def launch_app(args):
         )
         if needs_cameras and hasattr(args, "enable_cameras"):
             args.enable_cameras = True
+        _capture_renderer_feature_settings(args)
         _sync_headless_env(args)
         _enable_viewport_performance_hud(args)
         _enable_renderer_multi_gpu(args)
