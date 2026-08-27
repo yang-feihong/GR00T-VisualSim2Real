@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Official B2Z1 door-opening RL training entry.
 # Defaults are intentionally small for launch validation; increase these for real runs.
-GPU_ID="${GPU_ID:-2}"                 # Host GPU exposed as cuda:0 inside this process.
+GPU_ID="${GPU_ID:-0}"                 # Host GPU exposed as cuda:0 inside this process.
 NUM_ENVS="${NUM_ENVS:-1}"
 NUM_TOTAL_BATCHES="${NUM_TOTAL_BATCHES:-2}"
 NUM_STEPS_PER_ENV="${NUM_STEPS_PER_ENV:-8}"
