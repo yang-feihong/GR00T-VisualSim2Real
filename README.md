@@ -10,16 +10,14 @@
       <a href="https://arxiv.org/abs/2511.15200"><img src="https://img.shields.io/badge/arXiv-2511.15200-b31b1b.svg" alt="VIRAL Paper"></a>
       <a href="https://viral-humanoid.github.io/"><img src="https://img.shields.io/badge/Project-Page-blue.svg" alt="VIRAL Project Page"></a>
       <a href="https://github.com/NVlabs/GR00T-VisualSim2Real/tree/main"><img src="https://img.shields.io/badge/Code-viral-lightgrey.svg" alt="VIRAL Code"></a>
-      <br><br>
-      <img src="./media/viral-teaser.gif" width="100%">
+      <br>
     </td>
     <td align="center" valign="top" width="50%">
       <p><b>DoorMan</b><br><br><b>Opening the Sim-to-Real Door for<br>Humanoid Pixel-to-Action Policy Transfer</b></p>
       <a href="https://arxiv.org/abs/2512.01061"><img src="https://img.shields.io/badge/arXiv-2512.01061-b31b1b.svg" alt="DoorMan Paper"></a>
       <a href="https://doorman-humanoid.github.io/"><img src="https://img.shields.io/badge/Project-Page-blue.svg" alt="DoorMan Project Page"></a>
       <a href="https://github.com/NVlabs/GR00T-VisualSim2Real/tree/doorman"><img src="https://img.shields.io/badge/Code-doorman-lightgrey.svg" alt="DoorMan Code"></a>
-      <br><br>
-      <img src="./media/doorman-teaser.gif" width="100%">
+      <br>
     </td>
   </tr>
 </table>
@@ -136,13 +134,7 @@ projects/
 └── LAFAN-G1/       # LAFAN-G1 dataset
 ```
 
-### 6. Download HOMIE locomotion models
-
-The door task uses HOMIE locomotion models for lower-body control. Place the following model files in the repo root `./models/` directory:
-- `model_walk.pt` - Walking locomotion policy
-- `model_stand.pt` - Standing locomotion policy
-
-### 7. Verify installation
+### 6. Verify installation
 
 ```bash
 python -c "from gr00t.rl.envs.door.door_open_homie import DoorPregrasp; print('OK')"
@@ -160,7 +152,7 @@ gr00t/rl/
 │   ├── exp/wbmanip/            # Door experiment configs
 │   ├── algo/                   # Algorithm configs (PPO, DAgger)
 │   ├── env/                    # Environment configs
-│   ├── robot/g1/               # Robot configs (G1 43-DOF)
+│   ├── robot/                  # Robot configs, including B2Z1
 │   ├── rewards/wbmanip/        # Reward function configs
 │   ├── obs/wbmanip/            # Observation configs
 │   └── domain_rand/            # Domain randomization configs
@@ -176,9 +168,7 @@ gr00t/rl/
 ├── agents/modules/             # Neural network building blocks (MLP, CNN, ResNet)
 ├── simulator/isaacsim/         # Isaac Sim interface
 ├── data/                       # Task data
-│   ├── robots/g1/              # G1 robot USD assets
-│   ├── motions/g1_wsg/         # Door demonstration motion data
-│   ├── objects/grab/           # Door handle assets
+│   ├── robots/b2z1_lab30/      # B2Z1 USD assets
 │   └── tasks/door/             # Door scenario configuration
 └── utils/                      # General utilities
 ```
@@ -186,10 +176,6 @@ gr00t/rl/
 ## Door Asset Generation
 
 During training, door assets are procedurally generated on the fly. You can also generate them **offline** — see [gr00t/rl/scripts/README.md](gr00t/rl/scripts/README.md) for full documentation.
-
-<p align="center">
-  <img src="./media/door_assets.gif" width="90%">
-</p>
 
 ```bash
 # Quick start: generate 100 doors matching training config
