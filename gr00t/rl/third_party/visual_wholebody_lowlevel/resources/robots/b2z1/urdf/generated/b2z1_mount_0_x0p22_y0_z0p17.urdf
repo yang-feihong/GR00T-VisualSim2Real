@@ -1,6 +1,6 @@
 <?xml version='1.0' encoding='utf-8'?>
 <robot name="b2_description">
-  <!-- Mesh-axis fix for Isaac Sim: all DAE mesh visual/collision origins had rpy=+pi/2 about X, which caused parts to appear rotated 90 deg in Isaac Sim. Link/joint frames are unchanged. -->
+  <!-- B2+Z1 deployment geometry with the real +90 degree arm mount and refined gripper collision hulls. -->
   <link name="base_link">
     <inertial>
       <origin xyz="0.000458 0.005261 0.000665" rpy="0 0 0" />
@@ -29,6 +29,12 @@
       <origin xyz="0 0 0" rpy="0 0 0" />
       <geometry>
         <box size="0.568 0.295 0.255" />
+      </geometry>
+    </collision>
+    <collision name="trunk_front_camera_enclosure">
+      <origin xyz="0.377 0 0.01" rpy="0 0 0" />
+      <geometry>
+        <box size="0.206 0.12 0.10" />
       </geometry>
     </collision>
   </link>
@@ -904,17 +910,161 @@
         <mesh filename="../../meshes/z1_GripperStator.dae" scale="1 1 1" />
       </geometry>
     </visual>
-    <collision>
-      <origin rpy="0 0 0" xyz="0 0 0" />
-      <geometry>
-        <mesh filename="../../meshes/z1_GripperStator.dae" scale="1 1 1" />
-      </geometry>
-    </collision>
     <inertial>
       <origin rpy="1.5707963267948966 0 0" xyz="0.04764427 -0.00035819 -0.00249162" />
       <mass value="0.52603655" />
       <inertia ixx="0.00038683" ixy="3.59e-06" ixz="-7.662e-05" iyy="0.00068614" iyz="-2.09e-06" izz="0.00066293" />
     </inertial>
+    <collision name="fixed_convex_000">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_000.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_001">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_001.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_002">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_002.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_003">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_003.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_004">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_004.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_005">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_005.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_006">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_006.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_007">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_007.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_008">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_008.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_009">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_009.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_010">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_010.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_011">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_011.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_012">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_012.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_013">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_013.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_014">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_014.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_015">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_015.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_016">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_016.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_017">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_017.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_018">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_018.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_019">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_019.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_020">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_020.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_021">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_021.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_022">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_022.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_023">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_023.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="fixed_convex_024">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/fixed_024.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
   </link>
   <joint name="jointGripper" type="revolute">
     <origin rpy="0 0 0" xyz="0.049 0 0" />
@@ -922,7 +1072,7 @@
     <child link="gripperMover" />
     <axis xyz="0 1 0" />
     <dynamics damping="0.5" friction="0.5" />
-    <limit effort="20.0" lower="-0.78539816339" upper="0.78539816339" velocity="3.1415" />
+    <limit effort="20.0" lower="-1.0471975511965976" upper="0.0" velocity="3.1415" />
   </joint>
   <link name="gripperMover">
     <visual>
@@ -931,21 +1081,159 @@
         <mesh filename="../../meshes/z1_GripperMover.dae" scale="1 1 1" />
       </geometry>
     </visual>
-    <collision>
-      <origin rpy="0 0 0" xyz="0 0 0" />
-      <geometry>
-        <mesh filename="../../meshes/z1_GripperMover.dae" scale="1 1 1" />
-      </geometry>
-    </collision>
     <inertial>
       <origin rpy="1.5707963267948966 0 0" xyz="0.01320633 0.00476708 0.00380534" />
       <mass value="0.27621302" />
       <inertia ixx="0.00017716" ixy="-1.683e-05" ixz="1.786e-05" iyy="0.00026787" iyz="-2.62e-06" izz="0.00035728" />
     </inertial>
+    <collision name="moving_convex_000">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_000.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="moving_convex_001">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_001.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="moving_convex_002">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_002.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="moving_convex_003">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_003.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="moving_convex_004">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_004.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="moving_convex_005">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_005.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="moving_convex_006">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_006.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="moving_convex_007">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_007.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="moving_convex_008">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_008.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="moving_convex_009">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_009.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="moving_convex_010">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_010.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="moving_convex_011">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_011.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="moving_convex_012">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_012.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="moving_convex_013">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_013.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="moving_convex_014">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_014.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="moving_convex_015">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_015.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="moving_convex_016">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_016.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="moving_convex_017">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_017.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="moving_convex_018">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_018.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="moving_convex_019">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_019.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="moving_convex_020">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_020.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="moving_convex_021">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_021.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="moving_convex_022">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_022.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
+    <collision name="moving_convex_023">
+      <origin rpy="0 0 0" xyz="0 0 0" />
+      <geometry>
+        <mesh filename="../../meshes/gripper_collision_hulls/moving_023.obj" scale="1 1 1" />
+      </geometry>
+    </collision>
   </link>
   <joint name="ee_gripper" type="fixed" dont_collapse="true">
     <axis xyz="1 0 0" />
-    <origin rpy="0 0 0" xyz="0.135 0 0" />
+    <origin rpy="0 0 0" xyz="0.049 0 0" />
     <parent link="gripperStator" />
     <child link="gripper_link" />
   </joint>
