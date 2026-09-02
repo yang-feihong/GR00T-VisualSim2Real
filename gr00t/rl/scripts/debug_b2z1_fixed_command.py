@@ -15,7 +15,6 @@ Example:
 import argparse
 import os
 import site
-import shutil
 import sys
 from pathlib import Path
 
@@ -195,19 +194,20 @@ def isaacsim_ext_folders() -> list[str]:
     return folders
 
 
-def isaacsim_kit_args(use_gpu: bool) -> str:
+def isaacsim_kit_args(use_gpu: bool, enable_renderer: bool = False) -> str:
     args = []
     for folder in isaacsim_ext_folders():
         args.extend(["--ext-folder", folder])
-    args.extend(
-        [
-            "--/app/vulkan=false",
-            "--/renderer/enabled=none",
-            "--/renderer/active=none",
-            "--/renderer/multiGpu/enabled=false",
-            "--/renderer/multiGpu/autoEnable=false",
-        ]
-    )
+    if not enable_renderer:
+        args.extend(
+            [
+                "--/app/vulkan=false",
+                "--/renderer/enabled=none",
+                "--/renderer/active=none",
+                "--/renderer/multiGpu/enabled=false",
+                "--/renderer/multiGpu/autoEnable=false",
+            ]
+        )
     if not use_gpu:
         args.extend(
             [
@@ -337,18 +337,26 @@ def main(config: OmegaConf):
         args_cli.device = device
         args_cli.kit_args = " ".join(
             part
-            for part in (args_cli.kit_args, isaacsim_kit_args(torch.cuda.is_available()))
+            for part in (
+                args_cli.kit_args,
+                isaacsim_kit_args(
+                    torch.cuda.is_available(), enable_renderer=args_cli.enable_cameras
+                ),
+                "--enable isaacsim.sensors.camera" if args_cli.enable_cameras else "",
+            )
             if part
         )
 
         if args_cli.enable_cameras and config.headless:
-            dest_path = Path(isaaclab.__file__).resolve().parent.parent.parent.parent / "apps"
-            source_file = (
-                Path(__file__).resolve().parents[1]
-                / "apps/phc.isaaclab.python.headless.rendering.kit"
-            )
-            shutil.copy(source_file, dest_path)
-            args_cli.experience = dest_path / "phc.isaaclab.python.headless.rendering.kit"
+            os.environ.pop("DISPLAY", None)
+            isaaclab_apps_path = Path(isaaclab.__file__).resolve().parents[3] / "apps"
+            source_file = isaaclab_apps_path / "isaaclab.python.headless.rendering.kit"
+            if not source_file.exists():
+                source_file = (
+                    Path(__file__).resolve().parents[1]
+                    / "apps/phc.isaaclab.python.headless.rendering.kit"
+                )
+            args_cli.experience = source_file
         elif config.headless and not args_cli.enable_cameras:
             args_cli.experience = (
                 Path(__file__).resolve().parents[1]
@@ -421,6 +429,7 @@ def main(config: OmegaConf):
     trace_steps = set(int(x) for x in config.get("trace_steps", [0, 1, 2, 3, 4, 5, 10, 20, 50]))
     trace = {"meta": {}, "steps": {}} if trace_path is not None else None
     debug_stage_cycle = bool(config.get("debug_stage_cycle", False))
+    camera_dump_dir = config.get("camera_dump_dir", None)
     if trace is not None:
         trace["meta"]["dof_names"] = list(env.dof_names)
         trace["meta"]["dof_ids"] = list(env.simulator.dof_ids)
@@ -440,6 +449,27 @@ def main(config: OmegaConf):
             physical_commands.clone()
         )
         env.render_results()
+        if step == 0 and camera_dump_dir:
+            import cv2
+
+            output_dir = Path(str(camera_dump_dir))
+            output_dir.mkdir(parents=True, exist_ok=True)
+            images = env.simulator.get_rgb_images_uint8()
+            for camera_name, image_batch in images.items():
+                rgb = image_batch[0].detach().cpu().numpy().astype("uint8")
+                output_path = output_dir / f"{camera_name}.png"
+                if not cv2.imwrite(str(output_path), rgb[:, :, ::-1]):
+                    raise RuntimeError(f"Failed to write camera image: {output_path}")
+                logger.info(
+                    "camera={} shape={} range=[{},{}] mean={:.2f} path={}".format(
+                        camera_name,
+                        rgb.shape,
+                        int(rgb.min()),
+                        int(rgb.max()),
+                        float(rgb.mean()),
+                        output_path,
+                    )
+                )
         if skeleton_video_path is not None and step % skeleton_stride == 0:
             skeleton_frames.append(env.simulator._rigid_body_pos[0].detach().cpu().clone())
         if trace is not None and step in trace_steps:

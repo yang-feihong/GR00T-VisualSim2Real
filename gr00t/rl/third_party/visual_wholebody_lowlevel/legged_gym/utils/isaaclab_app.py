@@ -26,6 +26,7 @@ _RENDERER_MULTI_GPU_KIT_ARGS = (
     "--/renderer/multiGpu/autoEnable=true",
     "--/renderer/multiGPU/autoEnable=true",
 )
+_ISAACSIM_CAMERA_EXTENSION = "isaacsim.sensors.camera"
 _renderer_feature_settings = None
 
 
@@ -66,6 +67,18 @@ def load_rgb_camera_specs(config_path):
     return rgb_camera_specs_from_config(load_rgb_camera_config(config_path))
 
 
+def _rgb_camera_config_requires_isaacsim_camera_extension(config_path: str) -> bool:
+    try:
+        parsed = load_rgb_camera_specs(config_path)
+    except Exception:
+        return False
+    return bool(
+        parsed
+        and parsed["enabled"]
+        and any(camera.get("projection_type") == "opencvFisheye" for camera in parsed["cameras"])
+    )
+
+
 def _enable_viewport_performance_hud(args):
     if bool(args.headless):
         return
@@ -88,6 +101,23 @@ def _enable_renderer_multi_gpu(args):
     ):
         if setting_arg not in sys.argv:
             sys.argv.append(setting_arg)
+
+
+def _kit_extension_enabled_in_argv(extension_name: str) -> bool:
+    for idx, arg in enumerate(sys.argv):
+        if arg == "--enable" and idx + 1 < len(sys.argv) and sys.argv[idx + 1] == extension_name:
+            return True
+        if arg == f"--enable={extension_name}":
+            return True
+    return False
+
+
+def _enable_required_camera_extension(args):
+    if (
+        _rgb_camera_config_requires_isaacsim_camera_extension(args.rgb_camera_config)
+        and not _kit_extension_enabled_in_argv(_ISAACSIM_CAMERA_EXTENSION)
+    ):
+        sys.argv.extend(["--enable", _ISAACSIM_CAMERA_EXTENSION])
 
 
 def _sync_headless_env(args):
@@ -209,6 +239,7 @@ def launch_app(args):
             args.enable_cameras = True
         _capture_renderer_feature_settings(args)
         _sync_headless_env(args)
+        _enable_required_camera_extension(args)
         _enable_viewport_performance_hud(args)
         _enable_renderer_multi_gpu(args)
         _simulation_app = AppLauncher(args).app

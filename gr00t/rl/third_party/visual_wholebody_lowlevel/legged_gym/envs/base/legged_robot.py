@@ -8,6 +8,7 @@ from isaaclab.envs import DirectRLEnv
 from isaaclab.assets import Articulation, RigidObject, RigidObjectCfg
 from isaaclab.sensors import ContactSensor
 import isaaclab.sim as sim_utils
+from isaaclab.utils.math import quat_from_matrix, quat_inv
 
 from legged_gym.utils.isaaclab_math import quat_rotate_inverse, quat_mul, quat_apply, quat_from_euler_xyz, euler_from_quat, torch_rand_float, wrap_to_pi
 from .legged_robot_config import LeggedRobotIsaacLabCfg
@@ -77,6 +78,9 @@ class LeggedRobotIsaacLab(DirectRLEnv):
     cfg: LeggedRobotIsaacLabCfg
 
     def __init__(self, cfg: LeggedRobotIsaacLabCfg, render_mode: str | None = None, **kwargs):
+        self._rgb_camera_rigs = {}
+        self._rgb_camera_requires_reset_sync = False
+        self._rgb_camera_reset_sync_count = 0
         self._step_profile_enabled = bool(getattr(cfg, "profile_env_step", False))
         self._step_profile_in_step = False
         self._step_profile_wrap_warnings = set()
@@ -96,6 +100,7 @@ class LeggedRobotIsaacLab(DirectRLEnv):
 
         from legged_gym.utils.isaaclab_app import apply_renderer_feature_settings
         apply_renderer_feature_settings()
+        self._rgb_camera_requires_reset_sync = bool(self._rgb_camera_rigs)
 
         self.num_actions = int(cfg.action_space)
         self.num_obs = int(cfg.observation_space)
@@ -191,6 +196,39 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         self._init_reward_compat()
         self._resample_commands(torch.arange(self.num_envs, device=self.device))
         self._install_internal_step_profile_wrappers()
+
+    def reset(self, seed=None, options=None):
+        observations, extras = super().reset(seed=seed, options=options)
+        self.synchronize_rgb_cameras_after_reset()
+        return observations, extras
+
+    def synchronize_rgb_cameras_after_reset(self, env_id=0):
+        rigs = self._rgb_camera_rigs
+        if not rigs:
+            self._rgb_camera_requires_reset_sync = False
+            return
+        if not self._rgb_camera_requires_reset_sync:
+            return
+        if not self.body_names_to_idx:
+            raise RuntimeError("RGB camera reset synchronization requires initialized robot body maps")
+
+        self.sim.forward()
+        self._update_rgb_camera_poses_for_env(env_id=int(env_id))
+        self.sim.render()
+        self.sim.render()
+
+        updated_sensors = set()
+        for rig in rigs.values():
+            cameras = rig.get("cameras", {})
+            sensors = [cameras.get("tiled")] if rig.get("backend") == "tiled" else list(cameras.values())
+            for sensor in sensors:
+                if sensor is None or id(sensor) in updated_sensors:
+                    continue
+                sensor.update(0.0, force_recompute=True)
+                updated_sensors.add(id(sensor))
+
+        self._rgb_camera_requires_reset_sync = False
+        self._rgb_camera_reset_sync_count += 1
 
     def _reset_step_profile_stats(self):
         self._step_profile_step_count = 0
@@ -482,8 +520,12 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         body_name = str(spec["body_name"])
         base_pos = np.asarray(spec["local_position"], dtype=np.float64)
         base_rot = self._euler_xyz_to_quat_tuple(*spec["local_rotation"])
-        hfov_rad = np.deg2rad(float(spec["horizontal_fov"]))
-        focal_length = 0.5 * horizontal_aperture / max(float(np.tan(0.5 * hfov_rad)), 1.0e-6)
+        projection_type = str(spec.get("projection_type", "pinhole"))
+        if projection_type == "pinhole":
+            hfov_rad = np.deg2rad(float(spec["horizontal_fov"]))
+            focal_length = 0.5 * horizontal_aperture / max(float(np.tan(0.5 * hfov_rad)), 1.0e-6)
+        else:
+            focal_length = None
 
         if camera_mode == "mono":
             offsets = [("mono", np.asarray(spec["mono_offset"], dtype=np.float64))]
@@ -510,11 +552,97 @@ class LeggedRobotIsaacLab(DirectRLEnv):
             )
         return mount_name, camera_mode, body_name, focal_length, eye_defs
 
+    @staticmethod
+    def _rgb_camera_spawn_config(spec, horizontal_aperture: float, focal_length):
+        projection_type = str(spec.get("projection_type", "pinhole"))
+        if projection_type == "pinhole":
+            return sim_utils.PinholeCameraCfg(
+                focal_length=float(focal_length),
+                horizontal_aperture=float(horizontal_aperture),
+                clipping_range=(0.01, 20.0),
+            )
+
+        if projection_type == "opencvFisheye":
+            return sim_utils.PinholeCameraCfg.from_intrinsic_matrix(
+                intrinsic_matrix=[
+                    float(spec["fx"]),
+                    float(spec.get("skew", 0.0)),
+                    float(spec["cx"]),
+                    0.0,
+                    float(spec["fy"]),
+                    float(spec["cy"]),
+                    0.0,
+                    0.0,
+                    1.0,
+                ],
+                width=int(spec["width"]),
+                height=int(spec["height"]),
+                clipping_range=(0.01, 20.0),
+            )
+
+        return sim_utils.FisheyeCameraCfg(
+            projection_type=projection_type,
+            clipping_range=(0.01, 20.0),
+            focal_length=float(spec["focal_length_mm"]),
+            fisheye_nominal_width=float(spec["fisheye_nominal_width"]),
+            fisheye_nominal_height=float(spec["fisheye_nominal_height"]),
+            fisheye_optical_centre_x=float(spec["fisheye_optical_centre_x"]),
+            fisheye_optical_centre_y=float(spec["fisheye_optical_centre_y"]),
+            fisheye_max_fov=float(spec["fisheye_max_fov"]),
+            fisheye_polynomial_a=float(spec["fisheye_polynomial_a"]),
+            fisheye_polynomial_b=float(spec["fisheye_polynomial_b"]),
+            fisheye_polynomial_c=float(spec["fisheye_polynomial_c"]),
+            fisheye_polynomial_d=float(spec["fisheye_polynomial_d"]),
+            fisheye_polynomial_e=float(spec["fisheye_polynomial_e"]),
+            fisheye_polynomial_f=float(spec["fisheye_polynomial_f"]),
+        )
+
+    @staticmethod
+    def _apply_rgb_camera_lens_calibration(camera_prim_path: str, spec):
+        if str(spec.get("projection_type", "pinhole")) != "opencvFisheye":
+            return
+
+        from pxr import Gf
+
+        camera_prim = sim_utils.get_current_stage().GetPrimAtPath(camera_prim_path)
+        if not camera_prim.IsValid():
+            raise RuntimeError(f"RGB camera prim does not exist: {camera_prim_path}")
+        camera_prim.ApplyAPI("OmniLensDistortionOpenCvFisheyeAPI")
+        attributes = {
+            "omni:lensdistortion:model": "opencvFisheye",
+            "omni:lensdistortion:opencvFisheye:imageSize": Gf.Vec2i(int(spec["width"]), int(spec["height"])),
+            "omni:lensdistortion:opencvFisheye:cx": float(spec["cx"]),
+            "omni:lensdistortion:opencvFisheye:cy": float(spec["cy"]),
+            "omni:lensdistortion:opencvFisheye:fx": float(spec["fx"]),
+            "omni:lensdistortion:opencvFisheye:fy": float(spec["fy"]),
+        }
+        for index, value in enumerate(spec["distortion_coefficients"], start=1):
+            attributes[f"omni:lensdistortion:opencvFisheye:k{index}"] = float(value)
+        for attribute_name, value in attributes.items():
+            attribute = camera_prim.GetAttribute(attribute_name)
+            if not attribute.IsValid():
+                raise RuntimeError(
+                    f"Isaac Sim did not create OpenCV fisheye attribute {attribute_name!r} "
+                    f"for camera {camera_prim_path!r}."
+                )
+            attribute.Set(value)
+        skew = float(spec.get("skew", 0.0))
+        if abs(skew) > 1.0e-9:
+            print(
+                f"[rgb_camera][warn] OpenCV fisheye skew={skew:g} px is retained as calibration metadata "
+                "but is not supported by the Isaac Sim lens-distortion schema."
+            )
+
     def _setup_tiled_rgb_cameras(self, specs, tiled_camera_cls, tiled_camera_cfg_cls, horizontal_aperture: float):
         all_eye_defs = []
         rig_defs = []
         common_key = None
         for spec in specs:
+            if str(spec.get("projection_type", "pinhole")) != "pinhole":
+                raise ValueError(
+                    "rgb_camera_backend='tiled' does not support the calibrated fisheye configuration; "
+                    "use --rgb_camera_backend camera (or the default auto backend)."
+                )
             mount_name, camera_mode, body_name, focal_length, eye_defs = self._rgb_camera_spec_to_eye_defs(
                 spec,
                 horizontal_aperture,
@@ -532,7 +660,7 @@ class LeggedRobotIsaacLab(DirectRLEnv):
                     "rgb_camera_backend='tiled' requires all enabled RGB cameras in the config to share "
                     "height, width, and horizontal_fov. Use --rgb_camera_backend camera for mixed camera intrinsics."
                 )
-            rig_defs.append((mount_name, camera_mode, body_name, eye_defs))
+            rig_defs.append((mount_name, camera_mode, body_name, eye_defs, spec.get("valid_circle_mask")))
             all_eye_defs.extend(eye_defs)
 
         if not all_eye_defs:
@@ -571,7 +699,7 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         self.scene.sensors["rgb_cameras_tiled"] = tiled_camera
 
         sensor_index = 0
-        for mount_name, camera_mode, body_name, eye_defs in rig_defs:
+        for mount_name, camera_mode, body_name, eye_defs, valid_circle_mask in rig_defs:
             eyes = []
             for eye_def in eye_defs:
                 eyes.append(
@@ -590,6 +718,7 @@ class LeggedRobotIsaacLab(DirectRLEnv):
                 "body_name": body_name,
                 "backend": "tiled",
                 "pose_update": True,
+                "valid_circle_mask": valid_circle_mask,
                 "cameras": {"tiled": tiled_camera},
                 "eyes": eyes,
             }
@@ -632,11 +761,7 @@ class LeggedRobotIsaacLab(DirectRLEnv):
                 horizontal_aperture,
             )
 
-            camera_spawn_cfg = sim_utils.PinholeCameraCfg(
-                focal_length=float(focal_length),
-                horizontal_aperture=float(horizontal_aperture),
-                clipping_range=(0.01, 20.0),
-            )
+            camera_spawn_cfg = self._rgb_camera_spawn_config(spec, horizontal_aperture, focal_length)
 
             rig_cameras = {}
             for eye_def in eye_defs:
@@ -655,6 +780,23 @@ class LeggedRobotIsaacLab(DirectRLEnv):
                     ),
                 )
                 camera = Camera(camera_cfg)
+                self._apply_rgb_camera_lens_calibration(camera_cfg.prim_path, spec)
+                diagnostic = spec.get("door_diagnostic")
+                if diagnostic:
+                    light_cfg = sim_utils.SphereLightCfg(
+                        intensity=float(diagnostic["fill_light_intensity"]),
+                        radius=float(diagnostic["fill_light_radius_m"]),
+                        color=(1.0, 0.96, 0.90),
+                    )
+                    light_cfg.func(
+                        f"{camera_cfg.prim_path}/FillLight",
+                        light_cfg,
+                        translation=(
+                            0.0,
+                            float(diagnostic["fill_light_right_offset_m"]),
+                            float(diagnostic["fill_light_up_offset_m"]),
+                        ),
+                    )
                 self.scene.sensors[eye_def["sensor_name"]] = camera
                 rig_cameras[eye_def["eye_name"]] = camera
             resolved_backend = "camera"
@@ -664,6 +806,8 @@ class LeggedRobotIsaacLab(DirectRLEnv):
                 "body_name": body_name,
                 "backend": resolved_backend,
                 "pose_update": True,
+                "door_diagnostic": spec.get("door_diagnostic"),
+                "valid_circle_mask": spec.get("valid_circle_mask"),
                 "cameras": rig_cameras,
                 "eyes": [
                     {
@@ -749,12 +893,74 @@ class LeggedRobotIsaacLab(DirectRLEnv):
             )
 
     def _update_rgb_camera_world_poses(self, rig, env_id=0):
+        if rig.get("door_diagnostic"):
+            self._update_door_rgb_camera_world_pose(rig, env_id)
+            return
         env_id = int(env_id)
         env_ids_t = torch.tensor([env_id], dtype=torch.long, device=self.device)
         body_pos_w, body_quat_w = self._get_rgb_camera_body_state_w(str(rig["body_name"]), env_ids_t)
         body_pos_w_np = body_pos_w[0].detach().cpu().numpy()
         body_quat_w_np = body_quat_w[0].detach().cpu().numpy()
         positions, orientations = self._fill_rgb_camera_pose_arrays(rig, body_pos_w_np, body_quat_w_np)
+        self._set_rgb_camera_world_poses_from_arrays(rig, positions, orientations)
+
+    def _initialize_door_rgb_camera_local_pose(self, rig, env_id):
+        if self.door is None:
+            raise RuntimeError("Door diagnostic RGB cameras require the doorman door articulation.")
+        panel_ids, _ = self.door.find_bodies("door_panel", preserve_order=True)
+        handle_ids, _ = self.door.find_bodies("door_handle", preserve_order=True)
+        if len(panel_ids) != 1 or len(handle_ids) != 1:
+            raise RuntimeError(
+                "Door diagnostic RGB camera expected exactly one door_panel and door_handle body, "
+                f"got {panel_ids} and {handle_ids}."
+            )
+
+        panel_id = int(panel_ids[0])
+        handle_id = int(handle_ids[0])
+        panel_pos = self.door.data.body_pos_w[env_id, panel_id]
+        panel_quat = self.door.data.body_quat_w[env_id, panel_id]
+        handle_pos = self.door.data.body_pos_w[env_id, handle_id]
+        handle_quat = self.door.data.body_quat_w[env_id, handle_id]
+        diagnostic = rig["door_diagnostic"]
+
+        offset = torch.tensor(
+            diagnostic["target_offset_leaf_m"], device=self.device, dtype=panel_pos.dtype
+        )
+        target = handle_pos + quat_apply(panel_quat.unsqueeze(0), offset.unsqueeze(0))[0]
+        axis_local = torch.tensor(
+            diagnostic["view_axis_local"], device=self.device, dtype=panel_pos.dtype
+        )
+        axis_quat = handle_quat if diagnostic["view_axis_reference"] == "handle_body" else panel_quat
+        axis = quat_apply(axis_quat.unsqueeze(0), axis_local.unsqueeze(0))[0]
+        axis = torch.nn.functional.normalize(axis, dim=0) * float(
+            diagnostic["view_axis_direction_sign"]
+        )
+        camera_pos = target + float(diagnostic["axis_distance_m"]) * axis
+        forward = -axis
+        up_hint = torch.tensor([0.0, 0.0, 1.0], device=self.device, dtype=panel_pos.dtype)
+        if torch.abs(torch.dot(up_hint, forward)) > 0.95:
+            up_hint = torch.tensor([0.0, 1.0, 0.0], device=self.device, dtype=panel_pos.dtype)
+        right = torch.nn.functional.normalize(torch.cross(up_hint, forward, dim=0), dim=0)
+        up = torch.cross(forward, right, dim=0)
+        camera_quat = quat_from_matrix(torch.stack((forward, right, up), dim=-1).unsqueeze(0))[0]
+        panel_quat_inverse = quat_inv(panel_quat.unsqueeze(0))[0]
+        local_pos = quat_apply(
+            panel_quat_inverse.unsqueeze(0), (camera_pos - panel_pos).unsqueeze(0)
+        )[0]
+        local_quat = quat_mul(panel_quat_inverse.unsqueeze(0), camera_quat.unsqueeze(0))[0]
+        rig["_door_local_pose"] = (local_pos, local_quat, panel_id)
+
+    def _update_door_rgb_camera_world_pose(self, rig, env_id):
+        env_id = int(env_id)
+        if rig.get("_door_local_pose") is None:
+            self._initialize_door_rgb_camera_local_pose(rig, env_id)
+        local_pos, local_quat, panel_id = rig["_door_local_pose"]
+        panel_pos = self.door.data.body_pos_w[env_id, panel_id]
+        panel_quat = self.door.data.body_quat_w[env_id, panel_id]
+        camera_pos = panel_pos + quat_apply(panel_quat.unsqueeze(0), local_pos.unsqueeze(0))[0]
+        camera_quat = quat_mul(panel_quat.unsqueeze(0), local_quat.unsqueeze(0))[0]
+        positions = camera_pos.detach().cpu().numpy().reshape(1, 3)
+        orientations = camera_quat.detach().cpu().numpy().reshape(1, 4)
         self._set_rgb_camera_world_poses_from_arrays(rig, positions, orientations)
 
     def _update_rgb_camera_poses_for_env(self, env_id=0):
@@ -771,6 +977,8 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         body_names = []
         body_indices = []
         for rig in rigs:
+            if rig.get("door_diagnostic"):
+                continue
             body_name = str(rig["body_name"])
             if body_name in body_names:
                 continue
@@ -799,6 +1007,11 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         math_total = 0.0
         set_total = 0.0
         for rig in rigs:
+            if rig.get("door_diagnostic"):
+                set_start = time.perf_counter()
+                self._update_door_rgb_camera_world_pose(rig, env_id)
+                set_total += time.perf_counter() - set_start
+                continue
             body_row = body_name_to_row[str(rig["body_name"])]
             math_start = time.perf_counter()
             positions, orientations = self._fill_rgb_camera_pose_arrays(
@@ -2259,12 +2472,17 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         self.last_velocity_command[env_ids] = self.commands[env_ids, :3]
         self.velocity_command_changed[env_ids] = False
         self._reset_gait_state(env_ids)
+        if self._rgb_camera_rigs:
+            self._rgb_camera_requires_reset_sync = True
 
     def _reset_doorman_door_states(self, env_ids: torch.Tensor):
         if not self.cfg.enable_doorman_scene:
             return
         if self.door is None:
             raise RuntimeError("self.door is not initialized while cfg.enable_doorman_scene is True.")
+        for rig in self._rgb_camera_rigs.values():
+            if rig.get("door_diagnostic"):
+                rig.pop("_door_local_pose", None)
 
         root_state = self.door.data.default_root_state[env_ids].clone()
         root_state[:, :3] += self.scene.env_origins[env_ids]

@@ -1423,7 +1423,7 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
 
     def _camera_rgb_to_numpy(self, camera, env_id, update=False):
         if update:
-            camera.update(self.dt)
+            camera.update(0.0, force_recompute=True)
         rgb = camera.data.output.get("rgb")
         if rgb is None:
             return None
@@ -1431,6 +1431,30 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         if image.shape[-1] > 3:
             image = image[..., :3]
         return image.numpy().astype(np.uint8)
+
+    @staticmethod
+    def _apply_rgb_camera_valid_circle_mask(image, rig):
+        mask_cfg = rig.get("valid_circle_mask")
+        if not mask_cfg:
+            return image
+
+        height, width = image.shape[:2]
+        cache_key = (height, width)
+        if rig.get("valid_circle_mask_cache_key") != cache_key:
+            center_x, center_y = mask_cfg["center"]
+            radius = float(mask_cfg["radius"])
+            feather = float(mask_cfg["feather"])
+            yy, xx = np.ogrid[:height, :width]
+            distance = np.sqrt((xx - center_x) ** 2 + (yy - center_y) ** 2)
+            if feather > 0.0:
+                alpha = np.clip((radius - distance) / feather, 0.0, 1.0).astype(np.float32)
+            else:
+                alpha = (distance <= radius).astype(np.float32)
+            rig["valid_circle_mask_alpha"] = alpha[..., None]
+            rig["valid_circle_mask_cache_key"] = cache_key
+
+        alpha = rig["valid_circle_mask_alpha"]
+        return np.rint(image.astype(np.float32) * alpha).astype(np.uint8)
 
     def _tiled_camera_rgb_to_numpy(self, camera, sensor_index):
         rgb = camera.data.output.get("rgb")
@@ -1451,6 +1475,8 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
                     continue
                 if bool(rig.get("pose_update", True)):
                     self._update_rgb_camera_world_poses(rig, env_id)
+            self.sim.render()
+            self.sim.render()
 
         updated_tiled_cameras = set()
         for rig_name, rig in self._rgb_camera_rigs.items():
@@ -1461,23 +1487,29 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
                 tiled_camera = cameras["tiled"]
                 camera_key = id(tiled_camera)
                 if update and camera_key not in updated_tiled_cameras:
-                    tiled_camera.update(self.dt)
+                    tiled_camera.update(0.0, force_recompute=True)
                     updated_tiled_cameras.add(camera_key)
                 eye_images = {
                     eye["name"]: self._tiled_camera_rgb_to_numpy(tiled_camera, eye["sensor_index"])
                     for eye in rig.get("eyes", [])
                 }
                 if rig["mode"] == "mono":
-                    images_by_name[rig_name] = [eye_images["mono"]]
+                    images_by_name[rig_name] = [self._apply_rgb_camera_valid_circle_mask(eye_images["mono"], rig)]
                 else:
-                    images_by_name[rig_name] = [eye_images["left"], eye_images["right"]]
+                    images_by_name[rig_name] = [
+                        self._apply_rgb_camera_valid_circle_mask(eye_images["left"], rig),
+                        self._apply_rgb_camera_valid_circle_mask(eye_images["right"], rig),
+                    ]
             elif rig["mode"] == "mono":
                 mono_rgb = self._camera_rgb_to_numpy(cameras["mono"], env_id, update=update)
                 if mono_rgb is not None:
-                    images_by_name[rig_name] = [mono_rgb]
+                    images_by_name[rig_name] = [self._apply_rgb_camera_valid_circle_mask(mono_rgb, rig)]
             else:
                 left_rgb = self._camera_rgb_to_numpy(cameras["left"], env_id, update=update)
                 right_rgb = self._camera_rgb_to_numpy(cameras["right"], env_id, update=update)
                 if left_rgb is not None and right_rgb is not None:
-                    images_by_name[rig_name] = [left_rgb, right_rgb]
+                    images_by_name[rig_name] = [
+                        self._apply_rgb_camera_valid_circle_mask(left_rgb, rig),
+                        self._apply_rgb_camera_valid_circle_mask(right_rgb, rig),
+                    ]
         return images_by_name

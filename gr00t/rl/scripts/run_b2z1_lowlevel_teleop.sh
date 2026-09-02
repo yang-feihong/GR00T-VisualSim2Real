@@ -12,6 +12,7 @@ ENABLE_DOORMAN_SCENE="${ENABLE_DOORMAN_SCENE:-true}"
 CKPT_PATH="${CKPT_PATH:-${RUN_DIR}/model_40000.pt}"
 RUN_METADATA_PATH="${RUN_METADATA_PATH:-${RUN_DIR}/run_metadata.json}"
 USD_PATH="${USD_PATH:-${REPO_ROOT}/gr00t/rl/data/robots/b2z1_lab30/b2z1_mount_0_x0p22_y0_z0p17.usd}"
+RGB_CAMERA_CONFIG="${RGB_CAMERA_CONFIG:-${LOWLEVEL_ROOT}/legged_gym/scripts/rgb_cameras.json}"
 RTX_REFLECTIONS="${RTX_REFLECTIONS:-true}"
 RTX_TRANSLUCENCY="${RTX_TRANSLUCENCY:-true}"
 RTX_SUBSURFACE_SCATTERING="${RTX_SUBSURFACE_SCATTERING:-true}"
@@ -24,6 +25,7 @@ RTX_REFLECTIONS_SPP="${RTX_REFLECTIONS_SPP:-2}"
 [[ -f "${CKPT_PATH}" ]] || { echo "Checkpoint not found: ${CKPT_PATH}" >&2; exit 1; }
 [[ -f "${RUN_METADATA_PATH}" ]] || { echo "Run metadata not found: ${RUN_METADATA_PATH}" >&2; exit 1; }
 [[ -f "${USD_PATH}" ]] || { echo "B2Z1 USD not found: ${USD_PATH}" >&2; exit 1; }
+[[ -f "${RGB_CAMERA_CONFIG}" ]] || { echo "RGB camera config not found: ${RGB_CAMERA_CONFIG}" >&2; exit 1; }
 
 if [[ "${HEADLESS}" != "true" && -z "${DISPLAY:-}" ]]; then
     echo "DISPLAY is empty. Start/recreate the development container from a graphical session." >&2
@@ -51,6 +53,8 @@ exec python "${ENTRY}" \
     --ckpt_path "${CKPT_PATH}" \
     --run_metadata_path "${RUN_METADATA_PATH}" \
     --robot_usd_path "${USD_PATH}" \
+    --rgb_camera_config "${RGB_CAMERA_CONFIG}" \
+    --rgb_camera_backend auto \
     --sim_device "cuda:${GPU_ID}" \
     --rl_device "cuda:${GPU_ID}" \
     --teleop_mode \

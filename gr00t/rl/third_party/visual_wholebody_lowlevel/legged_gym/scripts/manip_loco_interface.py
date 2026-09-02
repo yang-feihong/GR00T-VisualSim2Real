@@ -22,6 +22,7 @@ from legged_gym.scripts.isaaclab_viewer import IsaacLabViewerController
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = build_common_arg_parser()
     parser.add_argument("--stdin_teleop", action="store_true")
+    parser.add_argument("--rgb_camera_dump_dir", type=str, default=None)
     return parser
 
 
@@ -37,6 +38,7 @@ class ManipLoco_Policy:
         self.obs = None
         self.env_cfg = None
         self.rgb_camera_manager = None
+        self._rgb_camera_dumped = False
         self.timestamp = 0
         self._last_status_wall_time = time.perf_counter()
         self._last_status_sim_time = 0.0
@@ -236,6 +238,7 @@ class ManipLoco_Policy:
         if self.rgb_camera_manager is not None:
             rgb_preview_start = time.perf_counter()
             self.rgb_camera_manager.maybe_update_preview(env_id=0)
+            self._dump_rgb_cameras_once()
             rgb_preview_dt = time.perf_counter() - rgb_preview_start
 
         loop_dt = time.perf_counter() - loop_start
@@ -320,6 +323,27 @@ class ManipLoco_Policy:
         self.timestamp += 1
         duration = time.perf_counter() - loop_start
         time.sleep(max(float(self.env.dt) - duration, 0.0))
+
+    def _dump_rgb_cameras_once(self):
+        dump_dir = str(self.args.rgb_camera_dump_dir or "").strip()
+        if self._rgb_camera_dumped or not dump_dir or self.rgb_camera_manager is None:
+            return
+        import cv2
+
+        output_dir = Path(dump_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        images_by_name = self.rgb_camera_manager.render_images(env_id=0, update=True)
+        for camera_name, images in images_by_name.items():
+            for index, rgb in enumerate(images):
+                suffix = "" if len(images) == 1 else f"_{index}"
+                output_path = output_dir / f"{camera_name}{suffix}.png"
+                if not cv2.imwrite(str(output_path), rgb[:, :, ::-1]):
+                    raise RuntimeError(f"Failed to write RGB camera image: {output_path}")
+                print(
+                    f"[rgb_camera] wrote {output_path} shape={rgb.shape} "
+                    f"range=[{int(rgb.min())},{int(rgb.max())}] mean={float(rgb.mean()):.2f}"
+                )
+        self._rgb_camera_dumped = True
 
 
 def main():

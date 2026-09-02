@@ -92,6 +92,9 @@ simulator:
       physx:
         num_position_iterations: 4
         num_velocity_iterations: 0
+    cameras:
+      config_path: "gr00t/rl/third_party/visual_wholebody_lowlevel/legged_gym/scripts/rgb_cameras.json"
+      primary_camera: "trunk_front"
 
 robot:
   asset:

@@ -3,7 +3,9 @@
 
 
 import asyncio
+import json
 import os
+from pathlib import Path
 from typing import Optional
 
 from pxr import Sdf, UsdGeom
@@ -51,6 +53,8 @@ if DEFAULT_ISAACSIM_VERSION == "4.5":
     from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
     from isaaclab.scene import InteractiveScene, InteractiveSceneCfg
     from isaaclab.sensors import (
+        Camera,
+        CameraCfg,
         ContactSensor,
         ContactSensorCfg,
         FrameTransformer,
@@ -66,6 +70,7 @@ if DEFAULT_ISAACSIM_VERSION == "4.5":
     from isaaclab.sim import PhysxCfg, SimulationCfg, SimulationContext
     from isaaclab.terrains import TerrainGeneratorCfg, TerrainImporterCfg
     from isaaclab.utils.timer import Timer
+    from isaaclab.utils.math import quat_apply, quat_from_matrix, quat_inv, quat_mul
     from loguru import logger
     from pxr import UsdShade
 
@@ -660,6 +665,151 @@ class IsaacSim(BaseSimulator):
             logger.info("Material randomization memory optimization completed")
         except Exception as e:
             logger.warning(f"Material randomization memory optimization failed: {e}")
+
+    def _load_rgb_camera_config(self):
+        cameras_cfg = getattr(self.simulator_config, "cameras", None)
+        config_path = str(getattr(cameras_cfg, "config_path", "") or "").strip()
+        if not config_path:
+            return None
+        path = Path(config_path)
+        if not path.is_absolute():
+            path = Path(__file__).resolve().parents[4] / path
+        from gr00t.rl.third_party.visual_wholebody_lowlevel.legged_gym.scripts.rgb_camera_debug import (
+            rgb_camera_specs_from_config,
+        )
+
+        with path.open("r", encoding="utf-8") as stream:
+            raw_config = json.load(stream)
+        parsed = rgb_camera_specs_from_config(raw_config)
+        parsed["config_path"] = str(path)
+        return parsed
+
+    @staticmethod
+    def _camera_euler_xyz_to_quat_wxyz(rotation):
+        roll, pitch, yaw = (float(value) for value in rotation)
+        cr, sr = np.cos(roll * 0.5), np.sin(roll * 0.5)
+        cp, sp = np.cos(pitch * 0.5), np.sin(pitch * 0.5)
+        cy, sy = np.cos(yaw * 0.5), np.sin(yaw * 0.5)
+        return (
+            float(cr * cp * cy + sr * sp * sy),
+            float(sr * cp * cy - cr * sp * sy),
+            float(cr * sp * cy + sr * cp * sy),
+            float(cr * cp * sy - sr * sp * cy),
+        )
+
+    @staticmethod
+    def _camera_spawn_cfg(spec):
+        projection_type = str(spec.get("projection_type", "pinhole"))
+        if projection_type == "opencvFisheye":
+            return sim_utils.PinholeCameraCfg.from_intrinsic_matrix(
+                intrinsic_matrix=[
+                    float(spec["fx"]), float(spec.get("skew", 0.0)), float(spec["cx"]),
+                    0.0, float(spec["fy"]), float(spec["cy"]),
+                    0.0, 0.0, 1.0,
+                ],
+                width=int(spec["width"]),
+                height=int(spec["height"]),
+                clipping_range=(0.01, 20.0),
+            )
+        horizontal_aperture = 20.955
+        focal_length = 0.5 * horizontal_aperture / np.tan(
+            np.deg2rad(float(spec["horizontal_fov"])) * 0.5
+        )
+        return sim_utils.PinholeCameraCfg(
+            focal_length=float(focal_length),
+            horizontal_aperture=horizontal_aperture,
+            clipping_range=(0.01, 20.0),
+        )
+
+    @staticmethod
+    def _apply_camera_lens_calibration(prim_path_pattern, spec):
+        if str(spec.get("projection_type", "pinhole")) != "opencvFisheye":
+            return
+        from pxr import Gf
+
+        stage = sim_utils.get_current_stage()
+        for prim_path in sim_utils.find_matching_prim_paths(prim_path_pattern, stage):
+            prim = stage.GetPrimAtPath(prim_path)
+            prim.ApplyAPI("OmniLensDistortionOpenCvFisheyeAPI")
+            values = {
+                "omni:lensdistortion:model": "opencvFisheye",
+                "omni:lensdistortion:opencvFisheye:imageSize": Gf.Vec2i(
+                    int(spec["width"]), int(spec["height"])
+                ),
+                "omni:lensdistortion:opencvFisheye:cx": float(spec["cx"]),
+                "omni:lensdistortion:opencvFisheye:cy": float(spec["cy"]),
+                "omni:lensdistortion:opencvFisheye:fx": float(spec["fx"]),
+                "omni:lensdistortion:opencvFisheye:fy": float(spec["fy"]),
+            }
+            for index, coefficient in enumerate(spec["distortion_coefficients"], start=1):
+                values[f"omni:lensdistortion:opencvFisheye:k{index}"] = float(coefficient)
+            for name, value in values.items():
+                attribute = prim.GetAttribute(name)
+                if not attribute.IsValid():
+                    raise RuntimeError(f"Missing fisheye attribute {name!r} on {prim_path}")
+                attribute.Set(value)
+
+    def _setup_configured_cameras(self, camera_types):
+        parsed = self._load_rgb_camera_config()
+        if not parsed or not parsed["enabled"]:
+            return False
+        self.named_cameras = {}
+        self.camera_sensor_names = {}
+        self.camera_specs = {spec["name"]: spec for spec in parsed["cameras"]}
+        self.door_diagnostic_configs = parsed.get("door_diagnostics", {})
+        self._camera_mask_cache = {}
+        self._door_diagnostic_local_poses = {}
+        primary_name = str(getattr(self.simulator_config.cameras, "primary_camera", "trunk_front"))
+
+        for spec in parsed["cameras"]:
+            name = str(spec["name"])
+            if spec["mode"] != "mono":
+                raise ValueError("GR00T training cameras currently require mode='mono'.")
+            if spec.get("door_diagnostic"):
+                prim_path = f"/World/envs/env_.*/{self.task_config.target_obj}/door_panel/{name}"
+                offset_pos = (0.0, 0.0, 0.0)
+                offset_rot = (1.0, 0.0, 0.0, 0.0)
+            else:
+                prim_path = f"/World/envs/env_.*/Robot/{spec['body_name']}/{name}"
+                offset_pos = tuple(float(value) for value in spec["local_position"])
+                offset_rot = self._camera_euler_xyz_to_quat_wxyz(spec["local_rotation"])
+            sensor_name = "ego_camera" if name == primary_name else f"camera_{name}"
+            cfg = CameraCfg(
+                prim_path=prim_path,
+                offset=CameraCfg.OffsetCfg(pos=offset_pos, rot=offset_rot, convention="world"),
+                data_types=camera_types,
+                spawn=self._camera_spawn_cfg(spec),
+                width=int(spec["width"]),
+                height=int(spec["height"]),
+                update_period=1.0 / max(float(spec["fps"]), 1.0e-6),
+            )
+            camera = Camera(cfg)
+            self._apply_camera_lens_calibration(prim_path, spec)
+            if spec.get("door_diagnostic"):
+                diagnostic = spec["door_diagnostic"]
+                light_cfg = sim_utils.SphereLightCfg(
+                    intensity=float(diagnostic["fill_light_intensity"]),
+                    radius=float(diagnostic["fill_light_radius_m"]),
+                    color=(1.0, 0.96, 0.90),
+                )
+                light_cfg.func(
+                    f"{prim_path}/FillLight",
+                    light_cfg,
+                    translation=(
+                        0.0,
+                        float(diagnostic["fill_light_right_offset_m"]),
+                        float(diagnostic["fill_light_up_offset_m"]),
+                    ),
+                )
+            self.scene.sensors[sensor_name] = camera
+            self.named_cameras[name] = camera
+            self.camera_sensor_names[name] = sensor_name
+        self.ego_camera = self.named_cameras.get(primary_name)
+        if self.ego_camera is None:
+            raise ValueError(f"Primary camera is not configured: {primary_name}")
+        self.primary_camera_name = primary_name
+        logger.info(f"Loaded lab30 RGB camera config: {parsed['config_path']}")
+        return True
 
     def cleanup_memory(self):
         """
@@ -1501,32 +1651,32 @@ class IsaacSim(BaseSimulator):
         if hasattr(self.simulator_config, "cameras") and getattr(
             self.simulator_config.cameras, "enable_cameras", False
         ):
-            camera_pos_offset = torch.tensor(
-                self.config.simulator.config.cameras.camera_pos_offset, device=self.sim_device
-            )
-            camera_rot_offset = torch.tensor(
-                self.config.simulator.config.cameras.camera_rot_offset, device=self.sim_device
-            )
-            ego_camera_config = TiledCameraCfg(
-                prim_path=f"/World/envs/env_.*/Robot/{self.simulator_config.cameras.camera_attached_link}/ego_camera",
-                offset=TiledCameraCfg.OffsetCfg(
-                    pos=camera_pos_offset, rot=camera_rot_offset, convention="world"
-                ),
-                data_types=camera_types,
-                spawn=sim_utils.PinholeCameraCfg(
-                    focal_length=self.simulator_config.cameras.camera_focal_length,
-                    focus_distance=self.simulator_config.cameras.camera_focus_distance,
-                    horizontal_aperture=self.simulator_config.cameras.camera_horizontal_aperture,
-                    vertical_aperture=self.simulator_config.cameras.camera_vertical_aperture,
-                    clipping_range=eval(self.simulator_config.cameras.camera_clipping_range),
-                ),
-                width=self.simulator_config.cameras.camera_resolutions[1],
-                height=self.simulator_config.cameras.camera_resolutions[0],
-                debug_vis=True,
-            )
-
-            self.ego_camera = TiledCamera(ego_camera_config)
-            self.scene.sensors["ego_camera"] = self.ego_camera
+            if not self._setup_configured_cameras(camera_types):
+                camera_pos_offset = torch.tensor(
+                    self.config.simulator.config.cameras.camera_pos_offset, device=self.sim_device
+                )
+                camera_rot_offset = torch.tensor(
+                    self.config.simulator.config.cameras.camera_rot_offset, device=self.sim_device
+                )
+                ego_camera_config = TiledCameraCfg(
+                    prim_path=f"/World/envs/env_.*/Robot/{self.simulator_config.cameras.camera_attached_link}/ego_camera",
+                    offset=TiledCameraCfg.OffsetCfg(
+                        pos=camera_pos_offset, rot=camera_rot_offset, convention="world"
+                    ),
+                    data_types=camera_types,
+                    spawn=sim_utils.PinholeCameraCfg(
+                        focal_length=self.simulator_config.cameras.camera_focal_length,
+                        focus_distance=self.simulator_config.cameras.camera_focus_distance,
+                        horizontal_aperture=self.simulator_config.cameras.camera_horizontal_aperture,
+                        vertical_aperture=self.simulator_config.cameras.camera_vertical_aperture,
+                        clipping_range=eval(self.simulator_config.cameras.camera_clipping_range),
+                    ),
+                    width=self.simulator_config.cameras.camera_resolutions[1],
+                    height=self.simulator_config.cameras.camera_resolutions[0],
+                    debug_vis=True,
+                )
+                self.ego_camera = TiledCamera(ego_camera_config)
+                self.scene.sensors["ego_camera"] = self.ego_camera
         else:
             self.ego_camera = None
 
@@ -1760,11 +1910,14 @@ class IsaacSim(BaseSimulator):
             hasattr(self.simulator_config, "cameras")
             and self.simulator_config.cameras.enable_cameras
         ):
+            camera_attached_link = self.simulator_config.cameras.camera_attached_link
+            if hasattr(self, "camera_specs"):
+                camera_attached_link = self.camera_specs[self.primary_camera_name]["body_name"]
             self.camera_body_id = self._robot.find_bodies(
-                self.simulator_config.cameras.camera_attached_link, preserve_order=True
+                camera_attached_link, preserve_order=True
             )[0]
             logger.info(
-                f"Camera attached link: {self.simulator_config.cameras.camera_attached_link}, Camera body id: {self.camera_body_id}"
+                f"Camera attached link: {camera_attached_link}, Camera body id: {self.camera_body_id}"
             )
 
         # import ipdb; ipdb.set_trace()
@@ -1916,8 +2069,118 @@ class IsaacSim(BaseSimulator):
         else:
             raise ValueError("Height scanner not found in the scene.")
 
+    def _initialize_door_diagnostic_pose(self, camera_name):
+        if camera_name not in getattr(self, "named_cameras", {}):
+            return
+        door = self.scene.articulations.get("door")
+        if door is None:
+            raise RuntimeError("Door diagnostic camera requires scene.articulations['door'].")
+        panel_ids, _ = door.find_bodies("door_panel", preserve_order=True)
+        handle_ids, _ = door.find_bodies("door_handle", preserve_order=True)
+        if len(panel_ids) != 1 or len(handle_ids) != 1:
+            raise RuntimeError(
+                f"Door diagnostic camera expected one panel and handle body, got {panel_ids}, {handle_ids}."
+            )
+        panel_pos = door.data.body_pos_w[:, panel_ids[0]]
+        panel_quat = door.data.body_quat_w[:, panel_ids[0]]
+        handle_pos = door.data.body_pos_w[:, handle_ids[0]]
+        handle_quat = door.data.body_quat_w[:, handle_ids[0]]
+        diagnostic = self.door_diagnostic_configs[camera_name]
+        offset = torch.tensor(
+            diagnostic["target_offset_leaf_m"], device=self.sim_device, dtype=panel_pos.dtype
+        ).expand_as(panel_pos)
+        target = handle_pos + quat_apply(panel_quat, offset)
+        axis_local = torch.tensor(
+            diagnostic["view_axis_local"], device=self.sim_device, dtype=panel_pos.dtype
+        ).expand_as(panel_pos)
+        axis_quat = handle_quat if diagnostic["view_axis_reference"] == "handle_body" else panel_quat
+        axis = quat_apply(axis_quat, axis_local)
+        axis = F.normalize(axis, dim=-1) * float(diagnostic["view_axis_direction_sign"])
+        camera_pos = target + float(diagnostic["axis_distance_m"]) * axis
+        forward = -axis
+        up_hint = torch.zeros_like(forward)
+        up_hint[:, 2] = 1.0
+        near_vertical = torch.abs(torch.sum(up_hint * forward, dim=-1)) > 0.95
+        up_hint[near_vertical] = torch.tensor(
+            [0.0, 1.0, 0.0], device=self.sim_device, dtype=panel_pos.dtype
+        )
+        right = F.normalize(torch.cross(up_hint, forward, dim=-1), dim=-1)
+        up = torch.cross(forward, right, dim=-1)
+        camera_quat = quat_from_matrix(torch.stack((forward, right, up), dim=-1))
+        panel_quat_inv = quat_inv(panel_quat)
+        self._door_diagnostic_local_poses[camera_name] = (
+            quat_apply(panel_quat_inv, camera_pos - panel_pos),
+            quat_mul(panel_quat_inv, camera_quat),
+            int(panel_ids[0]),
+        )
+
+    def _update_door_diagnostic_pose(self):
+        cameras = getattr(self, "named_cameras", {})
+        diagnostic_names = [name for name in self.door_diagnostic_configs if name in cameras]
+        if not diagnostic_names:
+            return
+        door = self.scene.articulations["door"]
+        for camera_name in diagnostic_names:
+            if camera_name not in self._door_diagnostic_local_poses:
+                self._initialize_door_diagnostic_pose(camera_name)
+            local_pos, local_quat, panel_id = self._door_diagnostic_local_poses[camera_name]
+            panel_pos = door.data.body_pos_w[:, panel_id]
+            panel_quat = door.data.body_quat_w[:, panel_id]
+            cameras[camera_name].set_world_poses(
+                positions=panel_pos + quat_apply(panel_quat, local_pos),
+                orientations=quat_mul(panel_quat, local_quat),
+                convention="world",
+            )
+
+    def _apply_camera_valid_circle_mask(self, name, image):
+        mask_cfg = self.camera_specs[name].get("valid_circle_mask")
+        if not mask_cfg:
+            return image
+        key = (name, image.shape[-3], image.shape[-2], image.device, image.dtype)
+        alpha = self._camera_mask_cache.get(key)
+        if alpha is None:
+            height, width = image.shape[-3:-1]
+            yy, xx = torch.meshgrid(
+                torch.arange(height, device=image.device, dtype=torch.float32),
+                torch.arange(width, device=image.device, dtype=torch.float32),
+                indexing="ij",
+            )
+            center_x, center_y = mask_cfg["center"]
+            distance = torch.sqrt((xx - center_x) ** 2 + (yy - center_y) ** 2)
+            radius = float(mask_cfg["radius"])
+            feather = float(mask_cfg["feather"])
+            alpha = (
+                torch.clamp((radius - distance) / feather, 0.0, 1.0)
+                if feather > 0.0
+                else (distance <= radius).float()
+            ).to(dtype=image.dtype)[..., None]
+            self._camera_mask_cache[key] = alpha
+        return image * alpha
+
+    def _rgb_image_from_camera(self, name, normalize=True, standardize=False):
+        sensor_name = self.camera_sensor_names[name]
+        rgb_image = self.scene.sensors[sensor_name].data.output["rgb"][..., :3]
+        rgb_image = self._apply_camera_valid_circle_mask(name, rgb_image)
+        if not normalize:
+            if rgb_image.dtype == torch.uint8:
+                return rgb_image
+            scale = 255.0 if rgb_image.max() <= 1.0 else 1.0
+            return torch.clamp(rgb_image * scale, 0, 255).to(torch.uint8)
+        if rgb_image.dtype != torch.float:
+            rgb_image = rgb_image.float()
+        if rgb_image.max() > 1.0:
+            rgb_image = rgb_image / 255.0
+        if standardize and hasattr(self.simulator_config.cameras, "image_mean"):
+            mean = torch.tensor(self.simulator_config.cameras.image_mean, device=self.sim_device)
+            std = torch.tensor(self.simulator_config.cameras.image_std, device=self.sim_device)
+            rgb_image = (rgb_image - mean) / std
+        return rgb_image
+
     def get_rgb_image(self):
-        # import ipdb; ipdb.set_trace()
+        if hasattr(self, "camera_sensor_names"):
+            return self._rgb_image_from_camera(
+                self.primary_camera_name, normalize=True, standardize=True
+            )
         if self.ego_camera is not None:
             # Get RGB image from the ego camera
             # The image is typically in shape [batch_size, height, width, channels]
@@ -1955,6 +2218,20 @@ class IsaacSim(BaseSimulator):
                 device=self.sim_device,
                 dtype=torch.float,
             )
+
+    def get_rgb_images(self, camera_names=None, normalize=True, standardize=False):
+        if not hasattr(self, "camera_sensor_names"):
+            return {}
+        self._update_door_diagnostic_pose()
+        selected = camera_names or list(self.camera_sensor_names)
+        return {
+            name: self._rgb_image_from_camera(name, normalize, standardize)
+            for name in selected
+            if name in self.camera_sensor_names
+        }
+
+    def get_rgb_images_uint8(self, camera_names=None):
+        return self.get_rgb_images(camera_names, normalize=False, standardize=False)
 
     def get_depth_image(self):
         if self.ego_camera is not None:
@@ -2329,6 +2606,8 @@ class IsaacSim(BaseSimulator):
         # note: we assume the render interval to be the shortest accepted rendering interval.
         #    If a camera needs rendering at a faster frequency, this will lead to unexpected behavior.
         if self._sim_step_counter % self.simulator_config.sim.render_interval == 0 and is_rendering:
+            if hasattr(self, "door_diagnostic_configs"):
+                self._update_door_diagnostic_pose()
             self.sim.render()
         # update buffers at sim
         self.scene.update(dt=1.0 / self.simulator_config.sim.fps)
@@ -2608,13 +2887,19 @@ class IsaacSim(BaseSimulator):
 
         return torch.tensor(positions, device=self.device)
 
-    def get_camera_pose_from_prim_path(self):
+    def get_camera_pose_from_prim_path(self, camera_name=None):
         """
         Get camera poses using the camera's prim path.
         Returns position and quaternion (in wxyz format) for all environments.
         """
         if self.ego_camera is None:
             return None, None
+
+        if hasattr(self, "named_cameras"):
+            self._update_door_diagnostic_pose()
+            name = camera_name or self.primary_camera_name
+            camera = self.named_cameras[name]
+            return camera.data.pos_w.clone(), camera.data.quat_w_world.clone()
 
         import omni.usd
 
@@ -2657,3 +2942,13 @@ class IsaacSim(BaseSimulator):
         rot_tensor = torch.tensor(rotations, dtype=torch.float32, device=self.device)
 
         return pos_tensor, rot_tensor
+
+    def get_camera_poses(self, camera_names=None):
+        if not hasattr(self, "named_cameras"):
+            return {}
+        selected = camera_names or list(self.named_cameras)
+        return {
+            name: self.get_camera_pose_from_prim_path(name)
+            for name in selected
+            if name in self.named_cameras
+        }

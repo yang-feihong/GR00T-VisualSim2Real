@@ -38,7 +38,6 @@ import glob
 import logging
 import os
 import random
-import shutil
 import sys
 from pathlib import Path
 
@@ -254,13 +253,17 @@ def main(config: OmegaConf):
         args_cli.distributed = config.multi_gpu
         args_cli.device = device
 
-        # Copy headless rendering kit file if cameras are enabled in headless mode
-        dest_path = Path(isaaclab.__file__).resolve().parent.parent.parent.parent / "apps"
+        if args_cli.enable_cameras and "--enable=isaacsim.sensors.camera" not in sys.argv:
+            sys.argv.append("--enable=isaacsim.sensors.camera")
+
         current_file_dir_path = Path(os.path.dirname(os.path.realpath(__file__)))
         if args_cli.enable_cameras and args_cli.headless:
-            source_file = current_file_dir_path / "apps/phc.isaaclab.python.headless.rendering.kit"
-            shutil.copy(source_file, dest_path)
-            args_cli.experience = dest_path / "phc.isaaclab.python.headless.rendering.kit"
+            os.environ.pop("DISPLAY", None)
+            isaaclab_apps_path = Path(isaaclab.__file__).resolve().parents[3] / "apps"
+            source_file = isaaclab_apps_path / "isaaclab.python.headless.rendering.kit"
+            if not source_file.exists():
+                source_file = current_file_dir_path / "apps/phc.isaaclab.python.headless.rendering.kit"
+            args_cli.experience = source_file
         elif args_cli.headless and not args_cli.enable_cameras:
             args_cli.experience = current_file_dir_path / "apps/b2z1.isaaclab.python.headless.no_render.kit"
 
@@ -330,6 +333,25 @@ def main(config: OmegaConf):
     config.env.config.save_rendering_dir = str(Path(config.experiment_dir) / "renderings_training")
     config.env.config.experiment_dir = str(Path(config.experiment_dir))
     env = custom_instantiate(config.env, device=device, _resolve=False)
+    if (
+        config.get("debug_dump_cameras_once", False)
+        and config.simulator.config.cameras.enable_cameras
+    ):
+        rgb_images = env.simulator.get_rgb_images_uint8()
+        if not rgb_images:
+            raise RuntimeError("Camera debug dump requested, but no RGB cameras are available.")
+        camera_poses = env.simulator.get_camera_poses(list(rgb_images.keys()))
+        for camera_name, rgb_image in rgb_images.items():
+            rgb_min = int(rgb_image.min().item())
+            rgb_max = int(rgb_image.max().item())
+            pos, quat = camera_poses[camera_name]
+            logger.info(
+                "Camera debug dump: "
+                f"{camera_name}: shape={tuple(rgb_image.shape)}, dtype={rgb_image.dtype}, "
+                f"range=[{rgb_min}, {rgb_max}], "
+                f"pos0={pos[0].detach().cpu().tolist()}, "
+                f"quat0={quat[0].detach().cpu().tolist()}"
+            )
 
     # --- Build policy and value models ---
     ref_model = None
