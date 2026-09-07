@@ -62,7 +62,10 @@ def add_app_launcher_args(parser):
 def load_rgb_camera_specs(config_path):
     if not config_path:
         return None
-    from rgb_camera_debug import load_rgb_camera_config, rgb_camera_specs_from_config
+    from legged_gym.scripts.rgb_camera_debug import (
+        load_rgb_camera_config,
+        rgb_camera_specs_from_config,
+    )
 
     return rgb_camera_specs_from_config(load_rgb_camera_config(config_path))
 

@@ -926,7 +926,19 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         offset = torch.tensor(
             diagnostic["target_offset_leaf_m"], device=self.device, dtype=panel_pos.dtype
         )
-        target = handle_pos + quat_apply(panel_quat.unsqueeze(0), offset.unsqueeze(0))[0]
+        offset_w = quat_apply(panel_quat.unsqueeze(0), offset.unsqueeze(0))[0]
+        panel_normal_local = torch.tensor(
+            [1.0, 0.0, 0.0], device=self.device, dtype=panel_pos.dtype
+        )
+        panel_normal = quat_apply(
+            panel_quat.unsqueeze(0), panel_normal_local.unsqueeze(0)
+        )[0]
+        robot_pos = self.robot.data.root_pos_w[env_id]
+        robot_side = torch.dot(robot_pos - panel_pos, panel_normal)
+        target_side = torch.dot(offset_w, panel_normal)
+        if robot_side * target_side < 0.0:
+            offset_w = offset_w - 2.0 * target_side * panel_normal
+        target = handle_pos + offset_w
         axis_local = torch.tensor(
             diagnostic["view_axis_local"], device=self.device, dtype=panel_pos.dtype
         )
@@ -949,6 +961,16 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         )[0]
         local_quat = quat_mul(panel_quat_inverse.unsqueeze(0), camera_quat.unsqueeze(0))[0]
         rig["_door_local_pose"] = (local_pos, local_quat, panel_id)
+        camera_side = torch.dot(camera_pos - panel_pos, panel_normal)
+        target_side = torch.dot(target - panel_pos, panel_normal)
+        print(
+            f"[rgb_camera][door] {diagnostic['camera_name']}: "
+            f"robot_side={float(robot_side):.4f} target_side={float(target_side):.4f} "
+            f"camera_side={float(camera_side):.4f} "
+            f"robot={robot_pos.detach().cpu().tolist()} "
+            f"target={target.detach().cpu().tolist()} "
+            f"camera={camera_pos.detach().cpu().tolist()}"
+        )
 
     def _update_door_rgb_camera_world_pose(self, rig, env_id):
         env_id = int(env_id)
@@ -1120,7 +1142,9 @@ class LeggedRobotIsaacLab(DirectRLEnv):
             [self.dof_names_to_idx[n] for n in self.gripper_joint_names if n in self.dof_names_to_idx],
             dtype=torch.long,
             device=self.device,
-        )        
+        )
+        # Policy observations exclude the gripper joints using this count.
+        self.num_gripper_joints = int(self.gripper_joint_ids.numel())
         print("[arm_joint_ids]", self.arm_joint_ids.detach().cpu().tolist())
         print("[gripper_joint_ids]", self.gripper_joint_ids.detach().cpu().tolist())        
         ############################################        

@@ -114,6 +114,7 @@ def rgb_camera_specs_from_config(config):
             raise ValueError(f"Duplicate door diagnostic config for camera: {camera_name}")
         target_reference = str(section["target_reference"])
         view_axis_reference = str(section["view_axis_reference"])
+        door_face_reference = str(section.get("door_face_reference", "robot"))
         if target_reference != "handle_joint":
             raise ValueError(
                 f"Door diagnostic camera '{camera_name}' requires target_reference='handle_joint'."
@@ -123,12 +124,18 @@ def rgb_camera_specs_from_config(config):
                 f"Door diagnostic camera '{camera_name}' has unsupported "
                 f"view_axis_reference={view_axis_reference!r}."
             )
+        if door_face_reference != "robot":
+            raise ValueError(
+                f"Door diagnostic camera '{camera_name}' requires "
+                "door_face_reference='robot'."
+            )
         axis_distance = float(section["axis_distance_m"])
         if axis_distance <= 0.0:
             raise ValueError(f"Door diagnostic camera '{camera_name}' axis_distance_m must be positive.")
         diagnostic_configs[camera_name] = {
             **section,
             "camera_name": camera_name,
+            "door_face_reference": door_face_reference,
             "target_offset_leaf_m": parse_vec3(
                 section["target_offset_leaf_m"], f"{section_name}.target_offset_leaf_m"
             ),

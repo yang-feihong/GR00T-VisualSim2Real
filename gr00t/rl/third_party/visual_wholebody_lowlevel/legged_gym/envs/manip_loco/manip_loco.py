@@ -91,7 +91,7 @@ def _compute_ee_goal_pose_from_ref_impl(
     goal_world_z = goal_ref_origin[:, 2] + vz + qw * tz + qx * ty - qy * tx
     goal_world = torch.stack((goal_world_x, goal_world_y, goal_world_z), dim=-1)
 
-    roll = ee_goal_orn_delta_rpy[:, 0] + 1.5707963267948966
+    roll = ee_goal_orn_delta_rpy[:, 0] - 1.5707963267948966
     pitch = -curr_ee_goal_sphere[:, 1] + arm_induced_pitch + ee_goal_orn_delta_rpy[:, 1]
     yaw = ee_goal_orn_delta_rpy[:, 2] + curr_ee_goal_sphere[:, 2]
     cr = torch.cos(roll * 0.5)
@@ -625,7 +625,7 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         local_ee_orn = quat_mul(quat_conjugate(goal_ref_quat), ee_orn_normalized)
         local_ee_orn_rpy = torch.stack(euler_from_quat(local_ee_orn), dim=-1)
         default_pitch = -self.curr_ee_goal_sphere[env_ids, 1] + self.arm_induced_pitch
-        self.teleop_raw_ee_goal_orn_delta_rpy[env_ids, 0] = wrap_to_pi(local_ee_orn_rpy[:, 0] - np.pi / 2)
+        self.teleop_raw_ee_goal_orn_delta_rpy[env_ids, 0] = wrap_to_pi(local_ee_orn_rpy[:, 0] + np.pi / 2)
         self.teleop_raw_ee_goal_orn_delta_rpy[env_ids, 1] = wrap_to_pi(local_ee_orn_rpy[:, 1] - default_pitch)
         self.teleop_raw_ee_goal_orn_delta_rpy[env_ids, 2] = wrap_to_pi(
             local_ee_orn_rpy[:, 2] - self.curr_ee_goal_sphere[env_ids, 2]

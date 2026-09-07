@@ -2089,7 +2089,16 @@ class IsaacSim(BaseSimulator):
         offset = torch.tensor(
             diagnostic["target_offset_leaf_m"], device=self.sim_device, dtype=panel_pos.dtype
         ).expand_as(panel_pos)
-        target = handle_pos + quat_apply(panel_quat, offset)
+        offset_w = quat_apply(panel_quat, offset)
+        panel_normal_local = torch.zeros_like(panel_pos)
+        panel_normal_local[:, 0] = 1.0
+        panel_normal = quat_apply(panel_quat, panel_normal_local)
+        robot_pos = self._robot.data.root_pos_w
+        robot_side = torch.sum((robot_pos - panel_pos) * panel_normal, dim=-1, keepdim=True)
+        target_side = torch.sum(offset_w * panel_normal, dim=-1, keepdim=True)
+        mirror = robot_side * target_side < 0.0
+        offset_w = torch.where(mirror, offset_w - 2.0 * target_side * panel_normal, offset_w)
+        target = handle_pos + offset_w
         axis_local = torch.tensor(
             diagnostic["view_axis_local"], device=self.sim_device, dtype=panel_pos.dtype
         ).expand_as(panel_pos)
@@ -2112,6 +2121,14 @@ class IsaacSim(BaseSimulator):
             quat_apply(panel_quat_inv, camera_pos - panel_pos),
             quat_mul(panel_quat_inv, camera_quat),
             int(panel_ids[0]),
+        )
+        camera_side = torch.sum((camera_pos - panel_pos) * panel_normal, dim=-1)
+        target_side = torch.sum((target - panel_pos) * panel_normal, dim=-1)
+        print(
+            f"[rgb_camera][door] {camera_name}: "
+            f"robot_side={robot_side[:, 0].detach().cpu().tolist()} "
+            f"target_side={target_side.detach().cpu().tolist()} "
+            f"camera_side={camera_side.detach().cpu().tolist()}"
         )
 
     def _update_door_diagnostic_pose(self):

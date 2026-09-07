@@ -55,6 +55,9 @@ class ManipLoco_Policy:
 
         self.env_cfg = build_env_cfg(self.args, for_play=True)
         self.configure_env_cfg(self.env_cfg)
+        # Isaac Lab reads the seed from the environment config.
+        if getattr(self.args, "seed", None) is not None and hasattr(self.env_cfg, "seed"):
+            self.env_cfg.seed = int(self.args.seed)
         if bool(self.env_cfg.env.teleop_mode):
             self.env_cfg.episode_length_s = 10000.0
         self.env = ManipLocoIsaacLab(self.env_cfg)
@@ -64,7 +67,7 @@ class ManipLoco_Policy:
         self.policy = load_policy(str(checkpoint_model_path(self.args)), self.env.device)
 
         try:
-            from rgb_camera_debug import SimRgbCameraManager
+            from legged_gym.scripts.rgb_camera_debug import SimRgbCameraManager
 
             self.rgb_camera_manager = SimRgbCameraManager(self.env, self.args.rgb_camera_config)
         except Exception as exc:
