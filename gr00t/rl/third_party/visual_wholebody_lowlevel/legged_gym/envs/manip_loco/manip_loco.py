@@ -279,6 +279,14 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         self.curr_ee_goal_cart_world = torch.zeros(self.num_envs, 3, device=self.device)
         self.ee_goal_orn_quat = torch.zeros(self.num_envs, 4, device=self.device)
         self.ee_goal_orn_quat[:, 0] = 1.0
+        # Optional scripted world-frame orientation.  The keyboard teleop
+        # path continues to use spherical/RPY targets; DoorMan can provide a
+        # measured jaw orientation directly when precise grasping is needed.
+        self.teleop_world_ee_goal_orn_quat = torch.zeros(self.num_envs, 4, device=self.device)
+        self.teleop_world_ee_goal_orn_quat[:, 0] = 1.0
+        self.teleop_world_ee_goal_orn_quat_enabled = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
         self.ee_goal_orn_euler = torch.zeros(self.num_envs, 3, device=self.device)
         self.ee_goal_orn_delta_rpy = torch.zeros(self.num_envs, 3, device=self.device)
 
@@ -503,6 +511,213 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         #     f"[teleop][env] key={key} cmd={self.teleop_raw_commands[0, :3].detach().cpu().tolist()} "
         #     f"arm_mode={self.teleop_arm_control_mode} ee_goal={self.curr_ee_goal_cart[0].detach().cpu().tolist()}"
         # )
+
+    def set_teleop_targets(
+        self,
+        base_command: torch.Tensor,
+        ee_goal_cart: torch.Tensor | None = None,
+        ee_orn_delta_rpy: torch.Tensor | None = None,
+        gripper_target: torch.Tensor | None = None,
+        ee_goal_orn_quat_world: torch.Tensor | None = None,
+    ):
+        """Set persistent teleoperation targets without synthesizing keyboard events.
+
+        Tensors are accepted for all environments and are copied to the same
+        buffers used by the keyboard/XR teleop path.  This keeps the target
+        semantics (including clipping and reference-frame handling) identical
+        for scripted and interactive control.
+        """
+        if not self.teleop_mode:
+            raise RuntimeError("set_teleop_targets requires cfg.env.teleop_mode=True")
+
+        def _copy(name: str, value: torch.Tensor | None, width: int):
+            if value is None:
+                return
+            tensor = torch.as_tensor(value, device=self.device, dtype=torch.float32)
+            if tensor.ndim == 1:
+                tensor = tensor.unsqueeze(0)
+            expected = (self.num_envs, width)
+            if tuple(tensor.shape) != expected:
+                raise ValueError(f"{name} must have shape {expected}, got {tuple(tensor.shape)}")
+            getattr(self, name).copy_(tensor)
+
+        _copy("teleop_raw_commands", base_command, 3)
+        _copy("teleop_raw_ee_goal_cart", ee_goal_cart, 3)
+        _copy("teleop_raw_ee_goal_orn_delta_rpy", ee_orn_delta_rpy, 3)
+        if gripper_target is not None:
+            target = torch.as_tensor(gripper_target, device=self.device, dtype=torch.float32)
+            if target.ndim == 1:
+                target = target.unsqueeze(-1)
+            if target.shape != (self.num_envs, 1):
+                raise ValueError(
+                    f"gripper_target must have shape {(self.num_envs, 1)}, got {tuple(target.shape)}"
+                )
+            self.gripper_pos_targets[:] = target
+        if ee_goal_orn_quat_world is not None:
+            quat = torch.as_tensor(ee_goal_orn_quat_world, device=self.device, dtype=torch.float32)
+            if quat.ndim == 1:
+                quat = quat.unsqueeze(0)
+            expected = (self.num_envs, 4)
+            if tuple(quat.shape) != expected:
+                raise ValueError(
+                    f"ee_goal_orn_quat_world must have shape {expected}, got {tuple(quat.shape)}"
+                )
+            quat = quat / torch.linalg.vector_norm(quat, dim=-1, keepdim=True).clamp_min(1.0e-8)
+            self.teleop_world_ee_goal_orn_quat.copy_(quat)
+            self.teleop_world_ee_goal_orn_quat_enabled[:] = True
+
+        self._teleop_inputs_dirty = True
+        self._clip_teleop_targets()
+        self._update_effective_teleop_inputs(force=True)
+
+    def get_control_state(self) -> dict:
+        """Return a device-local snapshot of state needed by scripted controllers."""
+        if self.ee_pos is None:
+            self._refresh_ee_and_jacobian_for_ik()
+        if not getattr(self, "_printed_control_contact_debug", False):
+            self._printed_control_contact_debug = True
+            sensor = getattr(self, "contact_sensor", None)
+            print(
+                "[doorman][contact-debug] enabled=",
+                sensor is not None,
+                "body_names=",
+                list(getattr(sensor, "body_names", [])),
+                "force_shape=",
+                tuple(getattr(getattr(sensor, "data", None), "net_forces_w", torch.empty(0)).shape),
+                flush=True,
+            )
+        contact_forces_w = (
+            self._contact_forces_w.detach().clone()
+            if hasattr(self, "_contact_forces_w")
+            else None
+        )
+        gripper_contact_force_w = None
+        finger_contact_forces_w = None
+        handle_finger_contact_forces_w = None
+        handle_finger_contact_points_w = None
+        if contact_forces_w is not None:
+            contact_sensor = getattr(self, "contact_sensor", None)
+            sensor_body_names = list(getattr(contact_sensor, "body_names", []))
+            contact_body_ids = [
+                idx for idx, name in enumerate(self.body_names)
+                if name.lower() in {"grippermover", "link06", "gripper_link"}
+            ]
+            if sensor_body_names and len(sensor_body_names) == contact_forces_w.shape[1]:
+                sensor_name_to_idx = {name.lower().split("/")[-1]: idx for idx, name in enumerate(sensor_body_names)}
+                contact_body_ids = [
+                    sensor_name_to_idx[name.lower()]
+                    for name in self.body_names
+                    if name.lower() in {"grippermover", "link06", "gripper_link"}
+                    and name.lower() in sensor_name_to_idx
+                ]
+            valid_contact_body_ids = [idx for idx in contact_body_ids if idx < contact_forces_w.shape[1]]
+            if valid_contact_body_ids:
+                candidates = contact_forces_w[:, valid_contact_body_ids, :]
+                best = torch.linalg.vector_norm(candidates, dim=-1).argmax(dim=1)
+                gripper_contact_force_w = candidates[
+                    torch.arange(self.num_envs, device=self.device), best
+                ]
+            finger_contact_forces_w = torch.zeros(self.num_envs, 2, 3, device=self.device)
+            # The fixed jaw mesh is welded into link06 in the imported USD;
+            # gripperMover is the moving jaw.
+            for finger_idx, finger_name in enumerate(("link06", "gripperMover")):
+                lookup_names = sensor_body_names if sensor_body_names else self.body_names
+                body_idx = next(
+                    (idx for idx, name in enumerate(lookup_names)
+                     if name.lower().split("/")[-1] == finger_name.lower()),
+                    None,
+                )
+                if body_idx is not None and body_idx < contact_forces_w.shape[1]:
+                    finger_contact_forces_w[:, finger_idx] = contact_forces_w[:, body_idx]
+            if not valid_contact_body_ids:
+                gripper_contact_force_w = torch.zeros(self.num_envs, 3, device=self.device)
+        handle_sensors = list(getattr(self, "handle_contact_sensors", []))
+        if len(handle_sensors) == 2:
+            handle_finger_contact_forces_w = torch.zeros(self.num_envs, 2, 3, device=self.device)
+            handle_finger_contact_points_w = torch.full(
+                (self.num_envs, 2, 3), float("nan"), device=self.device
+            )
+            for finger_idx, sensor in enumerate(handle_sensors):
+                force_matrix = getattr(sensor.data, "force_matrix_w", None)
+                if force_matrix is not None and force_matrix.shape[1:3] == (1, 1):
+                    handle_finger_contact_forces_w[:, finger_idx] = force_matrix[:, 0, 0]
+                contact_points = getattr(sensor.data, "contact_pos_w", None)
+                if contact_points is not None and contact_points.shape[1:3] == (1, 1):
+                    handle_finger_contact_points_w[:, finger_idx] = contact_points[:, 0, 0]
+        state = {
+            "root_states": self.root_states.detach().clone(),
+            "dof_pos": self.dof_pos.detach().clone(),
+            "dof_vel": self.dof_vel.detach().clone(),
+            "ee_pos": None if self.ee_pos is None else self.ee_pos.detach().clone(),
+            "ee_orn": None if self.ee_orn is None else self.ee_orn.detach().clone(),
+            "ee_vel": None if self.ee_vel is None else self.ee_vel.detach().clone(),
+            "base_command": self.commands[:, :3].detach().clone(),
+            "ee_goal_cart_local": self.curr_ee_goal_cart.detach().clone(),
+            "ee_goal_cart_world": self.curr_ee_goal_cart_world.detach().clone(),
+            "ee_goal_delta_rpy": self.ee_goal_orn_delta_rpy.detach().clone(),
+            "gripper_position": self.dof_pos[:, self.gripper_joint_ids].mean(
+                dim=1, keepdim=True
+            ).detach().clone(),
+            "gripper_command": self.gripper_pos_targets.mean(dim=1, keepdim=True).detach().clone(),
+            # Net contact force on the robot bodies.  The scripted DoorMan
+            # controller uses this as physical evidence before turning the
+            # handle; a closed command alone is not a grasp.
+            "contact_forces_w": contact_forces_w,
+            "gripper_contact_force_w": gripper_contact_force_w,
+            "finger_contact_forces_w": finger_contact_forces_w,
+            "handle_finger_contact_forces_w": handle_finger_contact_forces_w,
+            "handle_finger_contact_points_w": handle_finger_contact_points_w,
+            "robot_body_state_w": self.robot.data.body_state_w.detach().clone()
+            if hasattr(self.robot.data, "body_state_w")
+            else None,
+            "gripper_body_index": int(getattr(self, "gripper_idx", -1)),
+            "dt": float(self.dt),
+            "sim_time": float(getattr(self, "common_step_counter", 0)) * float(self.dt),
+            "body_names": list(self.body_names),
+            "dof_names": list(self.dof_names),
+        }
+        if self.door is not None:
+            data = self.door.data
+            state.update(
+                {
+                    "door_root_pose_w": torch.cat(
+                        (data.root_pos_w, data.root_quat_w), dim=-1
+                    ).detach().clone(),
+                    "door_joint_position": data.joint_pos.detach().clone(),
+                    "door_joint_velocity": data.joint_vel.detach().clone(),
+                    "door_body_state_w": getattr(data, "body_state_w", None),
+                    "door_joint_names": list(getattr(data, "joint_names", [])),
+                    "door_body_names": list(getattr(data, "body_names", [])),
+                }
+            )
+            if state["door_body_state_w"] is not None:
+                state["door_body_state_w"] = state["door_body_state_w"].detach().clone()
+        else:
+            state.update(
+                {
+                    "door_root_pose_w": None,
+                    "door_joint_position": None,
+                    "door_joint_velocity": None,
+                    "door_body_state_w": None,
+                    "door_joint_names": [],
+                    "door_body_names": [],
+                }
+            )
+        return state
+
+    def step_once(self, actions: torch.Tensor) -> dict:
+        """Advance Isaac Lab once with a low-level policy action."""
+        obs, privileged_obs, rewards, arm_rewards, dones, infos = self.step(actions)
+        return {
+            "obs": obs,
+            "privileged_obs": privileged_obs,
+            "rewards": rewards,
+            "arm_rewards": arm_rewards,
+            "dones": dones,
+            "infos": infos,
+            "low_level_action": actions.detach().clone(),
+            "state": self.get_control_state(),
+        }
 
     def _clip_teleop_targets(self):
         self.teleop_raw_commands[:, 0].clamp_(
@@ -1046,6 +1261,9 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         )
         self.curr_ee_goal_cart_world.copy_(goal_world)
         self.ee_goal_orn_quat.copy_(goal_quat)
+        enabled = getattr(self, "teleop_world_ee_goal_orn_quat_enabled", None)
+        if self.teleop_mode and enabled is not None and torch.any(enabled):
+            self.ee_goal_orn_quat[enabled] = self.teleop_world_ee_goal_orn_quat[enabled]
         if bool(self.cfg.compute_rewards):
             self.ee_goal_orn_euler = torch.stack(euler_from_quat(self.ee_goal_orn_quat), dim=-1)
 
@@ -1117,6 +1335,11 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         dpose = np.empty((6, 1), dtype=np.float32)
         dpose[:3, 0] = goal_pos - ee_pos
         dpose[3:, 0] = q_r[1:4] * sign
+        if self.teleop_mode:
+            orientation_gain = float(
+                getattr(self.cfg.goal_ee, "teleop_ik_orientation_gain", 1.0)
+            )
+            dpose[3:, 0] *= orientation_gain
 
         damping_sq = np.float32(float(self.cfg.goal_ee.ik_damping) ** 2)
         j_t = jac.T

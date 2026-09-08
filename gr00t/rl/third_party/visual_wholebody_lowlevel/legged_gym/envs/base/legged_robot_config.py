@@ -212,6 +212,7 @@ class LeggedRobotIsaacLabCfg(DirectRLEnvCfg):
     scene_position: list = field(default_factory=list)
     enable_doorman_scene: bool = False
     doorman_randomize_robot_init: bool = True
+    doorman_robot_side: str = "positive_x"
     doorman_randomize_door_init_state: bool = False
     doorman_door: ArticulationCfg | None = None
     rgb_camera_specs: list = field(default_factory=list)

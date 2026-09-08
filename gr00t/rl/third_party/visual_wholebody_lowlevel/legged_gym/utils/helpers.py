@@ -121,6 +121,7 @@ def build_common_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scene_prim_path", type=str, default=None)
     parser.add_argument("--scene_position", type=float, nargs=3, default=None)
     parser.add_argument("--enable_doorman_scene", action="store_true")
+    parser.add_argument("--doorman_door_open_lr", type=str, choices=["left", "right"], default=None)
     parser.add_argument("--doorman_randomize_robot_init", type=str_to_bool, nargs="?", const=True, default=True)
     parser.add_argument("--doorman_randomize_door_init_state", type=str_to_bool, nargs="?", const=True, default=False)
     parser.add_argument("--robot_usd_path", type=str, default=None)
@@ -285,8 +286,9 @@ def _apply_cli_scene_args(cfg, args):
         cfg.enable_doorman_scene = True
         cfg.scene.replicate_physics = False
         cfg.doorman_randomize_robot_init = bool(args.doorman_randomize_robot_init)
+        cfg.doorman_robot_side = str(getattr(args, "robot_side", "positive_x"))
         cfg.doorman_randomize_door_init_state = bool(args.doorman_randomize_door_init_state)
-        cfg.doorman_door = build_training_doorman_door_cfg(args.num_envs)
+        cfg.doorman_door = build_training_doorman_door_cfg(args.num_envs, args.doorman_door_open_lr)
         print("[doorman] using the high-level training DoorSpawner configuration")
 
 
@@ -355,11 +357,14 @@ def _apply_cli_rgb_camera_args(cfg, args):
 
 def _apply_cli_play_args(cfg, args):
     cfg.enable_height_scan = False
-    cfg.enable_contact_sensor = False
+    # DoorMan uses measured finger contact as the gate before handle
+    # rotation.  Keep the sensor enabled for that scene; regular policy
+    # playback retains the cheaper no-contact configuration.
+    cfg.enable_contact_sensor = bool(getattr(args, "enable_doorman_scene", False))
     cfg.compute_rewards = False
     cfg.profile_env_step = bool(args.print_timing_breakdown)
     cfg.check_terminations = False
-    cfg.robot.spawn.activate_contact_sensors = False
+    cfg.robot.spawn.activate_contact_sensors = bool(cfg.enable_contact_sensor)
     cfg.robot.spawn.articulation_props.enabled_self_collisions = False
     cfg.env.teleop_debug = False
     cfg.commands.curriculum_playback_counter = (

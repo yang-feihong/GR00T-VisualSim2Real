@@ -410,6 +410,38 @@ class LeggedRobotIsaacLab(DirectRLEnv):
             self.scene.sensors["contact_sensor"] = self.contact_sensor
         else:
             self.contact_sensor = None
+
+        # The general robot contact sensor cannot tell a handle contact from a
+        # collision with the panel or wall.  DoorMan therefore uses one
+        # one-to-one filtered sensor per jaw, as required by ContactSensor's
+        # one-to-many filtering contract.
+        self.handle_contact_sensors = []
+        if self.cfg.enable_doorman_scene and bool(self.cfg.enable_contact_sensor):
+            # Restrict the bilateral grasp sensors to the robot-facing lever
+            # capsule.  Filtering the parent door_handle articulation also
+            # reports contacts with its axle, which can look like a grasp even
+            # though the fingers never touch the lever itself.
+            robot_side = getattr(self.cfg, "doorman_robot_side", "positive_x")
+            # GPU PhysX cannot filter a ContactSensor directly against the
+            # handle_outside collider.  Filter to its rigid parent here; the
+            # DoorMan controller then accepts only contact points lying on the
+            # measured handle_outside capsule.
+            handle_filter = ["/World/envs/env_.*/door/door_handle"]
+            for sensor_name, body_name in (
+                ("fixed_handle_contact", "link06"),
+                ("moving_handle_contact", "gripperMover"),
+            ):
+                sensor_cfg = self.cfg.contact_sensor.replace(
+                    prim_path=f"/World/envs/env_.*/Robot/{body_name}",
+                    history_length=8,
+                    track_air_time=False,
+                    track_contact_points=True,
+                    max_contact_data_count_per_prim=16,
+                    filter_prim_paths_expr=handle_filter,
+                )
+                sensor = ContactSensor(sensor_cfg)
+                self.scene.sensors[sensor_name] = sensor
+                self.handle_contact_sensors.append(sensor)
         self._setup_rgb_cameras()
 
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
@@ -2466,17 +2498,29 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         root_state = self.robot.data.default_root_state[env_ids].clone()
         root_state[:, :3] += self.scene.env_origins[env_ids]
         if self.cfg.enable_doorman_scene and self.cfg.doorman_randomize_robot_init:
+            # DoorMan's door panel is an X-thin wall spanning Y.  The automatic
+            # controller normally starts on the visible, positive-X side.
+            robot_side = getattr(self.cfg, "doorman_robot_side", "positive_x")
+            if robot_side not in ("positive_x", "negative_x"):
+                raise ValueError(f"Unsupported doorman_robot_side={robot_side!r}")
+            side_sign = 1.0 if robot_side == "positive_x" else -1.0
+            # Keep the randomized reset inside the arm's reliable workspace.
+            # The previous 0.6--1.5 m range frequently initialized the base
+            # so far from the handle that the trained locomotion/IK policy
+            # saturated before either finger could make contact.
             root_state[:, 0:1] = (
                 self.scene.env_origins[env_ids, 0:1]
-                + torch_rand_float(-1.5, -0.6, (len(env_ids), 1), self.device)
+                + side_sign * torch_rand_float(0.65, 0.85, (len(env_ids), 1), self.device)
             )
             root_state[:, 1:2] = (
                 self.scene.env_origins[env_ids, 1:2]
-                + torch_rand_float(-0.5, 0.5, (len(env_ids), 1), self.device)
+                + torch_rand_float(0.15, 0.40, (len(env_ids), 1), self.device)
             )
             random_yaw = torch_rand_float(
-                -torch.pi / 4, torch.pi / 4, (len(env_ids), 1), self.device
+                -0.12, 0.12, (len(env_ids), 1), self.device
             ).squeeze(-1)
+            if side_sign > 0:
+                random_yaw = torch.pi + random_yaw
             zero_angle = torch.zeros_like(random_yaw)
             root_state[:, 3:7] = quat_from_euler_xyz(zero_angle, zero_angle, random_yaw)
         elif not self.cfg.enable_doorman_scene:

@@ -5,6 +5,7 @@ import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 
 LOW_LEVEL_ROOT = Path(__file__).resolve().parents[2]
@@ -39,6 +40,9 @@ class ManipLoco_Policy:
         self.env_cfg = None
         self.rgb_camera_manager = None
         self._rgb_camera_dumped = False
+        self._rgb_frame_source = None
+        self._rgb_frame_logged = False
+        self._rgb_frame_warned = False
         self.timestamp = 0
         self._last_status_wall_time = time.perf_counter()
         self._last_status_sim_time = 0.0
@@ -347,6 +351,125 @@ class ManipLoco_Policy:
                     f"range=[{int(rgb.min())},{int(rgb.max())}] mean={float(rgb.mean()):.2f}"
                 )
         self._rgb_camera_dumped = True
+    def set_teleop_targets(
+        self,
+        base_command,
+        ee_goal_cart=None,
+        ee_orn_delta_rpy=None,
+        gripper_target=None,
+        ee_goal_orn_quat_world=None,
+    ):
+        """Forward scripted targets to the environment teleop buffers."""
+        return self.env.set_teleop_targets(
+            base_command,
+            ee_goal_cart=ee_goal_cart,
+            ee_orn_delta_rpy=ee_orn_delta_rpy,
+            gripper_target=gripper_target,
+            ee_goal_orn_quat_world=ee_goal_orn_quat_world,
+        )
+
+    def get_control_state(self):
+        return self.env.get_control_state()
+
+    def step_once(self, sleep=False):
+        """Run one low-level policy/simulation step and return its action/state."""
+        if self.timestamp == 0:
+            print("[doorman] first low-level policy inference...", flush=True)
+        with torch.no_grad():
+            actions = self.policy(self.obs.detach(), hist_encoding=True)
+        if self.timestamp == 0:
+            print(
+                f"[doorman] first policy action shape={tuple(actions.shape)} "
+                f"finite={bool(torch.isfinite(actions).all().item())}",
+                flush=True,
+            )
+            print("[doorman] first Isaac Lab simulation step...", flush=True)
+        self.obs, *_ = self.env.step(actions.detach())
+        if self.timestamp == 0:
+            print("[doorman] first simulation step complete", flush=True)
+        if self.rgb_camera_manager is not None:
+            self.rgb_camera_manager.maybe_update_preview(env_id=0)
+        result = {
+            "low_level_action": actions.detach().clone(),
+            "state": self.get_control_state(),
+            "rgb": self._read_rgb_frame(),
+        }
+        self.timestamp += 1
+        if sleep:
+            time.sleep(float(self.env.dt))
+        return result
+
+    def _read_rgb_frame(self):
+        """Read one RGB frame from the configured ``SimRgbCameraManager``.
+
+        The RGB cameras added by the low-level stack are camera *rigs* managed
+        by ``SimRgbCameraManager``; they are not exposed as the regular
+        ``env.scene.sensors`` dictionary.  Keep the old sensor lookup as a
+        fallback for older environments, but prefer the manager so the
+        automatic data collector receives the actual configured camera image.
+        """
+        if self.rgb_camera_manager is not None and self.rgb_camera_manager.enabled:
+            images_by_name = self.rgb_camera_manager.render_images(env_id=0, update=True)
+            if images_by_name:
+                preferred_name = str(getattr(self.args, "rgb_camera_name", "") or "").strip()
+                preferred_order = [
+                    preferred_name,
+                    "door_panel_diagnostic",
+                    "trunk_front",
+                    "wrist",
+                    "door_panel_top_diagnostic",
+                ]
+                selected_name = None
+                for name in preferred_order:
+                    if name and name in images_by_name:
+                        selected_name = name
+                        break
+                if selected_name is None:
+                    selected_name = next(iter(images_by_name))
+                images = images_by_name[selected_name]
+                if isinstance(images, (list, tuple)):
+                    frame = images[0] if images else None
+                else:
+                    frame = images
+                if frame is not None:
+                    if torch.is_tensor(frame):
+                        frame = frame.detach().cpu()
+                        if frame.ndim == 4:
+                            frame = frame[0]
+                    else:
+                        frame = np.asarray(frame)
+                        if frame.ndim == 4:
+                            frame = frame[0]
+                    if getattr(frame, "ndim", 0) == 3 and frame.shape[-1] >= 3:
+                        frame = frame[..., :3]
+                        self._rgb_frame_source = selected_name
+                        if not self._rgb_frame_logged:
+                            print(
+                                f"[rgb_camera] collector source={selected_name} "
+                                f"shape={tuple(frame.shape)} dtype={frame.dtype} "
+                                f"range=[{int(frame.min())},{int(frame.max())}]",
+                                flush=True,
+                            )
+                            self._rgb_frame_logged = True
+                        return frame
+            if not self._rgb_frame_warned:
+                print("[rgb_camera][warn] camera manager returned no image", flush=True)
+                self._rgb_frame_warned = True
+
+        # Compatibility fallback for older IsaacLab camera sensors.
+        sensors = getattr(getattr(self.env, "scene", None), "sensors", {})
+        for sensor in sensors.values() if hasattr(sensors, "values") else []:
+            data = getattr(sensor, "data", None)
+            output = getattr(data, "output", None)
+            if isinstance(output, dict) and "rgb" in output:
+                frame = output["rgb"]
+                if hasattr(frame, "shape") and frame.ndim >= 4:
+                    frame = frame[0]
+                return frame.detach().cpu() if torch.is_tensor(frame) else frame
+        if self.rgb_camera_manager is not None and not self._rgb_frame_warned:
+            print("[rgb_camera][warn] no RGB frame available from manager or scene sensors", flush=True)
+            self._rgb_frame_warned = True
+        return None
 
 
 def main():

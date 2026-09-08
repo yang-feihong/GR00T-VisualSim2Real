@@ -174,6 +174,8 @@ class B2Z1IsaacLabCfg(LeggedRobotIsaacLabCfg):
         yaw_adaptive_time_min_scale = 1.0
         yaw_adaptive_time_max_scale = 5.0
         ik_damping = 0.05
+        # Higher orientation convergence for scripted physical grasping.
+        teleop_ik_orientation_gain = 4.0
         traj_timesteps_default = 1.0
         traj_total_timesteps_default = 1.0e9
         command_mode = "sphere"
