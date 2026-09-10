@@ -24,7 +24,8 @@ door_spawner_cfg = DoorSpawnerCfg(
     build_latch=True,
     add_floors=True,
     door_open_lr=["right"],
-    door_open_io=["out"],
+    # Current training scope contains push-open doors only.
+    door_open_io=["in"],
     door_handle_tblr=(0.95, 0.85, 0.08, 0.15),
     randomize_material=True,
     use_preloaded_materials=True,

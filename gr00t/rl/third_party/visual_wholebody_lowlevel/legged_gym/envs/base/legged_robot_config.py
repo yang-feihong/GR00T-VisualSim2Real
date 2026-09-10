@@ -188,6 +188,9 @@ class LeggedRobotIsaacLabCfg(DirectRLEnvCfg):
         prim_path="/World/envs/env_.*/Robot/.*",
         history_length=3,
         track_air_time=True,
+        # DoorMan grasping can generate many simultaneous mesh contact
+        # points. Keep enough GPU contact records to avoid PhysX truncation.
+        max_contact_data_count_per_prim=128,
     )
 
     control: ControlCfg = ControlCfg(stiffness={}, damping={})

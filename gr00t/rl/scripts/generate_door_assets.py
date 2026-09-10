@@ -22,7 +22,7 @@ Usage:
         --build_latch \
         --add_floors \
         --door_open_lr right \
-        --door_open_io out
+        --door_open_io in
 """
 
 import argparse
@@ -48,7 +48,7 @@ def parse_args():
     parser.add_argument(
         "--door_open_io",
         nargs="+",
-        default=["out"],
+        default=["in"],
         choices=["in", "out"],
         help="Door opening direction(s) to sample from.",
     )
@@ -443,7 +443,8 @@ def _build_door(
     hinge_joint.CreateBody1Rel().SetTargets([panel_prim_path])
     hinge_joint.GetAxisAttr().Set("Z")
     hinge_joint.CreateLocalPos0Attr().Set(Gf.Vec3f(0.02, -half_door_width * door_open_lr, 0))
-    if door_open_lr == 1:
+    hinge_axis_sign = door_open_lr * door_open_io
+    if hinge_axis_sign < 0:
         hinge_joint.CreateLocalRot0Attr().Set(Gf.Quatf(real=0.0, imaginary=(Gf.Vec3f(1, 0, 0))))
     hinge_joint.GetLowerLimitAttr().Set(0.0)
     hinge_joint.GetUpperLimitAttr().Set(150)

@@ -49,7 +49,8 @@ class DoorSpawnerCfg(sim_utils.RigidObjectSpawnerCfg):
     door_handle_tblr: tuple[float, float, float, float] = (1.0, 0.85, 0.08, 0.15)
     door_handle_type: list[Literal["knob", "lever", "pushbar", "handle", "flat"]] = ["lever"]
     door_open_lr: list[Literal["left", "right"]] = ["left", "right"]
-    door_open_io: list[Literal["in", "out"]] = ["in", "out"]
+    # Current B2Z1 training scope contains push-open doors only.
+    door_open_io: list[Literal["in", "out"]] = ["in"]
     door_weight: tuple[float, float] = (80.0, 120.0)
     add_walls: bool = False
     wall_minimum_clearance_fblr: tuple[float, float, float, float] = (3.0, 3.0, 1.0, 1.0)
@@ -475,7 +476,11 @@ def spawn_door(
     hinge_joint.CreateBody1Rel().SetTargets([panel_prim_path])
     hinge_joint.GetAxisAttr().Set("Z")
     hinge_joint.CreateLocalPos0Attr().Set(Gf.Vec3f(0.02, -half_door_width * door_open_lr, 0))
-    if door_open_lr == 1:
+    # ``in`` doors open away from a robot standing on +X (push), while
+    # ``out`` doors open toward it (pull).  The previous implementation
+    # ignored door_open_io and therefore generated pull doors only.
+    hinge_axis_sign = door_open_lr * door_open_io
+    if hinge_axis_sign < 0:
         hinge_joint.CreateLocalRot0Attr().Set(Gf.Quatf(real=0.0, imaginary=(Gf.Vec3f(1, 0, 0))))
     hinge_joint.GetLowerLimitAttr().Set(0.0)
     hinge_joint.GetUpperLimitAttr().Set(150)

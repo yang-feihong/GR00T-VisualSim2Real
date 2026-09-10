@@ -436,7 +436,10 @@ class LeggedRobotIsaacLab(DirectRLEnv):
                     history_length=8,
                     track_air_time=False,
                     track_contact_points=True,
-                    max_contact_data_count_per_prim=16,
+                    # The finger can contact several capsule/mesh patches at
+                    # once while turning the handle. 16 records caused GPU
+                    # contact data truncation and a CUDA index assertion.
+                    max_contact_data_count_per_prim=128,
                     filter_prim_paths_expr=handle_filter,
                 )
                 sensor = ContactSensor(sensor_cfg)

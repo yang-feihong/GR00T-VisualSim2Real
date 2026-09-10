@@ -519,6 +519,7 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         ee_orn_delta_rpy: torch.Tensor | None = None,
         gripper_target: torch.Tensor | None = None,
         ee_goal_orn_quat_world: torch.Tensor | None = None,
+        ee_goal_orn_quat_world_enabled: bool | torch.Tensor | None = None,
     ):
         """Set persistent teleoperation targets without synthesizing keyboard events.
 
@@ -564,7 +565,20 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
                 )
             quat = quat / torch.linalg.vector_norm(quat, dim=-1, keepdim=True).clamp_min(1.0e-8)
             self.teleop_world_ee_goal_orn_quat.copy_(quat)
-            self.teleop_world_ee_goal_orn_quat_enabled[:] = True
+            if ee_goal_orn_quat_world_enabled is None:
+                self.teleop_world_ee_goal_orn_quat_enabled[:] = True
+        if ee_goal_orn_quat_world_enabled is not None:
+            enabled = torch.as_tensor(
+                ee_goal_orn_quat_world_enabled, device=self.device, dtype=torch.bool
+            )
+            if enabled.ndim == 0:
+                enabled = enabled.expand(self.num_envs)
+            if tuple(enabled.shape) != (self.num_envs,):
+                raise ValueError(
+                    "ee_goal_orn_quat_world_enabled must be a scalar or have shape "
+                    f"{(self.num_envs,)}, got {tuple(enabled.shape)}"
+                )
+            self.teleop_world_ee_goal_orn_quat_enabled.copy_(enabled)
 
         self._teleop_inputs_dirty = True
         self._clip_teleop_targets()
@@ -655,6 +669,16 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
             "ee_goal_cart_local": self.curr_ee_goal_cart.detach().clone(),
             "ee_goal_cart_world": self.curr_ee_goal_cart_world.detach().clone(),
             "ee_goal_delta_rpy": self.ee_goal_orn_delta_rpy.detach().clone(),
+            "ee_goal_orn_quat_world": self.ee_goal_orn_quat.detach().clone(),
+            "ee_goal_orn_quat_world_enabled": self.teleop_world_ee_goal_orn_quat_enabled.detach().clone(),
+            "joint_position_target": self._joint_position_target_buf.detach().clone(),
+            "arm_position_target": (
+                self.target_pos[:, self.arm_joint_ids]
+                if self._arm_pos_targets_for_step is None
+                else self._arm_pos_targets_for_step
+            ).detach().clone(),
+            "applied_torque": self.torques.detach().clone(),
+            "ee_jacobian_arm": None if self.ee_j_eef is None else self.ee_j_eef.detach().clone(),
             "gripper_position": self.dof_pos[:, self.gripper_joint_ids].mean(
                 dim=1, keepdim=True
             ).detach().clone(),
