@@ -456,6 +456,7 @@ class DoorController:
         self.push_target_hinge_angle = None
         self.panel_contact_local = None
         self.panel_center_world = None
+        self.panel_push_world = None
         self.panel_tcp_world = None
         self.panel_precontact_clearance = 0.018
         self.panel_contact_clearance = 0.0
@@ -469,7 +470,16 @@ class DoorController:
         self.push_last_progress_hinge = None
         self.push_no_progress_steps = 0
         self.push_contact_loss_steps = 0
+        self.push_substage = "IMPULSE"
+        self.push_contact_world = None
+        self.push_normal_world = None
+        self.push_orientation = None
+        self.push_peak_hinge = 0.0
+        self.push_coast_steps = 0
+        self.push_depth = 0.0
         self.through_start_base_xy = None
+        self.through_best_distance = 0.0
+        self.through_no_progress_steps = 0
         self.hinge_world = None
         self.hinge_axis_sign = None
         self.final_min_normal_offset = None
@@ -603,7 +613,16 @@ class DoorController:
         self.push_last_progress_hinge = None
         self.push_no_progress_steps = 0
         self.push_contact_loss_steps = 0
+        self.push_substage = "IMPULSE"
+        self.push_contact_world = None
+        self.push_normal_world = None
+        self.push_orientation = None
+        self.push_peak_hinge = 0.0
+        self.push_coast_steps = 0
+        self.push_depth = 0.0
         self.through_start_base_xy = None
+        self.through_best_distance = 0.0
+        self.through_no_progress_steps = 0
         self.push_target_hinge_angle = None
         self.failure_reason = None
         self.center_substage = "CENTER_CLEARANCE"
@@ -641,7 +660,14 @@ class DoorController:
         self._measure_panel_geometry()
         if self.panel_center_world is None:
             raise RuntimeError("door panel collider geometry is unavailable")
-        panel_contact_world = self.panel_center_world + self.door_normal * self.panel_half_thickness
+        panel_radius = self.panel_center_world - self.hinge_world
+        panel_radius -= np.dot(panel_radius, self.door_normal) * self.door_normal
+        panel_radius[2] = 0.0
+        panel_radius /= max(float(np.linalg.norm(panel_radius)), 1.0e-8)
+        # Push well away from the hinge for more torque at a lower contact
+        # force.  Keep the panel's centre height to avoid the handle.
+        self.panel_push_world = self.panel_center_world + 0.28 * panel_radius
+        panel_contact_world = self.panel_push_world + self.door_normal * self.panel_half_thickness
         self.panel_contact_local = _quat_rotate_inverse_np(
             panel_state[3:7], panel_contact_world - panel_state[:3]
         )
@@ -1800,7 +1826,7 @@ class DoorController:
         # Push on the central panel, away from the handle and its return path.
         # The old 35% interpolation left the target close enough to the lever
         # for the fixed finger to strike it during the diagonal approach.
-        panel_surface = self.panel_center_world.copy()
+        panel_surface = self.panel_push_world.copy()
         surface_projection = float(np.dot(self.panel_center_world, self.door_normal)) + self.panel_half_thickness
         panel_surface += (surface_projection - float(np.dot(panel_surface, self.door_normal))) * self.door_normal
         panel_tcp = panel_surface.copy()
@@ -2072,35 +2098,50 @@ class DoorController:
             gripper = -0.785 if self.stage_steps < 40 else 0.0
         elif self.stage in (Stage.CONTACT_PANEL, Stage.PUSH_OPEN):
             if self.stage == Stage.PUSH_OPEN and self.panel_tcp_world is not None:
-                hinge_angle = float(_as_np(state["door_joint_position"])[0, self.hinge_idx])
-                finger_forces = state.get("finger_contact_forces_w")
-                push_force = (
-                    float(np.linalg.norm(_as_np(finger_forces)[0], axis=-1).max())
-                    if finger_forces is not None
-                    else 0.0
-                )
-                if self.push_target_hinge_angle is None:
-                    self.push_target_hinge_angle = self.hinge_axis_sign * math.radians(80.0)
-                # Follow the door around its hinge instead of slewing along a
-                # straight chord to 80 degrees.  The global endpoint remains
-                # fixed, while measured hinge feedback limits the local lead.
-                remaining = self.push_target_hinge_angle - hinge_angle
-                # Do not chase the panel when contact is lost.  A small lead
-                # while touching supplies pressure; an overloaded finger is
-                # moved outward to unload before locomotion resumes.
-                if push_force > 100.0:
-                    angular_lead = -self.hinge_axis_sign * math.radians(0.5)
-                elif push_force >= 0.5:
-                    angular_lead = self.hinge_axis_sign * math.radians(0.6)
+                if self.push_contact_world is None:
+                    self.push_contact_world = _as_np(state["ee_pos"])[0].copy()
+                if self.push_normal_world is None:
+                    hinge_angle = float(_as_np(state["door_joint_position"])[0, self.hinge_idx])
+                    self.push_normal_world = _quat_rotate_np(
+                        self._yaw_quat(hinge_angle), self.door_normal
+                    )
+                if self.push_orientation is None:
+                    self.push_orientation = self.active_grasp_quat.copy()
+                # Follow the measured panel angle with a small force-dependent
+                # angular lead.  Only the arm follows the contact point; the
+                # base command below remains a straight line through the door.
+                if self.push_substage == "IMPULSE":
+                    finger_forces = state.get("finger_contact_forces_w")
+                    push_force = (
+                        float(np.linalg.norm(_as_np(finger_forces)[0], axis=-1).max())
+                        if finger_forces is not None
+                        else 0.0
+                    )
+                    current_hinge = float(
+                        _as_np(state["door_joint_position"])[0, self.hinge_idx]
+                    )
+                    if push_force > 120.0:
+                        lead = -self.hinge_axis_sign * math.radians(0.5)
+                    elif push_force > 75.0:
+                        lead = 0.0
+                    else:
+                        lead = self.hinge_axis_sign * math.radians(0.7)
+                    target_hinge = current_hinge + lead
+                    ee_target_world = self._rotate_about_z(
+                        self.panel_tcp_world, self.hinge_world, target_hinge
+                    )
+                    self.active_grasp_quat = _quat_mul_np(
+                        self._yaw_quat(target_hinge - self.push_start_hinge_angle),
+                        self.push_orientation,
+                    )
                 else:
-                    angular_lead = self.hinge_axis_sign * math.radians(1.2)
-                next_angle = hinge_angle + float(
-                    np.clip(remaining, min(0.0, angular_lead), max(0.0, angular_lead))
-                )
-                ee_target_world = self._rotate_about_z(
-                    self.panel_tcp_world, self.hinge_world,
-                    next_angle,
-                )
+                    retract_fraction = min(1.0, self.push_coast_steps / 30.0)
+                    ee_target_world = (
+                        self.push_contact_world
+                        + (0.12 * retract_fraction) * self.push_normal_world
+                        + np.array([0.0, 0.0, 0.04 * retract_fraction], dtype=np.float32)
+                    )
+                    self.active_grasp_quat = self.push_orientation.copy()
             else:
                 # Freeze the current-door contact pose on stage entry.  A
                 # target recomputed from a swinging panel makes the arm chase
@@ -2154,7 +2195,7 @@ class DoorController:
             if self.stage == Stage.CONTACT_PANEL:
                 max_step = 0.0015 if self.panel_alignment_established else 0.003
             elif self.stage == Stage.PUSH_OPEN:
-                max_step = 0.006
+                max_step = 0.004 if self.push_substage == "IMPULSE" else 0.006
             else:
                 max_step = 0.002 if self.stage == Stage.CENTER_HANDLE and self.center_substage == "CENTER_INSERT" else 0.012
             ee_target_world = self._slew_ee_target(ee_target_world, max_step=max_step)
@@ -2176,27 +2217,29 @@ class DoorController:
             # degree handoff endpoint is reached.
             base_cmd = self._travel_command(state, 0.35) if pushing_to_handoff else np.zeros(3, dtype=np.float32)
         elif self.stage == Stage.PUSH_OPEN:
-            finger_forces = state.get("finger_contact_forces_w")
-            push_force = (
-                float(np.linalg.norm(_as_np(finger_forces)[0], axis=-1).max())
-                if finger_forces is not None
-                else 0.0
-            )
-            # Locomotion is enabled only while the arm has a measured panel
-            # contact.  This prevents the base from walking into a detached
-            # finger and producing a second impact.
-            if push_force > 100.0:
-                push_speed = 0.0
-            elif push_force >= 0.5:
-                push_speed = min(0.30, 0.16 + 0.0015 * self.stage_steps)
+            if self.push_substage == "IMPULSE":
+                # Supply one finite, straight impulse.  This is intentionally
+                # not _push_arc_command(): after contact the robot never
+                # follows the rotating panel around the hinge.
+                finger_forces = state.get("finger_contact_forces_w")
+                push_force = (
+                    float(np.linalg.norm(_as_np(finger_forces)[0], axis=-1).max())
+                    if finger_forces is not None
+                    else 0.0
+                )
+                ramp = min(1.0, self.stage_steps / 150.0)
+                if push_force > 120.0:
+                    push_speed = 0.0
+                elif push_force > 75.0:
+                    push_speed = 0.06
+                else:
+                    push_speed = 0.08 + 0.27 * ramp
+                base_cmd = self._travel_command(state, push_speed)
             else:
-                # The locomotion policy has a sizeable command dead-zone.
-                # Keep orbiting slowly enough to support the arm even while
-                # contact sensing flickers between simulation frames.
-                push_speed = 0.18
-            base_cmd = self._push_arc_command(state, push_speed)
+                base_cmd = np.zeros(3, dtype=np.float32)
         elif self.stage == Stage.THROUGH:
-            base_cmd = self._travel_command(state, 0.55)
+            through_ramp = min(1.0, self.stage_steps / 40.0)
+            base_cmd = self._travel_command(state, 0.20 + 0.35 * through_ramp)
         elif self.stage not in (Stage.APPROACH, Stage.ALIGN):
             base_cmd[:2] = 0.0
             if self.stage != Stage.ALIGN:
@@ -2820,12 +2863,24 @@ class DoorController:
                 self.push_last_progress_hinge = hinge
                 self.push_no_progress_steps = 0
                 self.push_contact_loss_steps = 0
+                self.push_substage = "IMPULSE"
+                self.push_contact_world = ee.copy()
+                self.push_normal_world = _quat_rotate_np(
+                    self._yaw_quat(hinge), self.door_normal
+                )
+                self.push_orientation = _as_np(state["ee_orn"])[0].copy()
+                self.push_peak_hinge = hinge
+                self.push_coast_steps = 0
+                self.push_depth = 0.0
                 self.stage = Stage.PUSH_OPEN; self.stage_steps = 0
         elif self.stage == Stage.PUSH_OPEN:
             finger_force = float(np.max(finger_contact_norms)) if finger_contact_norms.size else 0.0
-            self.push_contact_loss_steps = (
-                0 if finger_force >= 0.5 else self.push_contact_loss_steps + 1
+            hinge_velocity = float(
+                _as_np(state["door_joint_velocity"])[0, self.hinge_idx]
             )
+            opening_speed = self.hinge_axis_sign * hinge_velocity
+            opening_angle = self.hinge_axis_sign * hinge
+            self.push_peak_hinge = max(self.push_peak_hinge, opening_angle)
             if self.push_last_progress_hinge is None:
                 self.push_last_progress_hinge = hinge
             hinge_progress = self.hinge_axis_sign * (hinge - self.push_last_progress_hinge)
@@ -2834,15 +2889,50 @@ class DoorController:
                 self.push_no_progress_steps = 0
             else:
                 self.push_no_progress_steps += 1
-            if self.push_no_progress_steps > 100:
+            if self.push_substage == "IMPULSE":
+                impulse_complete = (
+                    opening_angle >= math.radians(68.0)
+                    or self.stage_steps >= 650
+                )
+                if impulse_complete:
+                    self.push_contact_world = ee.copy()
+                    self.push_normal_world = _quat_rotate_np(
+                        self._yaw_quat(hinge), self.door_normal
+                    )
+                    self.push_orientation = _as_np(state["ee_orn"])[0].copy()
+                    self.push_substage = "COAST"
+                    self.push_coast_steps = 0
+            else:
+                self.push_coast_steps += 1
+            if self.push_substage == "IMPULSE" and self.push_no_progress_steps > 220:
                 self.failure_reason = (
                     f"push_no_progress:hinge={hinge:.4f},"
                     f"start={self.push_start_hinge_angle:.4f}"
                 )
                 self.stage = Stage.FAILURE
-            if self.stage == Stage.PUSH_OPEN and self.hinge_axis_sign * hinge >= math.radians(80.0):
+            # The door may cross 80 degrees while coasting.  Require the arm
+            # to be retracted before the robot starts its straight traversal.
+            if (
+                self.stage == Stage.PUSH_OPEN
+                and self.push_substage == "COAST"
+                and opening_angle >= math.radians(80.0)
+                and self.push_coast_steps >= 25
+            ):
                 self.through_start_base_xy = base_xy.copy()
+                self.through_best_distance = 0.0
+                self.through_no_progress_steps = 0
                 self.stage = Stage.THROUGH; self.stage_steps = 0
+            elif (
+                self.push_substage == "COAST"
+                and self.push_coast_steps > 220
+                and opening_angle < math.radians(80.0)
+                and opening_speed <= 0.0
+            ):
+                self.failure_reason = (
+                    f"push_impulse_insufficient:peak={self.push_peak_hinge:.4f},"
+                    f"hinge={hinge:.4f}"
+                )
+                self.stage = Stage.FAILURE
         elif self.stage == Stage.THROUGH:
             through_origin = (
                 self.through_start_base_xy
@@ -2852,7 +2942,33 @@ class DoorController:
             through_distance = float(
                 np.dot(base_xy - through_origin, self.door_forward[:2])
             )
-            if through_distance > 1.0:
+            opening_angle = self.hinge_axis_sign * hinge
+            base_up = _quat_rotate_np(
+                base[3:7], np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            )
+            upright = float(base_up[2])
+            if through_distance > self.through_best_distance + 0.01:
+                self.through_best_distance = through_distance
+                self.through_no_progress_steps = 0
+            else:
+                self.through_no_progress_steps += 1
+            if upright < 0.75 or base[2] < 0.30:
+                self.failure_reason = (
+                    f"through_robot_fell:up={upright:.3f},height={base[2]:.3f}"
+                )
+                self.stage = Stage.FAILURE
+            elif opening_angle < math.radians(65.0) and through_distance < 0.8:
+                self.failure_reason = (
+                    f"through_door_swingback:hinge={hinge:.4f},"
+                    f"distance={through_distance:.3f}"
+                )
+                self.stage = Stage.FAILURE
+            elif self.through_no_progress_steps > 150:
+                self.failure_reason = (
+                    f"through_no_progress:distance={through_distance:.3f}"
+                )
+                self.stage = Stage.FAILURE
+            elif through_distance > 1.0:
                 self.stage = Stage.RESET_ARM; self.stage_steps = 0
         elif self.stage == Stage.RESET_ARM and reset_arm_dist < 0.10 and speed < 0.10:
             self.stage = Stage.SUCCESS; self.stage_steps = 0
@@ -3021,6 +3137,7 @@ def _serialize_episode(controller, runner, episode_id, seed, output_dir, max_ste
                 f"grasp_orientation_error={controller.ee_orientation_error:.3f} "
                 f"door_joints={door_joint_dbg} "
                 f"panel_settle={controller.panel_contact_settle_steps} "
+                f"push_substage={controller.push_substage} "
                 f"push_progress={push_progress_dbg:.3f} "
                 f"through_distance={through_distance_dbg:.3f} "
                 f"finger_positions={finger_pos_dbg} finger_contact_forces={finger_force_dbg} "
