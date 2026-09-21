@@ -312,6 +312,9 @@ class B2Z1CommandBase(LeggedRobotBase):
         self._lowlevel_ang_vel_scale = float(cmd_cfg.get("lowlevel_ang_vel_scale", 0.25))
         self._lowlevel_dof_pos_scale = float(cmd_cfg.get("lowlevel_dof_pos_scale", 1.0))
         self._lowlevel_dof_vel_scale = float(cmd_cfg.get("lowlevel_dof_vel_scale", 0.05))
+        self._lowlevel_arm_dof_state_obs_scale = float(
+            cmd_cfg.get("lowlevel_arm_dof_state_obs_scale", 1.0)
+        )
         policy_joint_names = list(
             cmd_cfg.get("lowlevel_policy_joint_names", self.config.robot.lower_dof_names)
         )
@@ -554,6 +557,8 @@ class B2Z1CommandBase(LeggedRobotBase):
             self.simulator.dof_pos[:, policy_joint_ids] - self.default_dof_pos[:, policy_joint_ids]
         ) * self._lowlevel_dof_pos_scale
         dof_vel_obs = self.simulator.dof_vel[:, policy_joint_ids] * self._lowlevel_dof_vel_scale
+        dof_pos_obs[:, 12:] *= self._lowlevel_arm_dof_state_obs_scale
+        dof_vel_obs[:, 12:] *= self._lowlevel_arm_dof_state_obs_scale
         if bool(cmd_cfg.get("lowlevel_observe_foot_contacts", False)):
             if bool(cmd_cfg.get("lowlevel_zero_observed_foot_contacts", False)):
                 foot_contacts = torch.zeros(self.num_envs, 4, device=self.device)

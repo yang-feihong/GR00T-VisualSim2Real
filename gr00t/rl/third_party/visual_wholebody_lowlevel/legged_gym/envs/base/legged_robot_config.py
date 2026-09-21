@@ -16,7 +16,7 @@ from isaaclab.actuators import ImplicitActuatorCfg
 _LOW_LEVEL_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_B2Z1_USD = (
     _LOW_LEVEL_ROOT.parents[1]
-    / "data/robots/b2z1_lab30/b2z1_mount_0_x0p22_y0_z0p17.usd"
+    / "data/robots/b2z1_lab30/b2z1_mount_90_x0p22_y0_z0p17.usd"
 )
 
 
@@ -216,6 +216,13 @@ class LeggedRobotIsaacLabCfg(DirectRLEnvCfg):
     enable_doorman_scene: bool = False
     doorman_randomize_robot_init: bool = True
     doorman_robot_side: str = "positive_x"
+    doorman_robot_init_x_range: tuple[float, float] = (0.75, 2.0)
+    doorman_robot_init_y_range: tuple[float, float] = (-2.0, 2.0)
+    doorman_robot_init_yaw_range: tuple[float, float] = (-1.0471975512, 1.0471975512)
+    doorman_arm_joint_init_center: list[float] = field(default_factory=list)
+    doorman_arm_joint_init_delta_rad: float = 0.25
+    doorman_arm_joint_limit_margin_rad: float = 0.02
+    doorman_gripper_joint_init: float | None = None
     doorman_randomize_door_init_state: bool = False
     doorman_door: ArticulationCfg | None = None
     rgb_camera_specs: list = field(default_factory=list)

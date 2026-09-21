@@ -96,6 +96,7 @@ def main():
         DoorSpawnerCfg,
         _update_joint_transform,
         build_frame,
+        sample_hinge_resistance,
     )
     from gr00t.rl.isaac_utils.playground.utils.math_utils import set_prim_transform
     from gr00t.rl.isaac_utils.playground.utils.usd_utils import (
@@ -448,13 +449,17 @@ def _build_door(
         hinge_joint.CreateLocalRot0Attr().Set(Gf.Quatf(real=0.0, imaginary=(Gf.Vec3f(1, 0, 0))))
     hinge_joint.GetLowerLimitAttr().Set(0.0)
     hinge_joint.GetUpperLimitAttr().Set(150)
+    resistance_band, hinge_joint_friction, hinge_drive_damping, hinge_drive_max_force = (
+        sample_hinge_resistance(cfg)
+    )
+    physx_hinge_joint = PhysxSchema.PhysxJointAPI.Apply(hinge_joint.GetPrim())
+    physx_hinge_joint.CreateJointFrictionAttr().Set(hinge_joint_friction)
     hinge_drive = UsdPhysics.DriveAPI.Apply(hinge_joint.GetPrim(), "angular")
-    hinge_drive.GetTargetPositionAttr().Set(-10.0)
-    hinge_drive_max_force = np.random.uniform(2.5, 4.5)
+    hinge_drive.GetTargetPositionAttr().Set(0.0)
+    hinge_drive.GetTargetVelocityAttr().Set(0.0)
     hinge_drive.GetMaxForceAttr().Set(hinge_drive_max_force)
-    hinge_drive.GetDampingAttr().Set(50.0)
-    hinge_drive_stiffness = np.random.uniform(1.0, 10.0)
-    hinge_drive.GetStiffnessAttr().Set(hinge_drive_stiffness)
+    hinge_drive.GetDampingAttr().Set(hinge_drive_damping)
+    hinge_drive.GetStiffnessAttr().Set(0.0)
     _update_joint_transform(stage, hinge_joint_prim_path, root_prim_path, panel_prim_path)
 
     # Handle joint
@@ -480,12 +485,15 @@ def _build_door(
 
     # --- Optional latch ---
     if cfg.build_latch:
+        latch_x = -0.02 + 0.063 * door_open_io
+        latch_edge_inset = 0.0028
+        latch_z = door_handle_height
         latch_link_prim_path = os.path.join(prim_path, "latch_link")
         _create_prim(latch_link_prim_path, "Xform")
         _set_prim_transform(
             stage,
             latch_link_prim_path,
-            (-0.083, (half_door_width - 0.005) * door_open_lr, door_height - 0.1),
+            (latch_x, (half_door_width - latch_edge_inset) * door_open_lr, latch_z),
             (0, 0, 0),
             (1.0, 1.0, 1.0),
         )
@@ -497,7 +505,7 @@ def _build_door(
             stage,
             latch_geom_prim_path,
             (0, 0, 0),
-            (-90 * door_open_lr, 0, -26.56 * door_open_lr),
+            (-90 * door_open_lr, 0, 26.56 * door_open_lr * door_open_io),
             (1.0, 1.0, 1.0),
         )
         cone_geom = UsdGeom.Cone.Define(stage, latch_geom_prim_path)
@@ -513,7 +521,11 @@ def _build_door(
         latch_joint.CreateBody1Rel().SetTargets([latch_link_prim_path])
         latch_joint.GetAxisAttr().Set("Y")
         latch_joint.CreateLocalPos0Attr().Set(
-            Gf.Vec3f(-0.083, (half_door_width - 0.005) * door_open_lr, door_height - 0.1)
+            Gf.Vec3f(
+                latch_x,
+                (half_door_width - latch_edge_inset) * door_open_lr,
+                latch_z,
+            )
         )
         if door_open_lr == 1:
             latch_joint.CreateLocalRot0Attr().Set(
@@ -638,7 +650,10 @@ def _build_door(
         "hookLength": float(hook_length),
         "handleRadius": float(handle_radius),
         "spawnHook": bool(spawn_hook),
+        "hingeResistanceBand": int(resistance_band),
+        "hingeJointFriction": float(physx_hinge_joint.GetJointFrictionAttr().Get()),
         "hingeDriveMaxForce": float(hinge_drive.GetMaxForceAttr().Get()),
+        "hingeDriveDamping": float(hinge_drive.GetDampingAttr().Get()),
         "hingeDriveStiffness": float(hinge_drive.GetStiffnessAttr().Get()),
         "handleDriveMaxForce": float(handle_drive.GetMaxForceAttr().Get()),
     }

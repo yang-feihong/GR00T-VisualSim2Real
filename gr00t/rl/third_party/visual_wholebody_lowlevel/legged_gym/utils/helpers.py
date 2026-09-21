@@ -14,6 +14,7 @@ for p in [str(LOW_LEVEL_ROOT)]:
     sys.path.insert(0, p)
 
 from legged_gym.utils import isaaclab_app, run_metadata
+from legged_gym.utils.b2z1_mount import mount_deg_to_rad
 
 OBSERVATION_BASE_PROPRIO = 2 + 3 + 18 + 18 + 12 + 3 + 3 + 3
 COMMAND_SCHEDULE_NAMES = (
@@ -123,14 +124,17 @@ def build_common_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable_doorman_scene", action="store_true")
     parser.add_argument("--doorman_door_open_lr", type=str, choices=["left", "right"], default=None)
     parser.add_argument("--doorman_randomize_robot_init", type=str_to_bool, nargs="?", const=True, default=True)
+    parser.add_argument("--doorman_arm_joint_init_center", type=float, nargs=6, default=None)
+    parser.add_argument("--doorman_gripper_joint_init", type=float, default=None)
     parser.add_argument("--doorman_randomize_door_init_state", type=str_to_bool, nargs="?", const=True, default=False)
     parser.add_argument("--robot_usd_path", type=str, default=None)
+    parser.add_argument("--mount_deg", type=float, default=None)
     parser.add_argument("--ee_goal_obs_mode", type=str, default=None)
     parser.add_argument(
         "--ee_goal_sampling_mode",
         type=str,
         default=None,
-        choices=["arm_front_sphere", "omnidirectional", "body_importance", "body_importance_single_dir"],
+        choices=["arm_front_sphere", "fk_reachable", "omnidirectional", "body_importance", "body_importance_single_dir"],
     )
     parser.add_argument("--trunk_follow_arm_obs_mode", type=str, default=None)
     parser.add_argument("--trunk_follow_ratio", type=float, default=None)
@@ -191,6 +195,8 @@ def _apply_checkpoint_goal_and_observation_args(cfg, features: dict):
     cfg.goal_ee.sphere_center.mixed_height_reference = bool(features["mixed_height_reference"])
     cfg.env.observe_gait_commands = bool(features["observe_gait_commands"])
     cfg.env.observe_foot_contacts = bool(features["observe_foot_contacts"])
+    if "arm_dof_state_obs_scale" in features:
+        cfg.env.arm_dof_state_obs_scale = float(features["arm_dof_state_obs_scale"])
 
 
 def _apply_checkpoint_observation_dim_args(cfg, metadata: dict):
@@ -227,10 +233,12 @@ def _apply_checkpoint_policy_control_args(cfg, metadata: dict):
         cfg.obs_scales["lin_vel"],
         cfg.obs_scales["ang_vel"],
     ]
-    cfg.action_delay = int(env_metadata["action_delay"])
-    cfg.env.action_delay = int(env_metadata["action_delay"])
-    cfg.action_delay_mode = str(env_metadata["action_delay_mode"])
-    cfg.env.action_delay_mode = str(env_metadata["action_delay_mode"])
+    if "action_delay" in env_metadata:
+        cfg.action_delay = int(env_metadata["action_delay"])
+        cfg.env.action_delay = int(env_metadata["action_delay"])
+    if "action_delay_mode" in env_metadata:
+        cfg.action_delay_mode = str(env_metadata["action_delay_mode"])
+        cfg.env.action_delay_mode = str(env_metadata["action_delay_mode"])
 
 
 def _apply_checkpoint_gait_args(cfg, features: dict):
@@ -287,6 +295,11 @@ def _apply_cli_scene_args(cfg, args):
         cfg.scene.replicate_physics = False
         cfg.doorman_randomize_robot_init = bool(args.doorman_randomize_robot_init)
         cfg.doorman_robot_side = str(getattr(args, "robot_side", "positive_x"))
+        if args.doorman_arm_joint_init_center is not None:
+            cfg.doorman_arm_joint_init_center = [
+                float(value) for value in args.doorman_arm_joint_init_center
+            ]
+        cfg.doorman_gripper_joint_init = args.doorman_gripper_joint_init
         cfg.doorman_randomize_door_init_state = bool(args.doorman_randomize_door_init_state)
         cfg.doorman_door = build_training_doorman_door_cfg(args.num_envs, args.doorman_door_open_lr)
         print("[doorman] using the high-level training DoorSpawner configuration")
@@ -299,6 +312,8 @@ def _apply_cli_robot_args(cfg, args, for_play: bool, checkpoint_features):
     if not Path(cfg.robot_usd_path).is_file():
         raise FileNotFoundError(f"B2Z1 USD not found: {cfg.robot_usd_path}")
     cfg.robot.spawn.usd_path = cfg.robot_usd_path
+    if args.mount_deg is not None:
+        cfg.goal_ee.urdf_mount.mount_yaw_offset = mount_deg_to_rad(args.mount_deg)
 
 
 def _apply_cli_goal_and_observation_args(cfg, args):

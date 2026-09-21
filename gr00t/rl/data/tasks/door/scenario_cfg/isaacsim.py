@@ -23,9 +23,12 @@ door_spawner_cfg = DoorSpawnerCfg(
     activate_contact_sensors=True,
     build_latch=True,
     add_floors=True,
-    door_open_lr=["right"],
+    door_open_lr=["left", "right"],
     # Current training scope contains push-open doors only.
     door_open_io=["in"],
+    # Passive resistance is randomized with a 70/25/5 low/medium/high mixture.
+    # Zero stiffness means damping and friction never pull the door closed.
+    rand_hinge_drive_stiffness=0.0,
     door_handle_tblr=(0.95, 0.85, 0.08, 0.15),
     randomize_material=True,
     use_preloaded_materials=True,

@@ -12,7 +12,7 @@
     "target_offset_leaf_m": [0.10, -0.065, 0.0],
     "view_axis_reference": "door_leaf",
     "view_axis_local": [0.0, 1.0, 0.0],
-    "view_axis_direction_sign": -1.0,
+    "view_axis_direction_mode": "handle_end",
     "axis_distance_m": 0.30,
     "fill_light_up_offset_m": 0.06,
     "fill_light_right_offset_m": 0.04,
@@ -33,6 +33,19 @@
     "fill_light_right_offset_m": 0.04,
     "fill_light_intensity": 80000.0,
     "fill_light_radius_m": 0.035
+  },
+  "door_world_diagnostic": {
+    "camera_name": "door_world_diagnostic",
+    "recording_name": "door_world",
+    "target_reference": "door_leaf_bounds_center",
+    "target_offset_leaf_m": [0.0, 0.0, 0.0],
+    "view_axis_reference": "push_side",
+    "view_axis_local": [1.0, 0.0, 0.0],
+    "view_axis_direction_mode": "explicit",
+    "view_axis_direction_sign": 1.0,
+    "axis_distance_m": 2.0,
+    "mount_frame": "world",
+    "minimum_push_side_offset_m": 0.05
   },
   "defaults": {
     "mode": "mono",
@@ -88,8 +101,9 @@
     "rotation 按固定轴 Euler XYZ 的 [roll, pitch, yaw] 顺序转换为 wxyz 四元数，单位是弧度；随后与挂载刚体的世界姿态相乘。",
     "相机姿态使用 IsaacLab Camera 的 world convention：局部 +X 为光轴正向、局部 +Z 为上方；IsaacLab 内部再转换成 USD/OpenGL 的 -Z 光轴、+Y 向上约定。",
     "固定安装的 URDF 传感器子 link，例如 f_dc_link、f_oc_link、lidar_link，不逐个列出；通常用 base_link 或 trunk 加局部偏移即可表达。",
-    "门板诊断相机由训练或遥操场景中的 door articulation 选择目标门。target_reference=handle_joint 时，观察中心由该门的把手刚体自动推导；target_offset_leaf_m 是门板刚体局部坐标系中的构图偏移。door_face_reference=robot 会根据门板法向和机器人根节点位置，将目标点约束到机器狗当前所在门面。view_axis_reference 和 view_axis_local 只定义侧视轴或俯视轴，view_axis_direction_sign 只选择该轴的观察端，不表示门的正反面。",
-    "door_panel_diagnostic 沿把手轴向观察夹持截面；door_panel_top_diagnostic 固定在门板坐标系中，从上方俯视轴座、握把和夹爪，用于判断实际握点沿把手长度的位置。两者都随门板运动，但不会跟随把手下压转动。"
+    "门板诊断相机由训练或遥操场景中的 door articulation 选择目标门。target_reference=handle_joint 时，观察中心由该门的把手刚体自动推导，并根据铰链所在侧镜像到把手自由端；door_leaf_bounds_center 使用门板碰撞体中心。target_offset_leaf_m 是门板刚体局部坐标系中的构图偏移。door_face_reference=robot 会根据门板法向和机器人根节点位置，将目标点约束到机器狗当前所在门面。view_axis_direction_mode=handle_end 会把相机固定在把手自由端一侧。",
+    "door_panel_diagnostic 从把手自由端看向轴座；door_panel_top_diagnostic 固定在门板坐标系中，从上方俯视轴座、握把和夹爪；door_world_diagnostic 固定在世界系中，位于关闭门板的推门侧约2米处，正对门板中心。前两者随门板运动，世界相机不会随门运动。",
+    "robot_top_diagnostic 使用 base_height_invariant 坐标系：跟随机器人根节点 x、y 和 yaw，但不跟随机身高度、roll 或 pitch；相机保持在局部地面上方3米并严格向下观察。"
   ],
   "cameras": [
     {
@@ -109,6 +123,19 @@
       "topic_prefix": "/xr_teleop/rgb/trunk_front",
       "position": [0.46, 0.0, 0.01],
       "rotation": [-1.5707963268, 0.0, 0.0]
+    },
+    {
+      "name": "robot_top_diagnostic",
+      "enabled": true,
+      "mode": "mono",
+      "body_name": "base_link",
+      "pose_reference": "base_height_invariant",
+      "topic_prefix": "/diagnostics/robot_top",
+      "position": [0.0, 0.0, 3.0],
+      "rotation": [0.0, 1.5707963268, 0.0],
+      "projection_type": "pinhole",
+      "horizontal_fov": 70.0,
+      "valid_circle_mask": {"enabled": false}
     },
     {
       "name": "door_panel_diagnostic",
@@ -132,6 +159,18 @@
       "rotation": [0.0, 0.0, 0.0],
       "projection_type": "pinhole",
       "horizontal_fov": 55.0,
+      "valid_circle_mask": {"enabled": false}
+    },
+    {
+      "name": "door_world_diagnostic",
+      "enabled": true,
+      "mode": "mono",
+      "body_name": "base_link",
+      "topic_prefix": "/diagnostics/door_world",
+      "position": [0.0, 0.0, 0.0],
+      "rotation": [0.0, 0.0, 0.0],
+      "projection_type": "pinhole",
+      "horizontal_fov": 70.0,
       "valid_circle_mask": {"enabled": false}
     }
   ]

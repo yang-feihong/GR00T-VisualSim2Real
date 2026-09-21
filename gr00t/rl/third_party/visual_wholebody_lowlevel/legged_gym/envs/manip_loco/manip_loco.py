@@ -182,6 +182,7 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         self.ee_goal_sampling_mode = str(ranges_cfg.ee_goal_sampling_mode)
         valid_goal_sampling_modes = (
             "arm_front_sphere",
+            "fk_reachable",
             "omnidirectional",
             "body_importance",
             "body_importance_single_dir",
@@ -1366,11 +1367,42 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
             dpose[3:, 0] *= orientation_gain
 
         damping_sq = np.float32(float(self.cfg.goal_ee.ik_damping) ** 2)
-        j_t = jac.T
-        a = jac @ j_t
-        a.flat[::7] += damping_sq
-        delta_q = (j_t @ np.linalg.solve(a, dpose)).reshape(-1).astype(np.float32, copy=False)
-        target_np = (arm_q + delta_q).reshape(1, -1)
+        # Solve the damped least-squares step inside the articulation limits.
+        # The unconstrained pseudoinverse can request several radians beyond a
+        # wrist limit.  Once the actuator saturates, repeatedly solving around
+        # that impossible target prevents the remaining joints from taking up
+        # the Cartesian error and traps IK on the wrong branch.
+        limits = self.dof_pos_limits[self.arm_joint_ids].detach().cpu().numpy()
+        margin = np.float32(1.0e-3)
+        lower_delta = limits[:, 0] + margin - arm_q
+        upper_delta = limits[:, 1] - margin - arm_q
+        delta_q = np.zeros_like(arm_q)
+        free = np.ones(arm_q.shape[0], dtype=bool)
+        rhs = dpose[:, 0]
+        for _ in range(arm_q.shape[0] + 1):
+            if not np.any(free):
+                break
+            active = ~free
+            residual = rhs - jac[:, active] @ delta_q[active]
+            j_free = jac[:, free]
+            normal = j_free.T @ j_free
+            normal.flat[:: normal.shape[0] + 1] += damping_sq
+            candidate = np.linalg.solve(normal, j_free.T @ residual)
+            free_indices = np.flatnonzero(free)
+            below = candidate < lower_delta[free]
+            above = candidate > upper_delta[free]
+            if not np.any(below | above):
+                delta_q[free] = candidate
+                break
+            violating_indices = free_indices[below | above]
+            violating_values = candidate[below | above]
+            delta_q[violating_indices] = np.where(
+                violating_values < lower_delta[violating_indices],
+                lower_delta[violating_indices],
+                upper_delta[violating_indices],
+            )
+            free[violating_indices] = False
+        target_np = np.clip(arm_q + delta_q, limits[:, 0] + margin, limits[:, 1] - margin).reshape(1, -1)
 
         target_buf = getattr(self, "_arm_pos_target_cpu_fast_buf", None)
         if (

@@ -11,6 +11,10 @@ import isaaclab.sim as sim_utils
 from isaaclab.utils.math import quat_from_matrix, quat_inv
 
 from legged_gym.utils.isaaclab_math import quat_rotate_inverse, quat_mul, quat_apply, quat_from_euler_xyz, euler_from_quat, torch_rand_float, wrap_to_pi
+from legged_gym.utils.door_diagnostic_camera import (
+    closed_leaf_pose,
+    infer_push_side_leaf,
+)
 from .legged_robot_config import LeggedRobotIsaacLabCfg
 import numpy as np
 
@@ -751,6 +755,7 @@ class LeggedRobotIsaacLab(DirectRLEnv):
             self._rgb_camera_rigs[mount_name] = {
                 "mode": camera_mode,
                 "body_name": body_name,
+                "pose_reference": str(spec.get("pose_reference", "body")),
                 "backend": "tiled",
                 "pose_update": True,
                 "valid_circle_mask": valid_circle_mask,
@@ -817,7 +822,7 @@ class LeggedRobotIsaacLab(DirectRLEnv):
                 camera = Camera(camera_cfg)
                 self._apply_rgb_camera_lens_calibration(camera_cfg.prim_path, spec)
                 diagnostic = spec.get("door_diagnostic")
-                if diagnostic:
+                if diagnostic and float(diagnostic["fill_light_intensity"]) > 0.0:
                     light_cfg = sim_utils.SphereLightCfg(
                         intensity=float(diagnostic["fill_light_intensity"]),
                         radius=float(diagnostic["fill_light_radius_m"]),
@@ -839,6 +844,7 @@ class LeggedRobotIsaacLab(DirectRLEnv):
             self._rgb_camera_rigs[mount_name] = {
                 "mode": camera_mode,
                 "body_name": body_name,
+                "pose_reference": str(spec.get("pose_reference", "body")),
                 "backend": resolved_backend,
                 "pose_update": True,
                 "door_diagnostic": spec.get("door_diagnostic"),
@@ -931,12 +937,47 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         if rig.get("door_diagnostic"):
             self._update_door_rgb_camera_world_pose(rig, env_id)
             return
+        if rig.get("pose_reference") == "base_height_invariant":
+            self._update_height_invariant_rgb_camera_pose(rig, env_id)
+            return
         env_id = int(env_id)
         env_ids_t = torch.tensor([env_id], dtype=torch.long, device=self.device)
         body_pos_w, body_quat_w = self._get_rgb_camera_body_state_w(str(rig["body_name"]), env_ids_t)
         body_pos_w_np = body_pos_w[0].detach().cpu().numpy()
         body_quat_w_np = body_quat_w[0].detach().cpu().numpy()
         positions, orientations = self._fill_rgb_camera_pose_arrays(rig, body_pos_w_np, body_quat_w_np)
+        self._set_rgb_camera_world_poses_from_arrays(rig, positions, orientations)
+
+    def _update_height_invariant_rgb_camera_pose(self, rig, env_id):
+        """Follow base x/y/yaw while rejecting body height, roll, and pitch."""
+        env_id = int(env_id)
+        env_ids = torch.tensor([env_id], dtype=torch.long, device=self.device)
+        if hasattr(self, "get_invariant_goal_reference_origin"):
+            origin = self.get_invariant_goal_reference_origin(env_ids)[0]
+        else:
+            origin = self.robot.data.root_pos_w[env_id].clone()
+            origin[2] = 0.0
+        root_quat = self.robot.data.root_quat_w[env_id]
+        w, x, y, z = root_quat
+        yaw = torch.atan2(
+            2.0 * (w * z + x * y),
+            1.0 - 2.0 * (y * y + z * z),
+        )
+        half_yaw = 0.5 * yaw
+        yaw_quat = np.asarray(
+            [
+                float(torch.cos(half_yaw).item()),
+                0.0,
+                0.0,
+                float(torch.sin(half_yaw).item()),
+            ],
+            dtype=np.float32,
+        )
+        positions, orientations = self._fill_rgb_camera_pose_arrays(
+            rig,
+            origin.detach().cpu().numpy(),
+            yaw_quat,
+        )
         self._set_rgb_camera_world_poses_from_arrays(rig, positions, orientations)
 
     def _initialize_door_rgb_camera_local_pose(self, rig, env_id):
@@ -958,8 +999,31 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         handle_quat = self.door.data.body_quat_w[env_id, handle_id]
         diagnostic = rig["door_diagnostic"]
 
+        if diagnostic["mount_frame"] == "world":
+            self._initialize_world_door_rgb_camera_pose(
+                rig, env_id, panel_id, panel_pos, panel_quat
+            )
+            return
+
+        offset_leaf = np.asarray(
+            diagnostic["target_offset_leaf_m"], dtype=np.float64
+        ).copy()
+        free_end_lateral_sign = None
+        if diagnostic["target_reference"] == "handle_joint":
+            hinge_pivot_leaf, _, handle_pivot_leaf, _ = (
+                self._door_diagnostic_geometry(env_id)
+            )
+            lateral_delta = float(hinge_pivot_leaf[1] - handle_pivot_leaf[1])
+            if abs(lateral_delta) <= 1.0e-9:
+                raise RuntimeError(
+                    "Door handle free-end direction is undefined along the door width."
+                )
+            # DoorMan lever handles point from the axle toward the hinge side.
+            # Mirror the configured along-handle offset for left/right doors.
+            free_end_lateral_sign = math.copysign(1.0, lateral_delta)
+            offset_leaf[1] = abs(float(offset_leaf[1])) * free_end_lateral_sign
         offset = torch.tensor(
-            diagnostic["target_offset_leaf_m"], device=self.device, dtype=panel_pos.dtype
+            offset_leaf, device=self.device, dtype=panel_pos.dtype
         )
         offset_w = quat_apply(panel_quat.unsqueeze(0), offset.unsqueeze(0))[0]
         panel_normal_local = torch.tensor(
@@ -979,9 +1043,25 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         )
         axis_quat = handle_quat if diagnostic["view_axis_reference"] == "handle_body" else panel_quat
         axis = quat_apply(axis_quat.unsqueeze(0), axis_local.unsqueeze(0))[0]
-        axis = torch.nn.functional.normalize(axis, dim=0) * float(
-            diagnostic["view_axis_direction_sign"]
-        )
+        axis = torch.nn.functional.normalize(axis, dim=0)
+        if diagnostic["view_axis_direction_mode"] == "handle_end":
+            if free_end_lateral_sign is None:
+                raise ValueError(
+                    "view_axis_direction_mode='handle_end' requires "
+                    "target_reference='handle_joint'."
+                )
+            free_end_leaf = torch.tensor(
+                [0.0, free_end_lateral_sign, 0.0],
+                device=self.device,
+                dtype=panel_pos.dtype,
+            )
+            free_end_world = quat_apply(
+                panel_quat.unsqueeze(0), free_end_leaf.unsqueeze(0)
+            )[0]
+            if torch.dot(axis, free_end_world) < 0.0:
+                axis = -axis
+        else:
+            axis = axis * float(diagnostic["view_axis_direction_sign"])
         camera_pos = target + float(diagnostic["axis_distance_m"]) * axis
         forward = -axis
         up_hint = torch.tensor([0.0, 0.0, 1.0], device=self.device, dtype=panel_pos.dtype)
@@ -1002,20 +1082,222 @@ class LeggedRobotIsaacLab(DirectRLEnv):
             f"[rgb_camera][door] {diagnostic['camera_name']}: "
             f"robot_side={float(robot_side):.4f} target_side={float(target_side):.4f} "
             f"camera_side={float(camera_side):.4f} "
+            f"free_end_lateral_sign={free_end_lateral_sign} "
             f"robot={robot_pos.detach().cpu().tolist()} "
             f"target={target.detach().cpu().tolist()} "
             f"camera={camera_pos.detach().cpu().tolist()}"
         )
 
+    @staticmethod
+    def _door_leaf_local_bounds(stage, collider_prim, body_prim):
+        from pxr import Gf, Usd, UsdGeom
+
+        if collider_prim.IsA(UsdGeom.Cube):
+            half_size = 0.5 * float(UsdGeom.Cube(collider_prim).GetSizeAttr().Get())
+            collider_to_body, _ = UsdGeom.XformCache().ComputeRelativeTransform(
+                collider_prim, body_prim
+            )
+            corners = np.asarray(
+                [
+                    collider_to_body.Transform(Gf.Vec3d(x, y, z))
+                    for x in (-half_size, half_size)
+                    for y in (-half_size, half_size)
+                    for z in (-half_size, half_size)
+                ],
+                dtype=np.float64,
+            )
+            return corners.min(axis=0), corners.max(axis=0)
+
+        bbox = UsdGeom.BBoxCache(
+            Usd.TimeCode.Default(),
+            [UsdGeom.Tokens.default_, UsdGeom.Tokens.proxy, UsdGeom.Tokens.render],
+            useExtentsHint=True,
+        ).ComputeWorldBound(collider_prim).ComputeAlignedRange()
+        body_inverse = UsdGeom.Xformable(body_prim).ComputeLocalToWorldTransform(
+            Usd.TimeCode.Default()
+        ).GetInverse()
+        minimum = bbox.GetMin()
+        maximum = bbox.GetMax()
+        corners = []
+        for x in (minimum[0], maximum[0]):
+            for y in (minimum[1], maximum[1]):
+                for z in (minimum[2], maximum[2]):
+                    local = body_inverse.Transform(Gf.Vec3d(float(x), float(y), float(z)))
+                    corners.append((float(local[0]), float(local[1]), float(local[2])))
+        corners = np.asarray(corners, dtype=np.float64)
+        return corners.min(axis=0), corners.max(axis=0)
+
+    def _door_diagnostic_geometry(self, env_id):
+        import isaaclab.sim as sim_utils
+        from pxr import Gf, UsdPhysics
+
+        root_paths = list(self.door.root_physx_view.prim_paths)
+        if env_id >= len(root_paths):
+            raise RuntimeError(
+                f"Door diagnostic camera env_id={env_id} exceeds door roots {root_paths}."
+            )
+        root_path = str(root_paths[env_id])
+        stage = sim_utils.get_current_stage()
+        hinge_prims = [
+            prim
+            for prim in stage.Traverse()
+            if prim.GetPath().pathString.startswith(f"{root_path}/")
+            and prim.GetName().lower() == "hinge_joint"
+            and prim.IsA(UsdPhysics.RevoluteJoint)
+        ]
+        if len(hinge_prims) != 1:
+            raise RuntimeError(
+                f"Expected one hinge_joint below {root_path}, got "
+                f"{[prim.GetPath().pathString for prim in hinge_prims]}."
+            )
+        hinge_prim = hinge_prims[0]
+        hinge_joint = UsdPhysics.RevoluteJoint(hinge_prim)
+        hinge_joint_base = UsdPhysics.Joint(hinge_prim)
+        panel_targets = hinge_joint_base.GetBody1Rel().GetTargets()
+        if len(panel_targets) != 1:
+            raise RuntimeError(
+                f"Expected one door panel body target for {hinge_prim.GetPath()}, "
+                f"got {panel_targets}."
+            )
+        panel_path = panel_targets[0].pathString
+        panel_prim = stage.GetPrimAtPath(panel_path)
+        panel_collider = stage.GetPrimAtPath(f"{panel_path}/panel")
+        if not panel_collider.IsValid():
+            raise RuntimeError(f"Door panel collider is missing: {panel_path}/panel")
+
+        axis_basis = {
+            "X": Gf.Vec3f(1.0, 0.0, 0.0),
+            "Y": Gf.Vec3f(0.0, 1.0, 0.0),
+            "Z": Gf.Vec3f(0.0, 0.0, 1.0),
+        }
+        hinge_axis = axis_basis[str(hinge_joint.GetAxisAttr().Get())]
+        hinge_rotation_leaf = hinge_joint_base.GetLocalRot1Attr().Get()
+        hinge_axis_leaf = np.asarray(
+            hinge_rotation_leaf.Transform(hinge_axis), dtype=np.float64
+        )
+        hinge_pivot_leaf = np.asarray(
+            hinge_joint_base.GetLocalPos1Attr().Get(), dtype=np.float64
+        )
+
+        handle_prim = stage.GetPrimAtPath(f"{panel_path}/handle_joint")
+        if not handle_prim.IsValid() or not handle_prim.IsA(UsdPhysics.RevoluteJoint):
+            raise RuntimeError(f"Door handle joint is missing: {panel_path}/handle_joint")
+        handle_joint_base = UsdPhysics.Joint(handle_prim)
+        handle_pivot_leaf = np.asarray(
+            handle_joint_base.GetLocalPos0Attr().Get(), dtype=np.float64
+        )
+        leaf_bounds = self._door_leaf_local_bounds(
+            stage, panel_collider, panel_prim
+        )
+        return hinge_pivot_leaf, hinge_axis_leaf, handle_pivot_leaf, leaf_bounds
+
+    def _initialize_world_door_rgb_camera_pose(
+        self, rig, env_id, panel_id, panel_pos, panel_quat
+    ):
+        diagnostic = rig["door_diagnostic"]
+        if diagnostic["target_reference"] != "door_leaf_bounds_center":
+            raise ValueError(
+                "World-mounted door diagnostic cameras currently require "
+                "target_reference='door_leaf_bounds_center'."
+            )
+        if diagnostic["view_axis_reference"] != "push_side":
+            raise ValueError(
+                "World-mounted door diagnostic cameras currently require "
+                "view_axis_reference='push_side'."
+            )
+        hinge_pivot_leaf, hinge_axis_leaf, handle_pivot_leaf, leaf_bounds = (
+            self._door_diagnostic_geometry(env_id)
+        )
+        joint_names = list(self.door.data.joint_names)
+        hinge_indices = [
+            index for index, name in enumerate(joint_names) if "hinge" in name.lower()
+        ]
+        if len(hinge_indices) != 1:
+            raise RuntimeError(
+                f"Expected one hinge joint for door diagnostic camera, got {joint_names}."
+            )
+        hinge_angle = float(
+            self.door.data.joint_pos[env_id, hinge_indices[0]].detach().cpu().item()
+        )
+        panel_position = panel_pos.detach().cpu().numpy().astype(np.float64)
+        panel_quaternion = panel_quat.detach().cpu().numpy().astype(np.float64)
+        panel_rotation = np.column_stack(
+            tuple(
+                self._quat_rotate_np_wxyz(panel_quaternion, axis)
+                for axis in np.eye(3, dtype=np.float64)
+            )
+        )
+        closed_position, closed_rotation = closed_leaf_pose(
+            panel_position,
+            panel_rotation,
+            hinge_pivot_leaf,
+            hinge_axis_leaf,
+            hinge_angle,
+        )
+        # The generated DoorMan articulation uses positive hinge travel as its
+        # opening direction for both mirrored hinge layouts.
+        push_side_leaf = infer_push_side_leaf(
+            hinge_axis_leaf,
+            1.0,
+            hinge_pivot_leaf,
+            handle_pivot_leaf,
+        )
+        push_side_world = closed_rotation @ push_side_leaf
+        door_center_leaf = 0.5 * (leaf_bounds[0] + leaf_bounds[1])
+        target_leaf = door_center_leaf + np.asarray(
+            diagnostic["target_offset_leaf_m"], dtype=np.float64
+        )
+        target = closed_position + closed_rotation @ target_leaf
+        axis = push_side_world.copy()
+        axis /= np.linalg.norm(axis)
+        axis *= float(diagnostic["view_axis_direction_sign"])
+        camera_position = target + float(diagnostic["axis_distance_m"]) * axis
+        minimum_push_side_offset = float(diagnostic["minimum_push_side_offset_m"])
+        door_center_world = closed_position + closed_rotation @ door_center_leaf
+        push_side_offset = float(
+            np.dot(camera_position - door_center_world, push_side_world)
+        )
+        if push_side_offset < minimum_push_side_offset:
+            camera_position += (
+                minimum_push_side_offset - push_side_offset
+            ) * push_side_world
+
+        forward = target - camera_position
+        forward /= np.linalg.norm(forward)
+        up_hint = np.asarray([0.0, 0.0, 1.0], dtype=np.float64)
+        if abs(float(np.dot(up_hint, forward))) > 0.95:
+            up_hint = np.asarray([0.0, 1.0, 0.0], dtype=np.float64)
+        right = np.cross(up_hint, forward)
+        right /= np.linalg.norm(right)
+        up = np.cross(forward, right)
+        camera_rotation = np.column_stack((forward, right, up))
+        camera_quat = quat_from_matrix(
+            torch.as_tensor(
+                camera_rotation, dtype=panel_pos.dtype, device=self.device
+            ).unsqueeze(0)
+        )[0]
+        rig["_door_world_pose"] = (
+            torch.as_tensor(camera_position, dtype=panel_pos.dtype, device=self.device),
+            camera_quat,
+        )
+        print(
+            f"[rgb_camera][door] {diagnostic['camera_name']}: mount=world "
+            f"target={target.tolist()} camera={camera_position.tolist()} "
+            f"push_side={push_side_world.tolist()} distance={float(np.linalg.norm(camera_position - target)):.4f}"
+        )
+
     def _update_door_rgb_camera_world_pose(self, rig, env_id):
         env_id = int(env_id)
-        if rig.get("_door_local_pose") is None:
+        if rig.get("_door_local_pose") is None and rig.get("_door_world_pose") is None:
             self._initialize_door_rgb_camera_local_pose(rig, env_id)
-        local_pos, local_quat, panel_id = rig["_door_local_pose"]
-        panel_pos = self.door.data.body_pos_w[env_id, panel_id]
-        panel_quat = self.door.data.body_quat_w[env_id, panel_id]
-        camera_pos = panel_pos + quat_apply(panel_quat.unsqueeze(0), local_pos.unsqueeze(0))[0]
-        camera_quat = quat_mul(panel_quat.unsqueeze(0), local_quat.unsqueeze(0))[0]
+        if rig.get("_door_world_pose") is not None:
+            camera_pos, camera_quat = rig["_door_world_pose"]
+        else:
+            local_pos, local_quat, panel_id = rig["_door_local_pose"]
+            panel_pos = self.door.data.body_pos_w[env_id, panel_id]
+            panel_quat = self.door.data.body_quat_w[env_id, panel_id]
+            camera_pos = panel_pos + quat_apply(panel_quat.unsqueeze(0), local_pos.unsqueeze(0))[0]
+            camera_quat = quat_mul(panel_quat.unsqueeze(0), local_quat.unsqueeze(0))[0]
         positions = camera_pos.detach().cpu().numpy().reshape(1, 3)
         orientations = camera_quat.detach().cpu().numpy().reshape(1, 4)
         self._set_rgb_camera_world_poses_from_arrays(rig, positions, orientations)
@@ -1035,6 +1317,8 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         body_indices = []
         for rig in rigs:
             if rig.get("door_diagnostic"):
+                continue
+            if rig.get("pose_reference") == "base_height_invariant":
                 continue
             body_name = str(rig["body_name"])
             if body_name in body_names:
@@ -1067,6 +1351,11 @@ class LeggedRobotIsaacLab(DirectRLEnv):
             if rig.get("door_diagnostic"):
                 set_start = time.perf_counter()
                 self._update_door_rgb_camera_world_pose(rig, env_id)
+                set_total += time.perf_counter() - set_start
+                continue
+            if rig.get("pose_reference") == "base_height_invariant":
+                set_start = time.perf_counter()
+                self._update_height_invariant_rgb_camera_pose(rig, env_id)
                 set_total += time.perf_counter() - set_start
                 continue
             body_row = body_name_to_row[str(rig["body_name"])]
@@ -1736,6 +2025,7 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         dof_vel_for_obs = self.dof_vel
         if (
             self._use_default_trunk_follow_policy_obs()
+            and self.ee_goal_sampling_mode != "fk_reachable"
             and torch.any(self.goal_height_follow_mask)
             and self.arm_joint_ids.numel() > 0
         ):
@@ -1760,7 +2050,7 @@ class LeggedRobotIsaacLab(DirectRLEnv):
             dof_vel_obs = self._env_to_policy_all(
                 dof_vel_for_obs * self.obs_scales.dof_vel
             )[:, :-self.num_gripper_joints]
-            return dof_pos_obs, dof_vel_obs
+            return self._scale_arm_dof_observations(dof_pos_obs, dof_vel_obs)
 
         obs_joint_ids = self._policy_obs_joint_ids
         dof_pos_obs = self._dof_pos_obs_buf
@@ -1769,11 +2059,19 @@ class LeggedRobotIsaacLab(DirectRLEnv):
 
         dof_vel_obs = self._dof_vel_obs_buf
         torch.mul(self.dof_vel[:, obs_joint_ids], self.obs_scales.dof_vel, out=dof_vel_obs)
+        return self._scale_arm_dof_observations(dof_pos_obs, dof_vel_obs)
+
+    def _scale_arm_dof_observations(self, dof_pos_obs, dof_vel_obs):
+        num_leg_dofs = int(self._leg_policy_joint_ids.numel())
+        arm_state_obs_scale = float(self.cfg.env.arm_dof_state_obs_scale)
+        dof_pos_obs[:, num_leg_dofs:] *= arm_state_obs_scale
+        dof_vel_obs[:, num_leg_dofs:] *= arm_state_obs_scale
         return dof_pos_obs, dof_vel_obs
 
     def _get_policy_ee_goal_local_cart(self, ee_goal_local_cart):
         if (
             not self._use_default_trunk_follow_policy_obs()
+            or self.ee_goal_sampling_mode == "fk_reachable"
             or not torch.any(self.goal_height_follow_mask)
             or self.reset_init_ee_sphere is None
         ):
@@ -2494,6 +2792,50 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         super()._reset_idx(env_ids)
         joint_pos = self.default_dof_pos[env_ids].clone()
         joint_vel = torch.zeros_like(joint_pos)
+        if self.cfg.enable_doorman_scene and self.cfg.doorman_randomize_robot_init:
+            arm_delta = float(self.cfg.doorman_arm_joint_init_delta_rad)
+            limit_margin = float(self.cfg.doorman_arm_joint_limit_margin_rad)
+            if arm_delta < 0.0 or limit_margin < 0.0:
+                raise ValueError(
+                    "DoorMan arm reset delta and joint-limit margin must be non-negative"
+                )
+            if self.arm_joint_ids.numel() > 0:
+                configured_center = list(self.cfg.doorman_arm_joint_init_center)
+                if configured_center:
+                    if len(configured_center) != self.arm_joint_ids.numel():
+                        raise ValueError(
+                            "DoorMan arm reset center must contain one value per arm joint: "
+                            f"expected {self.arm_joint_ids.numel()}, got {len(configured_center)}"
+                        )
+                    arm_defaults = torch.tensor(
+                        configured_center,
+                        dtype=joint_pos.dtype,
+                        device=self.device,
+                    ).unsqueeze(0).expand(len(env_ids), -1)
+                else:
+                    arm_defaults = self.default_dof_pos[env_ids][:, self.arm_joint_ids]
+                arm_limits = self.dof_pos_limits[self.arm_joint_ids]
+                safe_lower = arm_limits[:, 0].unsqueeze(0) + limit_margin
+                safe_upper = arm_limits[:, 1].unsqueeze(0) - limit_margin
+                if torch.any(arm_defaults < safe_lower) or torch.any(arm_defaults > safe_upper):
+                    raise ValueError(
+                        "DoorMan arm reset center is outside the URDF joint limits "
+                        "after applying the configured safety margin"
+                    )
+                if arm_delta == 0.0:
+                    joint_pos[:, self.arm_joint_ids] = arm_defaults
+                else:
+                    lower = torch.maximum(arm_defaults - arm_delta, safe_lower)
+                    upper = torch.minimum(arm_defaults + arm_delta, safe_upper)
+                    if torch.any(lower >= upper):
+                        raise RuntimeError(
+                            "DoorMan arm reset range is empty after applying joint limits"
+                        )
+                    joint_pos[:, self.arm_joint_ids] = lower + (upper - lower) * torch.rand(
+                        len(env_ids), self.arm_joint_ids.numel(), device=self.device
+                    )
+        if self.cfg.enable_doorman_scene and self.cfg.doorman_gripper_joint_init is not None:
+            joint_pos[:, self.gripper_joint_ids] = float(self.cfg.doorman_gripper_joint_init)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
         self.last_contact_forces[env_ids] = 0.0
         self.robot.set_joint_position_target(joint_pos, env_ids=env_ids)
@@ -2507,20 +2849,28 @@ class LeggedRobotIsaacLab(DirectRLEnv):
             if robot_side not in ("positive_x", "negative_x"):
                 raise ValueError(f"Unsupported doorman_robot_side={robot_side!r}")
             side_sign = 1.0 if robot_side == "positive_x" else -1.0
-            # Keep the randomized reset inside the arm's reliable workspace.
-            # The previous 0.6--1.5 m range frequently initialized the base
-            # so far from the handle that the trained locomotion/IK policy
-            # saturated before either finger could make contact.
+            x_min, x_max = map(float, self.cfg.doorman_robot_init_x_range)
+            y_min, y_max = map(float, self.cfg.doorman_robot_init_y_range)
+            yaw_min, yaw_max = map(float, self.cfg.doorman_robot_init_yaw_range)
+            if not (0.0 < x_min <= x_max and y_min <= y_max and yaw_min <= yaw_max):
+                raise ValueError(
+                    "Invalid DoorMan robot reset ranges: "
+                    f"x={(x_min, x_max)}, y={(y_min, y_max)}, "
+                    f"yaw={(yaw_min, yaw_max)}"
+                )
+            # The 0.75 m near bound is the closest verified reset with the
+            # extended default B2Z1 arm that remains clear of the door plane.
             root_state[:, 0:1] = (
                 self.scene.env_origins[env_ids, 0:1]
-                + side_sign * torch_rand_float(0.65, 0.85, (len(env_ids), 1), self.device)
+                + side_sign
+                * torch_rand_float(x_min, x_max, (len(env_ids), 1), self.device)
             )
             root_state[:, 1:2] = (
                 self.scene.env_origins[env_ids, 1:2]
-                + torch_rand_float(0.15, 0.40, (len(env_ids), 1), self.device)
+                + torch_rand_float(y_min, y_max, (len(env_ids), 1), self.device)
             )
             random_yaw = torch_rand_float(
-                -0.12, 0.12, (len(env_ids), 1), self.device
+                yaw_min, yaw_max, (len(env_ids), 1), self.device
             ).squeeze(-1)
             if side_sign > 0:
                 random_yaw = torch.pi + random_yaw
@@ -2554,6 +2904,7 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         for rig in self._rgb_camera_rigs.values():
             if rig.get("door_diagnostic"):
                 rig.pop("_door_local_pose", None)
+                rig.pop("_door_world_pose", None)
 
         root_state = self.door.data.default_root_state[env_ids].clone()
         root_state[:, :3] += self.scene.env_origins[env_ids]

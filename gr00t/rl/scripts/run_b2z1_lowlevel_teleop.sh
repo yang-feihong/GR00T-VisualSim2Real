@@ -4,14 +4,14 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 LOWLEVEL_ROOT="${REPO_ROOT}/gr00t/rl/third_party/visual_wholebody_lowlevel"
 ENTRY="${LOWLEVEL_ROOT}/legged_gym/scripts/manip_loco_interface.py"
-RUN_DIR="${REPO_ROOT}/ckpt/b2z1-low/20260817_154058_is-dc6jrxz4suufnmlp-devmachine-0_gpu1_agent2_z8e0p66v"
+RUN_DIR="${REPO_ROOT}/ckpt/b2z1-low/20260918_102500_is-dc7zasdnsm4oadn4-devmachine-0_gpu2_agent1_uhryvo2cn"
 
 GPU_ID="${GPU_ID:-0}"
 HEADLESS="${HEADLESS:-false}"
 ENABLE_DOORMAN_SCENE="${ENABLE_DOORMAN_SCENE:-true}"
-CKPT_PATH="${CKPT_PATH:-${RUN_DIR}/model_40000.pt}"
+CKPT_PATH="${CKPT_PATH:-${RUN_DIR}/model_54000.pt}"
 RUN_METADATA_PATH="${RUN_METADATA_PATH:-${RUN_DIR}/run_metadata.json}"
-USD_PATH="${USD_PATH:-${REPO_ROOT}/gr00t/rl/data/robots/b2z1_lab30/b2z1_mount_0_x0p22_y0_z0p17.usd}"
+USD_PATH="${USD_PATH:-${REPO_ROOT}/gr00t/rl/data/robots/b2z1_lab30/b2z1_mount_90_x0p22_y0_z0p17.usd}"
 RGB_CAMERA_CONFIG="${RGB_CAMERA_CONFIG:-${LOWLEVEL_ROOT}/legged_gym/scripts/rgb_cameras.json}"
 RTX_REFLECTIONS="${RTX_REFLECTIONS:-true}"
 RTX_TRANSLUCENCY="${RTX_TRANSLUCENCY:-true}"
@@ -58,6 +58,7 @@ exec python "${ENTRY}" \
     --sim_device "cuda:${GPU_ID}" \
     --rl_device "cuda:${GPU_ID}" \
     --teleop_mode \
+    --mount_deg 90 \
     --action_delay_mode auto \
     --rtx_reflections "${RTX_REFLECTIONS}" \
     --rtx_translucency "${RTX_TRANSLUCENCY}" \

@@ -113,6 +113,7 @@ class B2Z1IsaacLabCfg(LeggedRobotIsaacLabCfg):
         action_delay = 3  # -1 for no delay
         action_delay_mode = "auto"  # auto: keep training curriculum, undelayed: latest action, delayed: one-step delayed action
         ee_goal_obs_mode = "command"  # command: use sampled EE command directly, arm_base_target: use target relative to arm base
+        arm_dof_state_obs_scale = 1.0
         num_gripper_joints = 1
         num_proprio = 2 + 3 + 18 + 18 + 12 + 4 + 3 + 3 + 3
         num_priv = 5 + 1 + 12

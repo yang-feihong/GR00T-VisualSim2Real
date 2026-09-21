@@ -72,6 +72,16 @@ class DoorSpawnerCfg(sim_utils.RigidObjectSpawnerCfg):
     dynamic_material_randomization: bool = False
     dynamic_material_randomization_interval: float = 1.0
 
+    # Passive hinge resistance.  A band is selected by weight, then each
+    # parameter is sampled uniformly inside that band.  This keeps easy doors
+    # common without collapsing the domain randomization to one narrow range.
+    # Entries are: (weight, joint friction, drive damping, max damping torque).
+    hinge_resistance_mixture: tuple = (
+        (0.70, (0.001, 0.006), (2.0, 8.0), (0.3, 1.0)),
+        (0.25, (0.006, 0.018), (8.0, 20.0), (1.0, 2.5)),
+        (0.05, (0.018, 0.040), (20.0, 40.0), (2.5, 4.0)),
+    )
+
     # deterministic generation
     rand_door_width: Optional[float] = None
     rand_door_height: Optional[float] = None
@@ -87,7 +97,11 @@ class DoorSpawnerCfg(sim_utils.RigidObjectSpawnerCfg):
     rand_hook_length: Optional[float] = None
     rand_handle_radius: Optional[float] = None
     rand_spawn_hook: Optional[bool] = None
+    rand_hinge_joint_friction: Optional[float] = None
     rand_hinge_drive_max_force: Optional[float] = None
+    rand_hinge_drive_damping: Optional[float] = None
+    # Retained for metadata compatibility.  Passive doors always use zero
+    # stiffness so this value cannot create a position-restoring door closer.
     rand_hinge_drive_stiffness: Optional[float] = None
     rand_handle_drive_max_force: Optional[float] = None
     rand_front: Optional[bool] = None
@@ -97,6 +111,32 @@ class DoorSpawnerCfg(sim_utils.RigidObjectSpawnerCfg):
     rand_right_front: Optional[bool] = None
     rand_left_rear: Optional[bool] = None
     rand_right_rear: Optional[bool] = None
+
+
+def sample_hinge_resistance(cfg: DoorSpawnerCfg) -> tuple[int, float, float, float]:
+    """Sample passive hinge friction and damping from a weighted mixture."""
+    mixture = cfg.hinge_resistance_mixture
+    if not mixture:
+        raise ValueError("hinge_resistance_mixture must contain at least one band")
+
+    weights = np.asarray([band[0] for band in mixture], dtype=np.float64)
+    if np.any(weights < 0.0) or not np.isfinite(weights).all() or weights.sum() <= 0.0:
+        raise ValueError("hinge resistance weights must be finite, non-negative, and non-zero")
+
+    band_index = int(np.random.choice(len(mixture), p=weights / weights.sum()))
+    _, friction_range, damping_range, max_force_range = mixture[band_index]
+    for name, value_range in (
+        ("joint friction", friction_range),
+        ("drive damping", damping_range),
+        ("max damping torque", max_force_range),
+    ):
+        if len(value_range) != 2 or value_range[0] < 0.0 or value_range[1] < value_range[0]:
+            raise ValueError(f"invalid hinge {name} range: {value_range}")
+
+    joint_friction = float(np.random.uniform(*friction_range))
+    drive_damping = float(np.random.uniform(*damping_range))
+    drive_max_force = float(np.random.uniform(*max_force_range))
+    return band_index, joint_friction, drive_damping, drive_max_force
 
 
 def _update_joint_transform(stage, joint_path, prim0_path, prim1_path):
@@ -484,19 +524,24 @@ def spawn_door(
         hinge_joint.CreateLocalRot0Attr().Set(Gf.Quatf(real=0.0, imaginary=(Gf.Vec3f(1, 0, 0))))
     hinge_joint.GetLowerLimitAttr().Set(0.0)
     hinge_joint.GetUpperLimitAttr().Set(150)
+    resistance_band, hinge_joint_friction, hinge_drive_damping, hinge_drive_max_force = (
+        sample_hinge_resistance(cfg)
+    )
+    if cfg.rand_hinge_joint_friction is not None:
+        hinge_joint_friction = cfg.rand_hinge_joint_friction
+    if cfg.rand_hinge_drive_damping is not None:
+        hinge_drive_damping = cfg.rand_hinge_drive_damping
+    if cfg.rand_hinge_drive_max_force is not None:
+        hinge_drive_max_force = cfg.rand_hinge_drive_max_force
+
+    physx_hinge_joint = PhysxSchema.PhysxJointAPI.Apply(hinge_joint.GetPrim())
+    physx_hinge_joint.CreateJointFrictionAttr().Set(hinge_joint_friction)
     hinge_drive = UsdPhysics.DriveAPI.Apply(hinge_joint.GetPrim(), "angular")
-    hinge_drive.GetTargetPositionAttr().Set(-10.0)
-    hinge_drive.GetMaxForceAttr().Set(
-        np.random.uniform(2.5, 4.5)
-        if cfg.rand_hinge_drive_max_force is None
-        else cfg.rand_hinge_drive_max_force
-    )
-    hinge_drive.GetDampingAttr().Set(50.0)
-    hinge_drive.GetStiffnessAttr().Set(
-        np.random.uniform(1, 10.0)
-        if cfg.rand_hinge_drive_stiffness is None
-        else cfg.rand_hinge_drive_stiffness
-    )
+    hinge_drive.GetTargetPositionAttr().Set(0.0)
+    hinge_drive.GetTargetVelocityAttr().Set(0.0)
+    hinge_drive.GetMaxForceAttr().Set(hinge_drive_max_force)
+    hinge_drive.GetDampingAttr().Set(hinge_drive_damping)
+    hinge_drive.GetStiffnessAttr().Set(0.0)
     _update_joint_transform(stage, hinge_joint_prim_path, root_prim_path, panel_prim_path)
 
     handle_joint_prim_path = os.path.join(panel_prim_path, "handle_joint")
@@ -524,12 +569,20 @@ def spawn_door(
 
     # build latch
     if cfg.build_latch:
+        # The latch must sit on the side of the jamb opposite the commanded
+        # opening motion.  The old fixed -X placement only worked for pull
+        # doors; after switching to push doors it moved away from the jamb.
+        latch_x = -0.02 + 0.063 * door_open_io
+        # This inset gives the latch about 19.5 mm of engagement in the jamb:
+        # 19 mm remains locked, while the intended 20 mm travel clears it.
+        latch_edge_inset = 0.0028
+        latch_z = door_handle_height
         latch_link_prim_path = os.path.join(prim_path, "latch_link")
         create_prim(latch_link_prim_path, "Xform")
         set_prim_transform(
             stage,
             latch_link_prim_path,
-            (-0.083, (half_door_width - 0.005) * door_open_lr, door_height - 0.1),
+            (latch_x, (half_door_width - latch_edge_inset) * door_open_lr, latch_z),
             (0, 0, 0),
             (1.0, 1.0, 1.0),
         )
@@ -541,7 +594,7 @@ def spawn_door(
             stage,
             latch_geom_prim_path,
             (0, 0, 0),
-            (-90 * door_open_lr, 0, -26.56 * door_open_lr),
+            (-90 * door_open_lr, 0, 26.56 * door_open_lr * door_open_io),
             (1.0, 1.0, 1.0),
         )
         cone_geom: UsdGeom.Cone = UsdGeom.Cone.Define(stage, latch_geom_prim_path)
@@ -557,7 +610,11 @@ def spawn_door(
         latch_joint.CreateBody1Rel().SetTargets([latch_link_prim_path])
         latch_joint.GetAxisAttr().Set("Y")
         latch_joint.CreateLocalPos0Attr().Set(
-            Gf.Vec3f(-0.083, (half_door_width - 0.005) * door_open_lr, door_height - 0.1)
+            Gf.Vec3f(
+                latch_x,
+                (half_door_width - latch_edge_inset) * door_open_lr,
+                latch_z,
+            )
         )
         if door_open_lr == 1:
             latch_joint.CreateLocalRot0Attr().Set(Gf.Quatf(real=0.0, imaginary=(Gf.Vec3f(0, 0, 1))))
@@ -943,7 +1000,10 @@ def spawn_door(
         "hookLength": hook_length,
         "handleRadius": handle_radius,
         "spawnHook": spawn_hook,
+        "hingeResistanceBand": resistance_band,
+        "hingeJointFriction": physx_hinge_joint.GetJointFrictionAttr().Get(),
         "hingeDriveMaxForce": hinge_drive.GetMaxForceAttr().Get(),
+        "hingeDriveDamping": hinge_drive.GetDampingAttr().Get(),
         "hingeDriveStiffness": hinge_drive.GetStiffnessAttr().Get(),
         "handleDriveMaxForce": handle_drive.GetMaxForceAttr().Get(),
     }
@@ -1092,8 +1152,10 @@ def get_deterministic_door_config(cfg: DoorSpawnerCfg, metadata: dict) -> DoorSp
     cfg.rand_hook_length = metadata["hookLength"]
     cfg.rand_handle_radius = metadata["handleRadius"]
     cfg.rand_spawn_hook = metadata["spawnHook"]
+    cfg.rand_hinge_joint_friction = metadata.get("hingeJointFriction", 0.0)
     cfg.rand_hinge_drive_max_force = metadata["hingeDriveMaxForce"]
-    cfg.rand_hinge_drive_stiffness = metadata["hingeDriveStiffness"]
+    cfg.rand_hinge_drive_damping = metadata.get("hingeDriveDamping", 50.0)
+    cfg.rand_hinge_drive_stiffness = 0.0
     cfg.rand_handle_drive_max_force = metadata["handleDriveMaxForce"]
 
     if cfg.add_walls:

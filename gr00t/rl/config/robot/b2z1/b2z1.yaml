@@ -230,7 +230,7 @@ robot:
     gripper_open_command: -1.0
     gripper_closed_command: 1.0
     lowlevel_leg_control_mode: "effort"
-    lowlevel_policy_path: "ckpt/b2z1-low/20260817_154058_is-dc6jrxz4suufnmlp-devmachine-0_gpu1_agent2_z8e0p66v/model_40000.pt"
+    lowlevel_policy_path: "ckpt/b2z1-low/20260918_102500_is-dc7zasdnsm4oadn4-devmachine-0_gpu2_agent1_uhryvo2cn/model_54000.pt"
     lowlevel_policy_obs_dim: 799
     lowlevel_num_proprio: 71
     lowlevel_num_priv: 18
@@ -246,6 +246,7 @@ robot:
     lowlevel_ang_vel_scale: 0.25
     lowlevel_dof_pos_scale: 1.0
     lowlevel_dof_vel_scale: 0.05
+    lowlevel_arm_dof_state_obs_scale: 1.0
     lowlevel_command_obs_scale: [2.0, 2.0, 0.25]
     # Manual/deployment limits from the checkpoint's visual_wholebody config.
     lowlevel_velocity_command_lower: [-0.8, -0.8, -1.0]
@@ -261,8 +262,8 @@ robot:
     lowlevel_gait_transition_duration_s: 0.5
     lowlevel_trot_stance_ratio: 0.5
     lowlevel_trot_swing_ratio: 0.5
-    # Exact fixed-trot timing recorded with model_40000.pt.
-    lowlevel_trot_swing_duration_max_s: 0.25
+    # Exact fixed-trot timing recorded with model_54000.pt.
+    lowlevel_trot_swing_duration_max_s: 0.3
     lowlevel_action_scale: [
       0.4, 0.45, 0.45,
       0.4, 0.45, 0.45,
@@ -277,8 +278,8 @@ robot:
     lowlevel_goal_center_offset: [0.2, 0.0, 0.7]
     lowlevel_default_ee_goal_cart: [0.4619397663, 0.0, 0.1913417162]
     # [radius, pitch, yaw], copied from the low-level checkpoint metadata.
-    lowlevel_ee_goal_sphere_lower: [0.4, -1.4959965017, -1.5707963268]
-    lowlevel_ee_goal_sphere_upper: [0.95, 1.0471975512, 1.5707963268]
+    lowlevel_ee_goal_sphere_lower: [0.4, -1.5707963268, -1.5707963268]
+    lowlevel_ee_goal_sphere_upper: [0.95, 2.0943951024, 1.5707963268]
     lowlevel_policy_joint_names: [
       "FR_hip_joint", "FR_thigh_joint", "FR_calf_joint",
       "FL_hip_joint", "FL_thigh_joint", "FL_calf_joint",
@@ -323,7 +324,7 @@ robot:
     disable_gravity: False
     fix_base_link: False
     # Generated offline from the lab30-aligned URDF with convex decomposition.
-    usd_file: "b2z1_lab30/b2z1_mount_0_x0p22_y0_z0p17.usd"
+    usd_file: "b2z1_lab30/b2z1_mount_90_x0p22_y0_z0p17.usd"
     xml_file: null
     robot_type: b2z1
     self_collisions: 0

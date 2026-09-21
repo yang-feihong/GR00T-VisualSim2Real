@@ -1,4 +1,3 @@
-import json
 import os
 import json
 import time
@@ -101,12 +100,7 @@ def rgb_camera_specs_from_config(config):
             "target_offset_leaf_m",
             "view_axis_reference",
             "view_axis_local",
-            "view_axis_direction_sign",
             "axis_distance_m",
-            "fill_light_up_offset_m",
-            "fill_light_right_offset_m",
-            "fill_light_intensity",
-            "fill_light_radius_m",
         )
         if any(key not in section for key in required_keys):
             continue
@@ -115,19 +109,33 @@ def rgb_camera_specs_from_config(config):
         target_reference = str(section["target_reference"])
         view_axis_reference = str(section["view_axis_reference"])
         door_face_reference = str(section.get("door_face_reference", "robot"))
-        if target_reference != "handle_joint":
+        if target_reference not in ("handle_joint", "door_leaf_bounds_center"):
             raise ValueError(
-                f"Door diagnostic camera '{camera_name}' requires target_reference='handle_joint'."
+                f"Door diagnostic camera '{camera_name}' has unsupported "
+                f"target_reference={target_reference!r}."
             )
-        if view_axis_reference not in ("handle_body", "door_leaf"):
+        if view_axis_reference not in ("handle_body", "door_leaf", "push_side"):
             raise ValueError(
                 f"Door diagnostic camera '{camera_name}' has unsupported "
                 f"view_axis_reference={view_axis_reference!r}."
             )
-        if door_face_reference != "robot":
+        mount_frame = str(section.get("mount_frame", "door_leaf"))
+        if mount_frame not in ("door_leaf", "world"):
             raise ValueError(
-                f"Door diagnostic camera '{camera_name}' requires "
-                "door_face_reference='robot'."
+                f"Door diagnostic camera '{camera_name}' has unsupported "
+                f"mount_frame={mount_frame!r}."
+            )
+        direction_mode = str(section.get("view_axis_direction_mode", "explicit"))
+        if direction_mode not in ("explicit", "handle_end"):
+            raise ValueError(
+                f"Door diagnostic camera '{camera_name}' has unsupported "
+                f"view_axis_direction_mode={direction_mode!r}."
+            )
+        direction_sign = float(section.get("view_axis_direction_sign", 1.0))
+        if not np.isfinite(direction_sign) or direction_sign == 0.0:
+            raise ValueError(
+                f"Door diagnostic camera '{camera_name}' "
+                "view_axis_direction_sign must be finite and non-zero."
             )
         axis_distance = float(section["axis_distance_m"])
         if axis_distance <= 0.0:
@@ -136,6 +144,16 @@ def rgb_camera_specs_from_config(config):
             **section,
             "camera_name": camera_name,
             "door_face_reference": door_face_reference,
+            "mount_frame": mount_frame,
+            "view_axis_direction_mode": direction_mode,
+            "view_axis_direction_sign": direction_sign,
+            "minimum_push_side_offset_m": float(
+                section.get("minimum_push_side_offset_m", 0.05)
+            ),
+            "fill_light_up_offset_m": float(section.get("fill_light_up_offset_m", 0.0)),
+            "fill_light_right_offset_m": float(section.get("fill_light_right_offset_m", 0.0)),
+            "fill_light_intensity": float(section.get("fill_light_intensity", 0.0)),
+            "fill_light_radius_m": float(section.get("fill_light_radius_m", 0.035)),
             "target_offset_leaf_m": parse_vec3(
                 section["target_offset_leaf_m"], f"{section_name}.target_offset_leaf_m"
             ),
@@ -163,6 +181,12 @@ def rgb_camera_specs_from_config(config):
         body_name = str(require_config_value(camera_cfg, "body_name", f"Camera '{camera_name}'")).strip()
         if not body_name:
             raise ValueError(f"Camera '{camera_name}' has an empty body_name.")
+        pose_reference = str(camera_cfg.get("pose_reference", "body")).strip()
+        if pose_reference not in ("body", "base_height_invariant"):
+            raise ValueError(
+                f"Camera '{camera_name}' has unsupported pose_reference="
+                f"{pose_reference!r}."
+            )
 
         camera_mode = str(camera_cfg.get("mode", require_config_value(defaults, "mode", "RGB camera defaults"))).strip().lower()
         if camera_mode not in ("mono", "stereo"):
@@ -268,6 +292,7 @@ def rgb_camera_specs_from_config(config):
                 "name": camera_name,
                 "mode": camera_mode,
                 "body_name": body_name,
+                "pose_reference": pose_reference,
                 "topic_prefix": str(require_config_value(camera_cfg, "topic_prefix", f"Camera '{camera_name}'")).rstrip("/"),
                 "width": width,
                 "height": height,

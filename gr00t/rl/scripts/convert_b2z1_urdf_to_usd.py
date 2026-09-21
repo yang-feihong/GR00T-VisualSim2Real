@@ -122,11 +122,11 @@ def parse_args():
     default_urdf = (
         repo_root
         / "gr00t/rl/third_party/visual_wholebody_lowlevel/resources/robots/b2z1/urdf"
-        / "generated/b2z1_mount_0_x0p22_y0_z0p17.urdf"
+        / "generated/b2z1_mount_90_x0p22_y0_z0p17.urdf"
     )
     default_usd = (
         repo_root
-        / "gr00t/rl/data/robots/b2z1_lab30/b2z1_mount_0_x0p22_y0_z0p17.usd"
+        / "gr00t/rl/data/robots/b2z1_lab30/b2z1_mount_90_x0p22_y0_z0p17.usd"
     )
 
     parser = argparse.ArgumentParser()

@@ -11,7 +11,7 @@ def main():
     repo_root = Path(__file__).resolve().parents[3]
     usd_path = (
         repo_root
-        / "gr00t/rl/data/robots/b2z1_lab30/b2z1_mount_0_x0p22_y0_z0p17.usd"
+        / "gr00t/rl/data/robots/b2z1_lab30/b2z1_mount_90_x0p22_y0_z0p17.usd"
     )
     if not usd_path.is_file():
         raise FileNotFoundError(f"B2Z1 USD does not exist: {usd_path}")
