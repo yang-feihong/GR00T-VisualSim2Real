@@ -262,6 +262,11 @@ def _apply_checkpoint_gait_args(cfg, features: dict):
 
 def _apply_checkpoint_command_schedule_args(cfg, metadata: dict):
     commands_metadata = metadata["env_cfg"]["commands"]
+    for name in ("lin_vel_x_clip", "lin_vel_y_clip", "ang_vel_yaw_clip"):
+        value = float(commands_metadata[name])
+        if value < 0.0:
+            raise ValueError(f"Checkpoint command threshold {name} must be non-negative, got {value}")
+        setattr(cfg.commands, name, value)
     for name in COMMAND_SCHEDULE_NAMES:
         parsed = parse_float_schedule(commands_metadata[name])
         if parsed is not None:

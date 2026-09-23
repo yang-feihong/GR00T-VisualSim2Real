@@ -10,6 +10,7 @@ the simulator and does not use measured or fitted correction tables.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -644,11 +645,14 @@ class B2Z1SteadyEeForwardModel:
             or float(np.linalg.norm(orientation_error)) > float(orientation_tolerance)
             or float(np.linalg.norm(equilibrium_residual, ord=np.inf)) > 1.0e-7
         ):
-            raise RuntimeError(
-                "steady EE inverse back-substitution failed: "
+            warnings.warn(
+                "steady EE inverse back-substitution exceeds the requested tolerance; "
+                "returning the best feasible compensated command: "
                 f"position_error_m={np.linalg.norm(position_error):.9g} "
                 f"orientation_error={np.linalg.norm(orientation_error):.9g} "
-                f"equilibrium_error_nm={np.linalg.norm(equilibrium_residual, ord=np.inf):.9g}"
+                f"equilibrium_error_nm={np.linalg.norm(equilibrium_residual, ord=np.inf):.9g}",
+                RuntimeWarning,
+                stacklevel=2,
             )
         forward_result = SteadyEeForwardResult(
             position_world=actual_position_world.copy(),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import sys
 import time
 from pathlib import Path
@@ -75,6 +76,68 @@ class ManipLoco_Policy:
                 raise
             self.rgb_camera_manager = None
             print(f"[rgb_camera][warn] RGB camera manager unavailable: {exc}")
+
+    def close(self):
+        """Release scene and camera references before rebuilding in this app."""
+        env = self.env
+        camera_manager = self.rgb_camera_manager
+        self.rgb_camera_manager = None
+        self.obs = None
+        self.policy = None
+        self.env = None
+        if env is not None:
+            # DirectRLEnv.close() deletes the scene before stopping the
+            # timeline, but the compatibility rig dictionary also owns every
+            # Camera object.  Drop both owners while the stage is still valid
+            # so Camera.__del__ can detach its Replicator annotators first.
+            rgb_rigs = getattr(env, "_rgb_camera_rigs", None)
+            had_rgb_cameras = bool(rgb_rigs)
+            if rgb_rigs is not None:
+                rgb_rigs.clear()
+            scene = getattr(env, "scene", None)
+            sensors = getattr(scene, "sensors", None)
+            if sensors is not None:
+                for name in list(sensors):
+                    sensor = sensors[name]
+                    if type(sensor).__name__ in ("Camera", "TiledCamera"):
+                        del sensors[name]
+                    del sensor
+            del camera_manager
+            gc.collect()
+            # Camera.__del__ detaches annotators but Isaac Sim's global
+            # ViewportManager still owns the HydraTexture/render-product
+            # objects.  Destroy them explicitly so they cannot recreate the
+            # old camera paths during the next stage initialization.
+            if had_rgb_cameras:
+                from omni.replicator.core.scripts.utils.viewport_manager import destroy_hydra_textures
+
+                destroy_hydra_textures()
+
+            stage = env.sim.stage
+            # Isaac Lab 5.1 only executes its complete PhysX/stage cleanup
+            # branch when this flag is set.  Set it at teardown rather than at
+            # construction: DoorSpawner needs the regular app-owned USD stage,
+            # while subsequent environments need the old /World cleared.
+            if bool(getattr(self.args, "clear_stage_on_close", False)):
+                env.cfg.sim.create_stage_in_memory = True
+                # SimulationContext's STOP callback otherwise loops on
+                # render() while the timeline is stopped.  With active
+                # SyntheticData render products this never returns in
+                # headless mode.  DirectRLEnv.close() clears the context right
+                # after stop(), so suppressing that callback during teardown
+                # is the intended one-shot behavior here.
+                env.sim._disable_app_control_on_stop_handle = True
+            env.close()
+            # The camera prims live outside /World/envs.  Delete the
+            # project-owned mount root after stop/clear; deleting it earlier
+            # lets Fabric's final synchronization author it back into USD.
+            camera_root = stage.GetPrimAtPath("/World/RGBCameras")
+            if camera_root.IsValid():
+                stage.RemovePrim("/World/RGBCameras")
+            if stage.GetPrimAtPath("/World/RGBCameras").IsValid():
+                raise RuntimeError("Failed to remove stale /World/RGBCameras during environment teardown")
+        del env
+        gc.collect()
 
     def _format_vec(self, tensor, env_id=0, precision=3):
         return format_env_vec(tensor, env_id=env_id, precision=precision)
