@@ -1,5 +1,31 @@
 # Door Asset Generation Scripts
 
+## AutoOpen Four-Seed Video Regression
+
+Run the accepted seeds `1700` through `1703` concurrently on four physical
+GPUs, with six-camera video recording enabled:
+
+```bash
+RUN_NAME=auto_open_flat_stages_v1 \
+    bash gr00t/rl/scripts/run_auto_open_four_seed_video.sh
+```
+
+The launcher isolates one physical GPU per Isaac Sim process with
+`CUDA_VISIBLE_DEVICES`; every process therefore uses `--device cuda:0` inside
+its own CUDA namespace. Results are written below
+`logs_rl/${RUN_NAME}_seed<seed>_6cam`, with one adjacent `.console.log` file per
+seed. Existing result directories are never overwritten.
+
+The defaults can be overridden without editing the launcher:
+
+```bash
+RUN_NAME=auto_open_check \
+GPU_IDS=0,1,2,3 \
+SEEDS=1700,1701,1702,1703 \
+MAX_STEPS=3000 \
+    bash gr00t/rl/scripts/run_auto_open_four_seed_video.sh
+```
+
 Generate randomized articulated door USD assets offline, matching the same distributions used during training in `spawn_door()`.
 
 <p align="center">

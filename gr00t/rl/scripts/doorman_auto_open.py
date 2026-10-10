@@ -55,18 +55,22 @@ class Stage(IntEnum):
     RESET = 0
     APPROACH = 1
     PREGRASP = 2
-    CENTER_HANDLE = 3
-    GRASP_HANDLE = 4
-    TURN_HANDLE = 5
-    RELEASE_HANDLE = 6
-    RETRACT_ARM = 7
-    ALIGN_PANEL = 8
-    CONTACT_PANEL = 9
-    PUSH_OPEN = 10
-    THROUGH = 11
-    RESET_ARM = 12
-    SUCCESS = 13
-    FAILURE = 14
+    OPEN_GRIPPER = 3
+    CENTER_HANDLE = 4
+    GRASP_HANDLE = 5
+    TURN_HANDLE = 6
+    RETURN_HANDLE = 7
+    OPEN_AND_CLEAR = 8
+    RETREAT_ARM = 9
+    RESTORE_GRIPPER = 10
+    ALIGN_PANEL = 11
+    CONTACT_PANEL = 12
+    PUSH_OPEN = 13
+    PUSH_ARM_RETRACT = 14
+    BASE_ADVANCE = 15
+    THROUGH = 16
+    SUCCESS = 17
+    FAILURE = 18
 
 
 class DeferredSteadyInverse(RuntimeError):
@@ -105,16 +109,20 @@ STAGE_NAMES = [
     "reset",
     "approach",
     "pregrasp",
+    "open_gripper",
     "center_handle",
     "grasp_handle",
     "turn_handle",
-    "release_handle",
-    "retract_arm",
+    "return_handle",
+    "open_and_clear",
+    "retreat_arm",
+    "restore_gripper",
     "align_panel",
     "contact_panel",
     "push_open",
+    "push_arm_retract",
+    "base_advance",
     "through",
-    "reset_arm",
     "success",
     "failure",
 ]
@@ -122,18 +130,42 @@ TASK_PHASE_NAMES = ["position_at_door", "turn_handle", "push_and_traverse"]
 STAGE_TO_TASK_PHASE = {
     Stage.APPROACH: 0,
     Stage.PREGRASP: 0,
+    Stage.OPEN_GRIPPER: 0,
     Stage.CENTER_HANDLE: 1,
     Stage.GRASP_HANDLE: 1,
     Stage.TURN_HANDLE: 1,
-    Stage.RELEASE_HANDLE: 1,
-    Stage.RETRACT_ARM: 1,
+    Stage.RETURN_HANDLE: 1,
+    Stage.OPEN_AND_CLEAR: 1,
+    Stage.RETREAT_ARM: 1,
+    Stage.RESTORE_GRIPPER: 1,
     Stage.ALIGN_PANEL: 2,
     Stage.CONTACT_PANEL: 2,
     Stage.PUSH_OPEN: 2,
+    Stage.PUSH_ARM_RETRACT: 2,
+    Stage.BASE_ADVANCE: 2,
     Stage.THROUGH: 2,
-    Stage.RESET_ARM: 2,
 }
 
+MAX_BASE_PLANAR_SPEED = 0.4
+MAX_BASE_YAW_RATE = 0.6
+ROBOT_TRUNK_REAR_X = -0.284
+THROUGH_TAIL_TARGET_DISTANCE = 1.0
+
+
+def _limit_base_commands(commands):
+    """Apply the shared base command contract to one or more commands."""
+    limited = np.asarray(commands, dtype=np.float32).copy()
+    planar = limited[..., :2]
+    planar_norm = np.linalg.norm(planar, axis=-1, keepdims=True)
+    scale = np.minimum(
+        1.0,
+        MAX_BASE_PLANAR_SPEED / np.maximum(planar_norm, 1.0e-8),
+    )
+    limited[..., :2] = planar * scale
+    limited[..., 2] = np.clip(
+        limited[..., 2], -MAX_BASE_YAW_RATE, MAX_BASE_YAW_RATE
+    )
+    return limited
 
 def _parser() -> argparse.ArgumentParser:
     parser = build_common_arg_parser()
@@ -776,6 +808,7 @@ class _BatchedRunnerView:
     ):
         env = self._runner.env
         row = slice(self.env_id, self.env_id + 1)
+        base_command = _limit_base_commands(base_command)
 
         if self.command_buffers is not None:
             def _store(name, value):
@@ -936,17 +969,10 @@ def _batched_default_base_commands_exact(state, station_xy, station_yaw):
         dtype=np.float64,
     )
     command = np.empty((len(roots), 3), dtype=np.float32)
-    command[:, 0] = np.clip(1.2 * local_x - local_vx, -0.8, 0.8)
-    command[:, 1] = np.clip(1.2 * local_y - local_vy, -0.8, 0.8)
-    command[:, 2] = np.asarray(
-        [
-            np.clip(1.5 * error_yaw - 0.35 * angular_velocity, -1.0, 1.0)
-            for error_yaw, angular_velocity in zip(
-                yaw_error, roots[:, 12], strict=True
-            )
-        ],
-        dtype=np.float32,
-    )
+    command[:, 0] = 1.2 * local_x - local_vx
+    command[:, 1] = 1.2 * local_y - local_vy
+    command[:, 2] = 1.5 * yaw_error - 0.35 * roots[:, 12]
+    command = _limit_base_commands(command)
     distance = np.linalg.norm(error[:, :2], axis=1).astype(np.float32)
     planar_norm = np.linalg.norm(command[:, :2], axis=1).astype(np.float32)
     deadzone = (
@@ -1326,7 +1352,9 @@ def _batched_geometry_metrics_gpu(state, cache, env_ids):
         "grasp_depth": grasp_depth,
         "pocket_center_error": torch.linalg.vector_norm(pocket_error, dim=-1),
         "pocket_normal_error": torch.sum(pocket_error * select("door_normal"), dim=-1),
+        "pocket_axial_error": torch.sum(pocket_error * handle_axis, dim=-1),
         "pocket_vertical_error": pocket_error[:, 2],
+        "channel_vertical_error": channel_center[:, 2] - grasp_center[:, 2],
         "pocket_center": pocket_center,
         "panel_clearance": panel_clearance,
         "fixed_handle_clearance": capsule_clearance(fixed),
@@ -1482,7 +1510,9 @@ def _batched_geometry_metrics_numpy(state, cache, env_ids, grasp_centers):
         "grasp_depth": grasp_depth,
         "pocket_center_error": np.linalg.norm(pocket_error, axis=1),
         "pocket_normal_error": np.einsum("ni,ni->n", pocket_error, door_normal),
+        "pocket_axial_error": np.einsum("ni,ni->n", pocket_error, handle_axis),
         "pocket_vertical_error": pocket_error[:, 2],
+        "channel_vertical_error": channel_center[:, 2] - grasp_center[:, 2],
         "pocket_center": pocket_center,
         "panel_clearance": panel_clearance,
         "fixed_handle_clearance": capsule_clearance(fixed),
@@ -1506,11 +1536,9 @@ def _numpy_geometry_requires_exact_scalar(controller, metrics):
         return True
     numerical_guard_m = 1.0e-4
     boundaries = (
-        ("channel_center_xy_error", 0.018, False),
-        ("horizontal_error", 0.022, False),
-        ("pocket_normal_error", 0.012, True),
-        ("upper_gap", 0.003, False),
-        ("lower_gap", 0.003, False),
+        ("pocket_normal_error", 0.005, True),
+        ("pocket_axial_error", 0.005, True),
+        ("channel_vertical_error", 0.010, True),
         ("grasp_depth", 0.015, False),
         ("panel_clearance", 0.005, False),
     )
@@ -1616,16 +1644,20 @@ class DoorController:
         self.stage_limits = {
             Stage.APPROACH: 700,
             Stage.PREGRASP: 500,
+            Stage.OPEN_GRIPPER: 100,
             Stage.CENTER_HANDLE: 800,
             Stage.GRASP_HANDLE: 400,
             Stage.TURN_HANDLE: 900,
-            Stage.RELEASE_HANDLE: 450,
-            Stage.RETRACT_ARM: 300,
+            Stage.RETURN_HANDLE: 150,
+            Stage.OPEN_AND_CLEAR: 100,
+            Stage.RETREAT_ARM: 200,
+            Stage.RESTORE_GRIPPER: 300,
             Stage.ALIGN_PANEL: 400,
             Stage.CONTACT_PANEL: 400,
-            Stage.PUSH_OPEN: 1800,
-            Stage.THROUGH: 700,
-            Stage.RESET_ARM: 400,
+            Stage.PUSH_OPEN: 900,
+            Stage.PUSH_ARM_RETRACT: 300,
+            Stage.BASE_ADVANCE: 900,
+            Stage.THROUGH: 1100,
         }
         self.hinge_idx = None
         self.handle_joint_idx = None
@@ -1677,7 +1709,6 @@ class DoorController:
         self.turn_command_bias_world = np.zeros(3, dtype=np.float32)
         self.turn_base_start_xy = None
         self.release_start_world = None
-        self.release_substage = "RETURN_HANDLE"
         self.release_start_quat = None
         self.release_endpoint_world = None
         self.release_endpoint_quat = None
@@ -1691,11 +1722,9 @@ class DoorController:
         self.release_vertical_delta = 0.0
         self.release_stable_steps = 0
         self.release_open_start_world = None
-        self.release_open_start_step = 0
         self.release_open_command_path = None
         self.release_open_orientation_path = None
         self.release_retreat_start_world = None
-        self.release_retreat_start_step = 0
         self.release_retreat_target_world = None
         self.release_retreat_command_path = None
         self.release_retreat_orientation_path = None
@@ -1738,7 +1767,6 @@ class DoorController:
         self.push_last_progress_hinge = None
         self.push_no_progress_steps = 0
         self.push_pause_steps = 0
-        self.push_substage = "ARM_TRACK"
         self.body_align_target_xy = None
         self.body_align_settle_steps = 0
         self.push_contact_world = None
@@ -1753,7 +1781,7 @@ class DoorController:
         self.push_speed_kp = 0.45
         self.push_speed_ki = 0.50
         self.push_speed_integral_limit = math.radians(8.0)
-        self.push_max_angular_lead = math.radians(8.0)
+        self.push_max_angular_lead = math.radians(4.0)
         self.push_max_ee_step = 0.003
         self.push_speed_error_integral = 0.0
         self.push_command_hinge_angle = None
@@ -1767,7 +1795,6 @@ class DoorController:
         self.push_arm_detached = False
         self.push_detached_ee_goal_local = None
         self.push_retracted_ee_goal_local = None
-        self.push_recovery_phase = None
         self.push_recovery_settle_steps = 0
         self.push_comfort_reach_radius = None
         self.push_reengage_reach_radius = 0.4
@@ -1786,9 +1813,11 @@ class DoorController:
         self.push_shoulder_min_clearance = float("nan")
         self.push_shoulder_predicted_min_clearance = float("nan")
         self.push_base_safety_scale = 1.0
-        self.through_start_base_xy = None
-        self.through_best_distance = 0.0
+        self.through_station_xy = None
+        self.through_station_yaw = None
+        self.through_best_station_error = math.inf
         self.through_no_progress_steps = 0
+        self.through_settle_steps = 0
         self.hinge_world = None
         self.hinge_axis_sign = None
         self.final_min_normal_offset = None
@@ -1811,7 +1840,8 @@ class DoorController:
         self.default_ee_goal_delta_rpy = None
         self.initial_arm_joint_target = None
         self.middle_arm_joint_target = None
-        self.middle_arm_joint_speed_limits = None
+        self.align_panel_arm_joint_target = None
+        self.base_advance_arm_joint_target = None
         # Cartesian targets are rate-limited in world coordinates.  The
         # low-level IK consumes incremental targets, so a large target jump at
         # a stage transition can overshoot the fingers into the door.
@@ -1822,6 +1852,8 @@ class DoorController:
         self.replan_counter = 0
         self.finger_separation_local = None
         self.finger_closing_local = None
+        self.fixed_inner_center_local = None
+        self.fixed_surface_target_z = None
         self.grasp_orientation_quat = None
         self.pregrasp_pitch_deg = 0.0
         self.grasp_branch = None
@@ -1839,8 +1871,6 @@ class DoorController:
         self.grasp_vertical_balance_started = False
         self.grasp_preload_angle = 0.0
         self.gripper_open_settle = 0
-        self.pregrasp_opening = False
-        self.center_substage = "CENTER_FORWARD"
         self.center_orientation_settle_steps = 0
         self.pregrasp_clearance_fallback = False
         self.center_clearance_fallback = False
@@ -1996,7 +2026,6 @@ class DoorController:
         self.turn_command_bias_world[:] = 0.0
         self.turn_base_start_xy = None
         self.release_start_world = None
-        self.release_substage = "RETURN_HANDLE"
         self.release_start_quat = None
         self.release_endpoint_world = None
         self.release_endpoint_quat = None
@@ -2009,11 +2038,9 @@ class DoorController:
         self.release_vertical_delta = 0.0
         self.release_stable_steps = 0
         self.release_open_start_world = None
-        self.release_open_start_step = 0
         self.release_open_command_path = None
         self.release_open_orientation_path = None
         self.release_retreat_start_world = None
-        self.release_retreat_start_step = 0
         self.release_retreat_target_world = None
         self.release_retreat_command_path = None
         self.release_retreat_orientation_path = None
@@ -2034,11 +2061,12 @@ class DoorController:
         self.panel_station_settle_steps = 0
         self.panel_align_ee_goal_local = None
         self.panel_align_ee_orientation_local = None
+        self.align_panel_arm_joint_target = None
+        self.base_advance_arm_joint_target = None
         self.push_start_hinge_angle = None
         self.push_last_progress_hinge = None
         self.push_no_progress_steps = 0
         self.push_pause_steps = 0
-        self.push_substage = "ARM_TRACK"
         self.body_align_target_xy = None
         self.body_align_settle_steps = 0
         self.push_contact_world = None
@@ -2058,7 +2086,6 @@ class DoorController:
         self.push_previous_finger_clearance = None
         self.push_arm_detached = False
         self.push_detached_ee_goal_local = None
-        self.push_recovery_phase = None
         self.push_recovery_settle_steps = 0
         self.push_comfort_reach_radius = None
         self.push_reengage_reachable = False
@@ -2068,9 +2095,9 @@ class DoorController:
         self.push_shoulder_min_clearance = float("nan")
         self.push_shoulder_predicted_min_clearance = float("nan")
         self.push_base_safety_scale = 1.0
-        self.through_start_base_xy = None
-        self.through_best_distance = 0.0
+        self.through_best_station_error = math.inf
         self.through_no_progress_steps = 0
+        self.through_settle_steps = 0
         self.push_target_hinge_angle = None
         self.failure_reason = None
         self.failure_stage = None
@@ -2078,14 +2105,12 @@ class DoorController:
         self.last_stability_diagnostics = {}
         self.stage_exit_diagnostics = {}
         self.precomputed_steady_paths = {}
-        self.center_substage = "CENTER_FORWARD"
         self.center_orientation_settle_steps = 0
         self.pregrasp_clearance_fallback = False
         self.center_clearance_fallback = False
         self.center_vertical_bias = 0.02
         self.center_depth_bias = -0.025
         self.gripper_open_settle = 0
-        self.pregrasp_opening = False
         self.pregrasp_pitch_deg = 0.0
         self.center_tangent_feedback_world[:] = 0.0
         self.center_normal_feedback = 0.0
@@ -2183,6 +2208,20 @@ class DoorController:
             np.dot(self.panel_center_world[:2] - self.panel_station_xy, door_tangent)
         ) * door_tangent
         self.door_forward = -self.door_normal
+        self.through_station_yaw = math.atan2(
+            float(self.door_forward[1]), float(self.door_forward[0])
+        )
+        c = math.cos(self.through_station_yaw)
+        s = math.sin(self.through_station_yaw)
+        rear_offset_world = np.array(
+            [c * ROBOT_TRUNK_REAR_X, s * ROBOT_TRUNK_REAR_X],
+            dtype=np.float32,
+        )
+        target_tail_xy = (
+            door_root[:2]
+            + THROUGH_TAIL_TARGET_DISTANCE * self.door_forward[:2]
+        )
+        self.through_station_xy = target_tail_xy - rear_offset_world
         self.initial_handle_pos = self.grasp_center_pos.copy()
         self.initial_door_root = door_root.copy()
         self.default_ee_goal_local = _as_np(state["ee_goal_cart_local"])[0]
@@ -2199,11 +2238,6 @@ class DoorController:
                 f"got {middle_arm_joint_target.shape}"
             )
         self.middle_arm_joint_target = middle_arm_joint_target
-        # Match visual_wholebody lab30's joint-reset speed.  Keep this as a
-        # per-joint vector so every arm joint is independently rate-limited.
-        self.middle_arm_joint_speed_limits = np.full_like(
-            middle_arm_joint_target, 1.0, dtype=np.float32
-        )
         self.ee_command_world = _as_np(state["ee_pos"])[0].copy()
         self.initial_ee_orientation = _as_np(state["ee_orn"])[0].copy()
         dof_names = list(state["dof_names"])
@@ -2296,6 +2330,12 @@ class DoorController:
             pocket_capture_center += (
                 pocket_depth - float(np.dot(pocket_capture_center, depth_local))
             ) * depth_local
+            # This point is the handle-center target carried by the TCP.  The
+            # grasp frame maps local +X to the door-facing shaft direction,
+            # so include the former 10 mm CENTER_HANDLE insertion in the
+            # local geometry instead of adding a separate world-frame offset.
+            pocket_capture_center[0] -= 0.010
+            pocket_depth = float(np.dot(pocket_capture_center, depth_local))
             self.open_template = {
                 "fixed_points": fixed_local,
                 "moving_points": moving_local,
@@ -2485,6 +2525,8 @@ class DoorController:
                 self.grasp_center_pos[2]
                 + (handle_radius + 0.013) * (1.0 if fixed_is_upper else -1.0)
             )
+            self.fixed_inner_center_local = fixed_inner_center.copy()
+            self.fixed_surface_target_z = fixed_surface_target_z
             fixed_anchored_ee_z = float(
                 fixed_surface_target_z - fixed_inner_offset_world[2]
             )
@@ -3012,7 +3054,9 @@ class DoorController:
             "grasp_depth": float(depth),
             "pocket_center_error": float(np.linalg.norm(pocket_error)),
             "pocket_normal_error": float(np.dot(pocket_error, self.door_normal)),
+            "pocket_axial_error": float(np.dot(pocket_error, handle_axis)),
             "pocket_vertical_error": float(pocket_error[2]),
+            "channel_vertical_error": float(channel_center[2] - grasp_center[2]),
             "pocket_center": pocket_center,
             "panel_clearance": clearance,
             "fixed_handle_clearance": _capsule_clearance(fixed),
@@ -3075,11 +3119,9 @@ class DoorController:
         """Return whether the open jaws geometrically enclose the handle."""
         return bool(
             metrics.get("valid")
-            and metrics.get("channel_center_xy_error", 999.0) <= 0.018
-            and metrics.get("horizontal_error", 999.0) <= 0.022
-            and abs(metrics.get("pocket_normal_error", 999.0)) <= 0.012
-            and metrics.get("upper_gap", -1.0) >= 0.003
-            and metrics.get("lower_gap", -1.0) >= 0.003
+            and abs(metrics.get("pocket_normal_error", 999.0)) <= 0.005
+            and abs(metrics.get("pocket_axial_error", 999.0)) <= 0.005
+            and abs(metrics.get("channel_vertical_error", 999.0)) <= 0.010
             and metrics.get("grasp_depth", 0.0) >= 0.015
             and metrics.get("panel_clearance", -1.0) >= 0.005
         )
@@ -3096,16 +3138,22 @@ class DoorController:
             return True
         if self.stage == Stage.CENTER_HANDLE:
             guarded_thresholds = (
-                ("channel_center_xy_error", 0.018, 0.005),
-                ("horizontal_error", 0.022, 0.005),
-                ("pocket_normal_error", 0.012, 0.0001),
-                ("upper_gap", 0.003, 0.001),
-                ("lower_gap", 0.003, 0.001),
+                ("pocket_normal_error", 0.005, 0.0001),
+                ("pocket_axial_error", 0.005, 0.0001),
+                ("channel_vertical_error", 0.010, 0.0001),
                 ("grasp_depth", 0.015, 0.0001),
                 ("panel_clearance", 0.005, 0.0001),
             )
             for name, threshold, margin in guarded_thresholds:
-                value = abs(float(metrics[name])) if name == "pocket_normal_error" else float(metrics[name])
+                value = (
+                    abs(float(metrics[name]))
+                    if name in {
+                        "pocket_normal_error",
+                        "pocket_axial_error",
+                        "channel_vertical_error",
+                    }
+                    else float(metrics[name])
+                )
                 if abs(value - threshold) <= margin:
                     return True
         elif self.stage == Stage.GRASP_HANDLE:
@@ -3353,14 +3401,14 @@ class DoorController:
         # actually stationary before arm contact is attempted.
         vel_w = base[7:10]
         local_vel = np.array([c * vel_w[0] + s * vel_w[1], -s * vel_w[0] + c * vel_w[1]])
-        cmd = np.array(
+        cmd = _limit_base_commands(np.array(
             [
-                np.clip(1.2 * local[0] - 1.0 * local_vel[0], -0.8, 0.8),
-                np.clip(1.2 * local[1] - 1.0 * local_vel[1], -0.8, 0.8),
-                np.clip(1.5 * yaw_error - 0.35 * base[12], -1.0, 1.0),
+                1.2 * local[0] - 1.0 * local_vel[0],
+                1.2 * local[1] - 1.0 * local_vel[1],
+                1.5 * yaw_error - 0.35 * base[12],
             ],
             dtype=np.float32,
-        )
+        ))
         station_dist = float(np.linalg.norm(error_w[:2]))
         planar_command_norm = float(np.linalg.norm(cmd[:2]))
         # The imported locomotion policy has an effective planar dead-zone
@@ -3381,6 +3429,16 @@ class DoorController:
         local = quat_rotate_inverse(quat, target - origin)
         offset = self.env.get_goal_center_offset_local()
         return local - offset
+
+    def _ee_world_target(self, local_target):
+        """Map one goal-frame EE target into world coordinates."""
+        origin = _as_np(self.env.get_goal_reference_origin())[0]
+        quat = _as_np(self.env.get_goal_reference_quat())[0]
+        offset = _as_np(self.env.get_goal_center_offset_local())[0]
+        local_with_center = (
+            np.asarray(local_target, dtype=np.float32).reshape(3) + offset
+        )
+        return origin + _quat_rotate_np(quat, local_with_center)
 
     def _grasp_orientation_delta(self, ee_goal_local, grasp_quat_world):
         """Convert the configured B2Z1 grasp orientation into teleop RPY deltas."""
@@ -3644,7 +3702,7 @@ class DoorController:
 
         def append_segment(stage, count, start_world, end_world, start_quat, end_quat,
                            start_gripper, end_gripper, base_commands=None,
-                           local_override=None, substage=None):
+                           local_override=None):
             if count <= 0:
                 return
             if base_commands is None:
@@ -3657,7 +3715,6 @@ class DoorController:
                 quat = self._quat_nlerp(start_quat, end_quat, fraction)
                 trajectory.append({
                     "stage": stage,
-                    "substage": substage,
                     "base": np.asarray(base_commands[index], dtype=np.float32).copy(),
                     "ee_world": world,
                     "ee_local": None if local_override is None else np.asarray(local_override, dtype=np.float32).copy(),
@@ -3684,8 +3741,7 @@ class DoorController:
         approach_base = np.zeros((approach_steps, 3), dtype=np.float32)
         approach_base[:, :2] = weights[:, None] * displacement_local[None, :] / max(dt * float(weights.sum()) * 0.70, 1.0e-6)
         approach_base[:, 2] = weights * yaw_delta / max(dt * float(weights.sum()) * 0.70, 1.0e-6)
-        approach_base[:, :2] = np.clip(approach_base[:, :2], -0.8, 0.8)
-        approach_base[:, 2] = np.clip(approach_base[:, 2], -1.0, 1.0)
+        approach_base = _limit_base_commands(approach_base)
         append_segment(
             Stage.APPROACH, approach_steps, None, None, initial_quat, initial_quat,
             self.q_open, self.q_open, approach_base, self.default_ee_goal_local,
@@ -3702,8 +3758,7 @@ class DoorController:
         forward_target = self.grasp_waypoint_world.copy()
         forward_target[2] += 0.010
         append_segment(Stage.CENTER_HANDLE, 100, self.center_standoff_ee_world, forward_target,
-                       grasp_quat, grasp_quat, self.q_open, self.q_open,
-                       substage="CENTER_FORWARD")
+                       grasp_quat, grasp_quat, self.q_open, self.q_open)
         append_segment(Stage.GRASP_HANDLE, 80, forward_target, forward_target,
                        grasp_quat, grasp_quat, self.q_open, self.q_grasp)
 
@@ -3803,7 +3858,6 @@ class DoorController:
             )
             trajectory.append({
                 "stage": Stage.TURN_HANDLE,
-                "substage": None,
                 "base": turn_base[index],
                 "ee_world": point,
                 "ee_local": None,
@@ -3816,18 +3870,18 @@ class DoorController:
             release_grasp = point
             release_quat = quat
 
-        append_segment(Stage.RELEASE_HANDLE, 50, release_grasp, release_grasp,
+        append_segment(Stage.OPEN_AND_CLEAR, 50, release_grasp, release_grasp,
                        release_quat, release_quat, turn_gripper, self.q_open)
         release_normal = _quat_rotate_np(self._yaw_quat(release_angle), self.door_normal)
         retract_target = release_grasp + 0.20 * release_normal
         retract_target[2] += 0.10
-        append_segment(Stage.RETRACT_ARM, 70, release_grasp, retract_target,
+        append_segment(Stage.RETREAT_ARM, 70, release_grasp, retract_target,
                        release_quat, release_quat, self.q_open, 0.0)
         # Once the gripper is clear of the handle, undo the wrist rotation used
         # to align the jaws with the lever.  Restore it in place before moving
         # the base toward the panel so the orientation target stays continuous.
         append_segment(
-            Stage.RETRACT_ARM,
+            Stage.RESTORE_GRIPPER,
             120,
             retract_target,
             retract_target,
@@ -3835,7 +3889,6 @@ class DoorController:
             initial_quat,
             0.0,
             0.0,
-            substage="RESTORE_ORIENTATION",
         )
         align_panel_steps = 120
         align_panel_points = np.linspace(
@@ -3878,7 +3931,7 @@ class DoorController:
         push_base = self._planned_base_commands(push_base_points, target_yaw + push_angles, dt)
         for index, angle in enumerate(push_angles):
             trajectory.append({
-                "stage": Stage.PUSH_OPEN, "substage": None,
+                "stage": Stage.PUSH_OPEN,
                 "base": push_base[index],
                 "ee_world": self._rotate_about_z(panel_tcp, self.hinge_world, angle),
                 "ee_local": None,
@@ -3887,24 +3940,16 @@ class DoorController:
             })
 
         through_steps = 240
-        through_yaws = np.linspace(target_yaw + final_angle, target_yaw, through_steps, dtype=np.float32)
         through_base = np.zeros((through_steps, 3), dtype=np.float32)
-        for index, yaw in enumerate(through_yaws):
-            c, s = math.cos(float(yaw)), math.sin(float(yaw))
-            velocity_world = 0.45 * self.door_forward[:2]
-            through_base[index, :2] = [c * velocity_world[0] + s * velocity_world[1],
-                                       -s * velocity_world[0] + c * velocity_world[1]]
-        through_base[:, 2] = np.gradient(through_yaws, dt)
         append_segment(Stage.THROUGH, through_steps, None, None, release_quat, initial_quat,
                        0.0, 0.0, through_base, self.default_ee_goal_local)
-        append_segment(Stage.RESET_ARM, 100, None, None, initial_quat, initial_quat,
+        append_segment(Stage.THROUGH, 100, None, None, initial_quat, initial_quat,
                        0.0, 0.0, local_override=self.default_ee_goal_local)
 
         self.open_loop_trajectory = trajectory
         self.trajectory_step = 0
         self.stage = trajectory[0]["stage"]
         self.stage_steps = 0
-        self.center_substage = trajectory[0]["substage"] or self.center_substage
         stage_counts = {
             stage.name: sum(sample["stage"] == stage for sample in trajectory)
             for stage in Stage if stage not in (Stage.RESET, Stage.SUCCESS, Stage.FAILURE)
@@ -3930,9 +3975,7 @@ class DoorController:
             commands[index, 0] = c * velocity_world[index, 0] + s * velocity_world[index, 1]
             commands[index, 1] = -s * velocity_world[index, 0] + c * velocity_world[index, 1]
             commands[index, 2] = yaw_rate[index]
-        commands[:, :2] = np.clip(commands[:, :2], -0.8, 0.8)
-        commands[:, 2] = np.clip(commands[:, 2], -1.0, 1.0)
-        return commands
+        return _limit_base_commands(commands)
 
     def command(self, state):
         """Publish the next precomputed reference without changing the plan."""
@@ -3941,9 +3984,11 @@ class DoorController:
         index = min(self.trajectory_step, len(self.open_loop_trajectory) - 1)
         sample = self.open_loop_trajectory[index]
         self.stage = sample["stage"]
-        if sample["substage"] is not None:
-            self.center_substage = sample["substage"]
-        base_cmd = sample["base"]
+        base_cmd = _limit_base_commands(sample["base"])
+        if self.stage == Stage.THROUGH:
+            base_cmd, _, _ = self._base_command(
+                state, self.through_station_xy, self.through_station_yaw
+            )
         self.active_grasp_quat = sample["quat"]
         if sample["ee_local"] is not None:
             ee_local = torch.as_tensor(
@@ -3965,9 +4010,17 @@ class DoorController:
             ee_goal_orn_quat_world_enabled=True,
         )
         base = _as_np(state["root_states"])[0]
-        station_dist = float(np.linalg.norm(base[:2] - self.station_xy))
         yaw = _quat_yaw(base[3:7])
-        target_yaw = math.atan2(float(-self.door_normal[1]), float(-self.door_normal[0]))
+        if self.stage == Stage.THROUGH:
+            station_dist = float(
+                np.linalg.norm(base[:2] - self.through_station_xy)
+            )
+            target_yaw = self.through_station_yaw
+        else:
+            station_dist = float(np.linalg.norm(base[:2] - self.station_xy))
+            target_yaw = math.atan2(
+                float(-self.door_normal[1]), float(-self.door_normal[0])
+            )
         yaw_error = abs(((target_yaw - yaw + math.pi) % (2.0 * math.pi)) - math.pi)
         self.ee_orientation_error = self._quat_distance(
             _as_np(state["ee_orn"])[0], self.active_grasp_quat
@@ -4005,30 +4058,72 @@ class DoorController:
             desired_grasp_quat = _as_np(state["ee_orn"])[0].copy()
         rotate_for_grasp = self.stage in (
             Stage.PREGRASP,
+            Stage.OPEN_GRIPPER,
             Stage.CENTER_HANDLE,
             Stage.GRASP_HANDLE,
             Stage.TURN_HANDLE,
-            Stage.RELEASE_HANDLE,
-            Stage.RETRACT_ARM,
+            Stage.RETURN_HANDLE,
+            Stage.OPEN_AND_CLEAR,
+            Stage.RETREAT_ARM,
+            Stage.RESTORE_GRIPPER,
         )
         desired_orientation = desired_grasp_quat if rotate_for_grasp else self.initial_ee_orientation
         if (
-            self.stage in (Stage.ALIGN_PANEL, Stage.CONTACT_PANEL, Stage.PUSH_OPEN)
+            self.stage
+            in (
+                Stage.ALIGN_PANEL,
+                Stage.CONTACT_PANEL,
+                Stage.PUSH_OPEN,
+                Stage.PUSH_ARM_RETRACT,
+                Stage.BASE_ADVANCE,
+            )
             and self.panel_align_ee_orientation_local is not None
         ):
             goal_ref_quat = _as_np(self.env.get_goal_reference_quat())[0]
             desired_orientation = _quat_mul_np(
                 goal_ref_quat, self.panel_align_ee_orientation_local
             )
-        if self.stage in (Stage.THROUGH, Stage.RESET_ARM, Stage.SUCCESS):
+        if self.stage in (Stage.THROUGH, Stage.SUCCESS):
             desired_orientation = self.initial_ee_orientation
         command_orientation = desired_orientation
-        if self.stage == Stage.PREGRASP and self.arm_align_command_quat is not None:
-            command_orientation = self.arm_align_command_quat
+        if (
+            self.stage in (Stage.PREGRASP, Stage.OPEN_GRIPPER)
+        ):
+            if (
+                self.arm_align_command_path is not None
+                and self.arm_align_orientation_path is not None
+                and self.arm_align_path_index
+                < len(self.arm_align_command_path) - 1
+            ):
+                command_orientation = self.arm_align_orientation_path[
+                    min(
+                        self.arm_align_path_index,
+                        len(self.arm_align_orientation_path) - 1,
+                    )
+                ]
+            elif self.arm_align_command_quat is not None:
+                command_orientation = self.arm_align_command_quat
         elif self.stage in (Stage.CENTER_HANDLE, Stage.GRASP_HANDLE):
-            if self.arm_forward_command_quat is not None:
+            if (
+                self.stage == Stage.CENTER_HANDLE
+                and self.arm_forward_command_path is not None
+                and self.arm_forward_orientation_path is not None
+            ):
+                command_orientation = self.arm_forward_orientation_path[
+                    min(
+                        self.arm_forward_path_index,
+                        len(self.arm_forward_orientation_path) - 1,
+                    )
+                ]
+            elif self.arm_forward_command_quat is not None:
                 command_orientation = self.arm_forward_command_quat
-        self.active_grasp_quat = self._slew_orientation(command_orientation)
+        if self.stage == Stage.CONTACT_PANEL:
+            # CONTACT_PANEL's final orientation is produced by the one-shot
+            # steady inverse below.  Preserve the previous command here so the
+            # prepared target is slewed exactly once after it is available.
+            self.active_grasp_quat = self.ee_orientation_command.copy()
+        else:
+            self.active_grasp_quat = self._slew_orientation(command_orientation)
         ee_orientation_error = 999.0
         if state.get("ee_orn") is not None:
             ee_orientation_error = self._quat_distance(
@@ -4051,11 +4146,9 @@ class DoorController:
         else:
             ee_target_world = grasp_center.copy()
         gripper = float(self.q_open if self.q_open is not None else -0.785)
-        if self.stage == Stage.APPROACH or (
-            self.stage == Stage.PREGRASP and not self.pregrasp_opening
-        ):
+        if self.stage in (Stage.APPROACH, Stage.PREGRASP):
             gripper = float(self.q_closed if self.q_closed is not None else 0.0)
-        if self.stage == Stage.PREGRASP:
+        if self.stage in (Stage.PREGRASP, Stage.OPEN_GRIPPER):
             # One arm-alignment stage: reach the final standoff position and
             # final grasp orientation, then become stationary before moving
             # toward the handle.
@@ -4069,9 +4162,6 @@ class DoorController:
                     len(self.arm_align_command_path) - 1,
                 )
                 ee_target_world = self.arm_align_command_path[path_index].copy()
-                self.active_grasp_quat = self._slew_orientation(
-                    self.arm_align_orientation_path[path_index]
-                )
                 self.arm_align_path_index = min(
                     path_index + 1, len(self.arm_align_command_path) - 1
                 )
@@ -4091,9 +4181,6 @@ class DoorController:
                     len(self.arm_forward_command_path) - 1,
                 )
                 ee_target_world = self.arm_forward_command_path[path_index].copy()
-                self.active_grasp_quat = self._slew_orientation(
-                    self.arm_forward_orientation_path[path_index]
-                )
                 self.arm_forward_path_index = min(
                     path_index + 1, len(self.arm_forward_command_path) - 1
                 )
@@ -4227,75 +4314,68 @@ class DoorController:
             # Follow the fixed stage-entry handle-rotation trajectory.
             ee_target_world, self.active_grasp_quat = self._turn_path_target(state)
             gripper = float(self.q_grasp)
-        elif self.stage == Stage.RELEASE_HANDLE:
-            if self.release_substage == "RETURN_HANDLE":
-                return_fraction = float(
-                    np.clip(self.stage_steps / self.release_return_steps, 0.0, 1.0)
+        elif self.stage == Stage.RETURN_HANDLE:
+            return_fraction = float(
+                np.clip(self.stage_steps / self.release_return_steps, 0.0, 1.0)
+            )
+            desired_handle_angle = (
+                (1.0 - return_fraction) * self.release_start_handle_angle
+            )
+            if return_fraction >= 1.0:
+                current_handle_angle = float(
+                    _as_np(state["door_joint_position"])[0, self.handle_joint_idx]
                 )
-                desired_handle_angle = (
-                    (1.0 - return_fraction) * self.release_start_handle_angle
+                desired_handle_angle -= float(
+                    np.clip(current_handle_angle, -0.06, 0.06)
                 )
-                if return_fraction >= 1.0:
-                    current_handle_angle = float(
-                        _as_np(state["door_joint_position"])[0, self.handle_joint_idx]
-                    )
-                    desired_handle_angle -= float(
-                        np.clip(current_handle_angle, -0.06, 0.06)
-                    )
-                return_delta = desired_handle_angle - self.release_start_handle_angle
-                return_rotation = _quat_axis_angle_np(
-                    self.release_return_axis_world, return_delta
-                )
-                ee_target_world = (
-                    self.release_return_axle_world
-                    + _quat_rotate_np(
-                        return_rotation, self.release_return_offset_world
-                    )
-                )
-                self.active_grasp_quat = _quat_mul_np(
-                    return_rotation, self.release_return_start_quat
-                )
-                gripper = float(self.q_grasp)
-            elif self.release_substage == "OPEN_AND_CLEAR":
-                open_steps = max(0, self.stage_steps - self.release_open_start_step)
-                gripper_fraction = float(np.clip(open_steps / 35.0, 0.0, 1.0))
-                if (
-                    self.release_open_command_path is None
-                    or self.release_open_orientation_path is None
-                ):
-                    raise RuntimeError("release open inverse path is unavailable")
-                path_index = min(open_steps, len(self.release_open_command_path) - 1)
-                ee_target_world = self.release_open_command_path[path_index].copy()
-                self.active_grasp_quat = self.release_open_orientation_path[
-                    path_index
-                ].copy()
-                gripper = (1.0 - gripper_fraction) * float(self.q_grasp) + gripper_fraction * float(self.q_open)
-            elif self.release_substage == "RETREAT":
-                if (
-                    self.release_retreat_command_path is None
-                    or self.release_retreat_orientation_path is None
-                ):
-                    raise RuntimeError("release retreat inverse path is unavailable")
-                path_index = min(
-                    self.release_retreat_path_index,
-                    len(self.release_retreat_command_path) - 1,
-                )
-                ee_target_world = self.release_retreat_command_path[
-                    path_index
-                ].copy()
-                self.active_grasp_quat = self.release_retreat_orientation_path[
-                    path_index
-                ].copy()
-                self.release_retreat_path_index = min(
-                    path_index + 1,
-                    len(self.release_retreat_command_path) - 1,
-                )
-                gripper = float(self.q_open)
-            else:
-                raise RuntimeError(
-                    f"Unsupported release substage: {self.release_substage}"
-                )
-        elif self.stage == Stage.RETRACT_ARM:
+            return_delta = desired_handle_angle - self.release_start_handle_angle
+            return_rotation = _quat_axis_angle_np(
+                self.release_return_axis_world, return_delta
+            )
+            ee_target_world = self.release_return_axle_world + _quat_rotate_np(
+                return_rotation, self.release_return_offset_world
+            )
+            self.active_grasp_quat = _quat_mul_np(
+                return_rotation, self.release_return_start_quat
+            )
+            gripper = float(self.q_grasp)
+        elif self.stage == Stage.OPEN_AND_CLEAR:
+            open_steps = self.stage_steps
+            gripper_fraction = float(np.clip(open_steps / 35.0, 0.0, 1.0))
+            if (
+                self.release_open_command_path is None
+                or self.release_open_orientation_path is None
+            ):
+                raise RuntimeError("release open inverse path is unavailable")
+            path_index = min(open_steps, len(self.release_open_command_path) - 1)
+            ee_target_world = self.release_open_command_path[path_index].copy()
+            self.active_grasp_quat = self.release_open_orientation_path[
+                path_index
+            ].copy()
+            gripper = (
+                (1.0 - gripper_fraction) * float(self.q_grasp)
+                + gripper_fraction * float(self.q_open)
+            )
+        elif self.stage == Stage.RETREAT_ARM:
+            if (
+                self.release_retreat_command_path is None
+                or self.release_retreat_orientation_path is None
+            ):
+                raise RuntimeError("release retreat inverse path is unavailable")
+            path_index = min(
+                self.release_retreat_path_index,
+                len(self.release_retreat_command_path) - 1,
+            )
+            ee_target_world = self.release_retreat_command_path[path_index].copy()
+            self.active_grasp_quat = self.release_retreat_orientation_path[
+                path_index
+            ].copy()
+            self.release_retreat_path_index = min(
+                path_index + 1,
+                len(self.release_retreat_command_path) - 1,
+            )
+            gripper = float(self.q_open)
+        elif self.stage == Stage.RESTORE_GRIPPER:
             # Hold the measured retreat endpoint while restoring orientation
             # and closing.  Position and orientation commands both come from
             # the same steady-state inverse path so wrist rotation cannot
@@ -4320,20 +4400,19 @@ class DoorController:
                 + restore_fraction * float(self.q_closed)
             )
         elif self.stage == Stage.ALIGN_PANEL:
-            # Carry the post-release arm pose with the trunk while the base
-            # moves laterally.  ALIGN_PANEL must not introduce another arm
-            # retreat or an unsolicited stow motion.
-            if self.panel_align_ee_goal_local is None:
-                self.panel_align_ee_goal_local = _as_np(
-                    state["ee_goal_cart_local"]
-                )[0].copy()
-            ee_local_override = self.panel_align_ee_goal_local
-            # The arm pose remains unchanged, but close the jaws after they
-            # have cleared the lever so the open finger span does not rake
-            # across the panel during the lateral base translation.
+            # Hold the measured entry joint pose while the base moves.
             gripper = 0.0
-        elif self.stage in (Stage.CONTACT_PANEL, Stage.PUSH_OPEN):
-            if self.stage == Stage.PUSH_OPEN and self.panel_tcp_world is not None:
+        elif self.stage in (
+            Stage.CONTACT_PANEL,
+            Stage.PUSH_OPEN,
+            Stage.PUSH_ARM_RETRACT,
+            Stage.BASE_ADVANCE,
+        ):
+            if (
+                self.stage
+                in (Stage.PUSH_OPEN, Stage.PUSH_ARM_RETRACT, Stage.BASE_ADVANCE)
+                and self.panel_tcp_world is not None
+            ):
                 current_hinge_joint = float(
                     _as_np(state["door_joint_position"])[0, self.hinge_idx]
                 )
@@ -4343,7 +4422,11 @@ class DoorController:
                 current_hinge_world = self.hinge_axis_sign * current_hinge_joint
                 if self.push_orientation is None:
                     self.push_orientation = self.active_grasp_quat.copy()
-                if self.push_substage == "ARM_TRACK":
+                if self.stage in (
+                    Stage.PUSH_OPEN,
+                    Stage.PUSH_ARM_RETRACT,
+                    Stage.BASE_ADVANCE,
+                ):
                     finger_clearance = self._panel_finger_clearance(
                         state, current_hinge_joint
                     )
@@ -4368,14 +4451,14 @@ class DoorController:
                         else float(np.linalg.norm(current_goal_local[:2]))
                     )
                     arm_overextended = bool(
-                        not self.push_arm_detached
+                        self.stage == Stage.PUSH_OPEN
                         and float(np.linalg.norm(current_goal_local[:2]))
                         > comfort_reach_radius
                     )
                     tracked_contact_delta = None
                     tracked_contact_world = None
                     tracked_contact_orientation = None
-                    if self.push_arm_detached:
+                    if self.stage in (Stage.PUSH_ARM_RETRACT, Stage.BASE_ADVANCE):
                         tracked_contact_delta = self.hinge_axis_sign * (
                             current_hinge_joint - self.push_start_hinge_angle
                         )
@@ -4388,11 +4471,12 @@ class DoorController:
                             self._yaw_quat(tracked_contact_delta),
                             self.push_orientation,
                         )
-                    if not self.push_arm_detached and arm_overextended:
+                    if self.stage == Stage.PUSH_OPEN and arm_overextended:
                         self.push_arm_detached = True
                         self.push_recovery_settle_steps = 0
                         self.push_detached_ee_goal_local = current_goal_local.copy()
-                        self.push_recovery_phase = "ARM_RETRACT"
+                        self.stage = Stage.PUSH_ARM_RETRACT
+                        self.stage_steps = 0
                         print(
                             f"[doorman][push] begin arm/base reposition "
                             f"reason=reach "
@@ -4402,7 +4486,7 @@ class DoorController:
                             flush=True,
                         )
 
-                    if self.push_arm_detached:
+                    if self.stage in (Stage.PUSH_ARM_RETRACT, Stage.BASE_ADVANCE):
                         if tracked_contact_world is None:
                             tracked_contact_delta = self.hinge_axis_sign * (
                                 current_hinge_joint - self.push_start_hinge_angle
@@ -4419,7 +4503,7 @@ class DoorController:
                         tracked_contact_local = _as_np(
                             self._ee_local_target(tracked_contact_world)
                         )[0]
-                        if self.push_recovery_phase == "ARM_RETRACT":
+                        if self.stage == Stage.PUSH_ARM_RETRACT:
                             retract_delta = (
                                 self.push_retracted_ee_goal_local
                                 - self.push_detached_ee_goal_local
@@ -4446,7 +4530,14 @@ class DoorController:
                                 else 0
                             )
                             if self.push_recovery_settle_steps >= 10:
-                                self.push_recovery_phase = "BASE_ADVANCE"
+                                arm_joint_ids = _as_np(
+                                    self.env.arm_joint_ids
+                                ).astype(int)
+                                self.base_advance_arm_joint_target = _as_np(
+                                    state["dof_pos"]
+                                )[0, arm_joint_ids].copy()
+                                self.stage = Stage.BASE_ADVANCE
+                                self.stage_steps = 0
                                 self.push_recovery_settle_steps = 0
                                 self.push_reengage_reachable = False
                                 print(
@@ -4454,7 +4545,7 @@ class DoorController:
                                     "begin base-only advance",
                                     flush=True,
                                 )
-                        elif self.push_recovery_phase == "BASE_ADVANCE":
+                        elif self.stage == Stage.BASE_ADVANCE:
                             ee_local_override = self.push_retracted_ee_goal_local.copy()
                             target_distance = float(
                                 np.linalg.norm(tracked_contact_local[:2])
@@ -4500,11 +4591,6 @@ class DoorController:
                                 self._begin_panel_contact(
                                     tracked_contact_orientation
                                 )
-                        else:
-                            raise RuntimeError(
-                                f"Unsupported push recovery phase: "
-                                f"{self.push_recovery_phase}"
-                            )
                         self.push_command_hinge_angle = current_hinge_joint
                         self.push_speed_error_integral = 0.0
                         self.push_finger_clearance = finger_clearance
@@ -4562,23 +4648,22 @@ class DoorController:
                             self.push_orientation,
                         )
                     self.active_grasp_quat = self.push_orientation.copy()
-                else:
-                    raise RuntimeError(
-                        f"Unsupported arm push substage: {self.push_substage}"
-                    )
             else:
                 if self.prepared_panel_contact_command is None:
                     self._prepare_panel_contact_command(state)
                 (
                     ee_target_world,
-                    self.active_grasp_quat,
+                    prepared_orientation,
                 ) = self.prepared_panel_contact_command
+                self.active_grasp_quat = self._slew_orientation(
+                    prepared_orientation
+                )
             gripper = 0.0
         elif self.stage == Stage.THROUGH:
             # Traverse with the arm held at the same middle joint preset used
             # for the final state; do not introduce a separate stow pose.
             gripper = 0.0
-        elif self.stage in (Stage.RESET_ARM, Stage.SUCCESS):
+        elif self.stage == Stage.SUCCESS:
             gripper = 0.0
 
         # Keep the reset-pose override exact, but slew every Cartesian target
@@ -4588,17 +4673,22 @@ class DoorController:
             self.stage == Stage.CENTER_HANDLE
             and self.arm_forward_command_path is not None
         )
-        if follows_precomputed_inverse_path:
+        if self.stage in (Stage.ALIGN_PANEL, Stage.BASE_ADVANCE):
+            # These stages hold measured joint angles while the base moves.
+            # Keep the Cartesian slew origin at the actual EE pose so the
+            # next EE-controlled stage starts continuously from that pose.
+            self.ee_command_world = _as_np(state["ee_pos"])[0].copy()
+        elif follows_precomputed_inverse_path:
             self.ee_command_world = ee_target_world.copy()
         elif ee_local_override is None and self.stage != Stage.TURN_HANDLE:
             if self.stage == Stage.CONTACT_PANEL:
                 max_step = 0.003
-            elif self.stage == Stage.PUSH_OPEN:
-                max_step = (
-                    self.push_max_ee_step
-                    if self.push_substage == "ARM_TRACK"
-                    else 0.002
-                )
+            elif self.stage in (
+                Stage.PUSH_OPEN,
+                Stage.PUSH_ARM_RETRACT,
+                Stage.BASE_ADVANCE,
+            ):
+                max_step = self.push_max_ee_step
             else:
                 max_step = 0.002 if self.stage == Stage.CENTER_HANDLE else 0.012
             ee_target_world = self._slew_ee_target(ee_target_world, max_step=max_step)
@@ -4647,14 +4737,14 @@ class DoorController:
             if pushing_to_handoff:
                 travel_cmd = self._travel_command(state, 0.35)
                 base_cmd[:2] = travel_cmd[:2]
-        elif self.stage == Stage.PUSH_OPEN:
+        elif self.stage == Stage.BASE_ADVANCE:
             base_cmd = (
                 self._arm_push_base_command(state)
-                if self.push_substage == "ARM_TRACK"
-                and self.push_recovery_phase == "BASE_ADVANCE"
-                and not self.disable_push_base_assist
+                if not self.disable_push_base_assist
                 else np.zeros(3, dtype=np.float32)
             )
+        elif self.stage in (Stage.PUSH_OPEN, Stage.PUSH_ARM_RETRACT):
+            base_cmd = np.zeros(3, dtype=np.float32)
         elif self.stage == Stage.ALIGN_PANEL:
             panel_station_xy, panel_station_yaw = self._current_panel_station(state)
             base_cmd, _, _ = self._base_command(
@@ -4663,8 +4753,11 @@ class DoorController:
                 panel_station_yaw,
             )
         elif self.stage == Stage.THROUGH:
-            through_ramp = min(1.0, self.stage_steps / 40.0)
-            base_cmd = self._travel_command(state, 0.20 + 0.35 * through_ramp)
+            base_cmd, station_dist, yaw_error = self._base_command(
+                state,
+                self.through_station_xy,
+                self.through_station_yaw,
+            )
         elif self.stage != Stage.APPROACH:
             base_cmd[:] = 0.0
 
@@ -4672,6 +4765,7 @@ class DoorController:
         # measured base itself remains stationary.
         if self.stage in (
             Stage.PREGRASP,
+            Stage.OPEN_GRIPPER,
             Stage.CENTER_HANDLE,
             Stage.GRASP_HANDLE,
             Stage.TURN_HANDLE,
@@ -4682,16 +4776,18 @@ class DoorController:
         elif self.stage in (
             Stage.CENTER_HANDLE,
             Stage.GRASP_HANDLE,
-            Stage.RELEASE_HANDLE,
-            Stage.RETRACT_ARM,
+            Stage.RETURN_HANDLE,
+            Stage.OPEN_AND_CLEAR,
+            Stage.RETREAT_ARM,
+            Stage.RESTORE_GRIPPER,
             Stage.CONTACT_PANEL,
-            Stage.RESET_ARM,
+            Stage.PUSH_ARM_RETRACT,
         ):
             base_cmd[:] = 0.0
 
         # Dampen residual base momentum at the TURN->RELEASE handoff.  This
         # brakes the robot in place; it is not a door-pushing command.
-        if self.stage == Stage.RELEASE_HANDLE and self.stage_steps < 20:
+        if self.stage == Stage.RETURN_HANDLE and self.stage_steps < 20:
             base = _as_np(state["root_states"])[0]
             yaw = _quat_yaw(base[3:7])
             c, s = math.cos(yaw), math.sin(yaw)
@@ -4703,6 +4799,8 @@ class DoorController:
             base_cmd[:2] = np.clip(-1.5 * local_vel, -0.25, 0.25)
             base_cmd[2] = np.clip(-0.8 * float(base[12]), -0.25, 0.25)
 
+        base_cmd = _limit_base_commands(base_cmd)
+
         ee_local = (
             torch.as_tensor(ee_local_override, device=self.env.device, dtype=torch.float32).reshape(1, 3)
             if ee_local_override is not None
@@ -4713,7 +4811,7 @@ class DoorController:
         # later stage cannot resume from a stale grasp orientation.
         self.ee_orientation_command = self.active_grasp_quat.copy()
         orn = np.zeros((1, 3), dtype=np.float32)
-        use_world_orientation = self.stage not in (Stage.RESET_ARM, Stage.SUCCESS)
+        use_world_orientation = self.stage != Stage.SUCCESS
         if state.get("ee_orn") is not None:
             self.ee_orientation_error = self._quat_distance(
                 _as_np(state["ee_orn"])[0], self.active_grasp_quat
@@ -4737,26 +4835,35 @@ class DoorController:
                 base_cmd.reshape(1, 3),
                 gripper_target=np.asarray([[gripper]], dtype=np.float32),
             )
-        elif self.stage in (Stage.THROUGH, Stage.RESET_ARM, Stage.SUCCESS):
+        elif self.stage in (Stage.ALIGN_PANEL, Stage.BASE_ADVANCE):
+            self.env._set_teleop_arm_control_mode("joint")
+            arm_target = (
+                self.align_panel_arm_joint_target
+                if self.stage == Stage.ALIGN_PANEL
+                else self.base_advance_arm_joint_target
+            )
+            if arm_target is None:
+                raise RuntimeError(
+                    f"{self.stage.name} arm joint hold target is unavailable"
+                )
+            hold_target = torch.as_tensor(
+                arm_target,
+                device=self.env.device,
+                dtype=torch.float32,
+            ).reshape(1, -1)
+            self.env.teleop_arm_joint_pos_targets.copy_(hold_target)
+            self.runner.set_teleop_targets(
+                base_cmd.reshape(1, 3),
+                gripper_target=np.asarray([[gripper]], dtype=np.float32),
+            )
+        elif self.stage in (Stage.THROUGH, Stage.SUCCESS):
             self.env._set_teleop_arm_control_mode("joint")
             middle_target = torch.as_tensor(
                 self.middle_arm_joint_target,
                 device=self.env.device,
                 dtype=torch.float32,
             ).reshape(1, -1)
-            max_joint_step = torch.as_tensor(
-                self.middle_arm_joint_speed_limits,
-                device=self.env.device,
-                dtype=torch.float32,
-            ).reshape(1, -1) * float(self.env.dt)
-            current_target = self.env.teleop_arm_joint_pos_targets
-            current_target.add_(
-                torch.clamp(
-                    middle_target - current_target,
-                    min=-max_joint_step,
-                    max=max_joint_step,
-                )
-            )
+            self.env.teleop_arm_joint_pos_targets.copy_(middle_target)
             self.runner.set_teleop_targets(
                 base_cmd.reshape(1, 3),
                 gripper_target=np.asarray([[gripper]], dtype=np.float32),
@@ -4806,10 +4913,10 @@ class DoorController:
         local_y = -s * velocity_world[0] + c * velocity_world[1]
         target_yaw = math.atan2(float(direction[1]), float(direction[0]))
         yaw_error = ((target_yaw - yaw + math.pi) % (2 * math.pi)) - math.pi
-        return np.array(
+        return _limit_base_commands(np.array(
             [local_x, local_y, np.clip(1.2 * yaw_error, -0.6, 0.6)],
             dtype=np.float32,
-        )
+        ))
 
     def _current_panel_station(self, state):
         """Return the fixed doorway-centred station facing the door frame."""
@@ -5091,11 +5198,11 @@ class DoorController:
             self.panel_contact_inverse_command_orientation_world.copy(),
         )
 
-    def _begin_through(self, base_xy, opening_angle, opening_speed):
+    def _begin_through(self, opening_angle, opening_speed):
         """Start traversing as soon as the door crosses the accepted angle."""
-        self.through_start_base_xy = np.asarray(base_xy, dtype=np.float32).copy()
-        self.through_best_distance = 0.0
+        self.through_best_station_error = math.inf
         self.through_no_progress_steps = 0
+        self.through_settle_steps = 0
         self.stage = Stage.THROUGH
         self.stage_steps = 0
         print(
@@ -5104,6 +5211,21 @@ class DoorController:
             f"speed={opening_speed:.4f} max_speed="
             f"{self.push_max_observed_angular_speed:.4f}",
             flush=True,
+        )
+
+    def _through_tail_clearance(self, state):
+        """Signed distance from the trunk rear edge to the door-frame plane."""
+        base = _as_np(state["root_states"])[0]
+        rear_offset_world = _quat_rotate_np(
+            base[3:7],
+            np.array([ROBOT_TRUNK_REAR_X, 0.0, 0.0], dtype=np.float32),
+        )
+        tail_xy = base[:2] + rear_offset_world[:2]
+        return float(
+            np.dot(
+                tail_xy - self.initial_door_root[:2],
+                self.door_forward[:2],
+            )
         )
 
     def _arm_push_base_command(self, state):
@@ -5236,14 +5358,18 @@ class DoorController:
         )
         target_yaw = math.atan2(float(forward[1]), float(forward[0]))
         yaw_error = ((target_yaw - yaw + math.pi) % (2 * math.pi)) - math.pi
-        return np.array(
+        return _limit_base_commands(np.array(
             [
                 c * velocity_world[0] + s * velocity_world[1],
                 -s * velocity_world[0] + c * velocity_world[1],
-                np.clip(1.5 * yaw_error - 0.35 * base[12], -1.0, 1.0),
+                np.clip(
+                    1.5 * yaw_error - 0.35 * base[12],
+                    -MAX_BASE_YAW_RATE,
+                    MAX_BASE_YAW_RATE,
+                ),
             ],
             dtype=np.float32,
-        )
+        ))
 
     def _body_push_command(self, state, forward_speed):
         """Push forward while rejecting lateral sliding along the panel."""
@@ -5264,14 +5390,14 @@ class DoorController:
         c, s = math.cos(yaw), math.sin(yaw)
         target_yaw = math.atan2(float(self.door_forward[1]), float(self.door_forward[0]))
         yaw_error = ((target_yaw - yaw + math.pi) % (2.0 * math.pi)) - math.pi
-        return np.array(
+        return _limit_base_commands(np.array(
             [
                 c * velocity_world[0] + s * velocity_world[1],
                 -s * velocity_world[0] + c * velocity_world[1],
                 np.clip(1.2 * yaw_error, -0.6, 0.6),
             ],
             dtype=np.float32,
-        )
+        ))
 
     def _push_arc_command(self, state, speed):
         """Follow the panel contact point's circular path about the hinge."""
@@ -5295,10 +5421,10 @@ class DoorController:
         local_y = -s * tangent[0] + c * tangent[1]
         target_yaw = math.atan2(float(tangent[1]), float(tangent[0]))
         yaw_error = ((target_yaw - yaw + math.pi) % (2 * math.pi)) - math.pi
-        return np.array(
+        return _limit_base_commands(np.array(
             [speed * local_x, speed * local_y, np.clip(0.8 * yaw_error, -0.35, 0.35)],
             dtype=np.float32,
-        )
+        ))
 
     def _reset_turn_path(self):
         """Invalidate the rolling path whenever TURN_HANDLE is left."""
@@ -5511,24 +5637,42 @@ class DoorController:
                     key=lambda quat: float(_quat_rotate_np(quat, shaft_local)[2]),
                 )
             orientation /= max(float(np.linalg.norm(orientation)), 1.0e-8)
+            end_position = self.center_standoff_ee_world.copy()
+            fixed_inner_offset_world = _quat_rotate_np(
+                orientation, self.fixed_inner_center_local
+            )
+            end_position[2] = (
+                self.fixed_surface_target_z - fixed_inner_offset_world[2]
+            )
             candidates.append(
                 {
                     "pitch_deg": pitch_deg,
                     "orientation": orientation.astype(np.float32),
-                    "end_position": self.center_standoff_ee_world.copy(),
+                    "end_position": end_position.astype(np.float32),
                 }
             )
         return candidates
 
     def _apply_pregrasp_candidate(self, candidate):
-        """Commit one selected pitch without changing the Cartesian targets."""
+        """Commit one selected pitch and its fixed-jaw-anchored target height."""
         orientation = np.asarray(candidate["orientation"], dtype=np.float32)
+        end_position = np.asarray(candidate["end_position"], dtype=np.float32)
         self.pregrasp_pitch_deg = float(candidate["pitch_deg"])
         self.grasp_orientation_quat = orientation.copy()
         self.reachable_grasp_orientation_quat = orientation.copy()
         self.grasp_ee_offset_world = _quat_rotate_np(
             orientation, self.open_template["tip_capture_center"]
         )
+        for name in (
+            "center_standoff_ee_world",
+            "center_standoff_nominal_world",
+            "center_insert_waypoint_world",
+            "center_insert_nominal_world",
+            "grasp_waypoint_world",
+            "grasp_nominal_world",
+        ):
+            target = getattr(self, name)
+            target[2] = end_position[2]
 
     def _plan_pregrasp_path(self, state, start_position_world):
         """Select one reachable wrist pitch, then solve only that full path."""
@@ -5863,7 +6007,6 @@ class DoorController:
             self.arm_forward_path_index = 0
             self.arm_forward_command_world = positions[-1].copy()
             self.arm_forward_command_quat = orientations[-1].copy()
-            self.center_substage = "CENTER_FORWARD"
             self.arm_stability_window.clear()
             self.stage = Stage.CENTER_HANDLE
             self.stage_steps = 0
@@ -5884,7 +6027,7 @@ class DoorController:
             self.ee_command_world = positions[0].copy()
             self.arm_stability_window.clear()
             self.release_stable_steps = 0
-            self.stage = Stage.RETRACT_ARM
+            self.stage = Stage.RESTORE_GRIPPER
             self.stage_steps = 0
         else:
             raise RuntimeError(f"unsupported deferred path label: {label}")
@@ -5992,8 +6135,6 @@ class DoorController:
 
         next_sample = self.open_loop_trajectory[self.trajectory_step]
         self.stage = next_sample["stage"]
-        if next_sample["substage"] is not None:
-            self.center_substage = next_sample["substage"]
         if self.stage != previous_stage:
             print(
                 f"[doorman][plan] stage {previous_stage.name} -> {self.stage.name} "
@@ -6119,7 +6260,7 @@ class DoorController:
                 self.push_max_observed_angular_speed,
                 max(0.0, opening_speed),
             )
-            self._begin_through(base_xy, hinge, opening_speed)
+            self._begin_through(hinge, opening_speed)
 
         if self.stage == Stage.APPROACH:
             angular_speed = float(
@@ -6144,7 +6285,7 @@ class DoorController:
                 self.arm_align_command_quat = self.arm_align_orientation_path[-1].copy()
                 self.arm_stability_window.clear()
                 self.stage = Stage.PREGRASP; self.stage_steps = 0
-        elif self.stage == Stage.PREGRASP:
+        elif self.stage in (Stage.PREGRASP, Stage.OPEN_GRIPPER):
             arm_stable = self._arm_pose_is_stable(state)
             align_path_complete = bool(
                 self.arm_align_command_path is not None
@@ -6193,12 +6334,13 @@ class DoorController:
                     ].astype(float).tolist(),
                 }
             )
-            if not self.pregrasp_opening:
+            if self.stage == Stage.PREGRASP:
                 self.pregrasp_settle_steps = (
                     self.pregrasp_settle_steps + 1 if arm_aligned else 0
                 )
                 if self.pregrasp_settle_steps >= 5:
-                    self.pregrasp_opening = True
+                    self.stage = Stage.OPEN_GRIPPER
+                    self.stage_steps = 0
                     self.gripper_open_settle = 0
                     print(
                         "[doorman][pregrasp] arm aligned and stable; opening gripper",
@@ -6210,7 +6352,7 @@ class DoorController:
                 float(_as_np(state["dof_vel"])[0, gripper_joint_id])
             )
             gripper_open_stable = bool(
-                self.pregrasp_opening
+                self.stage == Stage.OPEN_GRIPPER
                 and arm_aligned
                 and abs(actual_q - self.q_open) < 0.02
                 and gripper_speed < 0.05
@@ -6218,10 +6360,8 @@ class DoorController:
             self.gripper_open_settle = (
                 self.gripper_open_settle + 1 if gripper_open_stable else 0
             )
-            if self.gripper_open_settle >= 10:
-                self.arm_forward_target_world = (
-                    self.grasp_waypoint_world - 0.010 * self.door_normal
-                ).astype(np.float32)
+            if self.stage == Stage.OPEN_GRIPPER and self.gripper_open_settle >= 10:
+                self.arm_forward_target_world = self.grasp_waypoint_world.copy()
                 (
                     self.arm_forward_command_path,
                     self.arm_forward_orientation_path,
@@ -6238,7 +6378,6 @@ class DoorController:
                 self.arm_forward_command_quat = (
                     self.arm_forward_orientation_path[-1].copy()
                 )
-                self.center_substage = "CENTER_FORWARD"
                 self.arm_stability_window.clear()
                 self.stage = Stage.CENTER_HANDLE; self.stage_steps = 0
         elif self.stage == Stage.CENTER_HANDLE:
@@ -6487,17 +6626,20 @@ class DoorController:
                 )
                 self.release_return_start_quat = _as_np(state["ee_orn"])[0].copy()
                 self.release_vertical_delta = -float(self.grasp_vertical_lift)
-                self.release_substage = "RETURN_HANDLE"
                 self.ee_command_world = ee.copy()
                 self.release_stable_steps = 0
-                self.stage = Stage.RELEASE_HANDLE; self.stage_steps = 0
+                self.stage = Stage.RETURN_HANDLE; self.stage_steps = 0
         if self.stage == Stage.TURN_HANDLE:
             self.turn_last_handle_angle = handle_joint
             self.turn_last_hinge_angle = hinge
-        elif self.stage == Stage.RELEASE_HANDLE:
+        elif self.stage in (
+            Stage.RETURN_HANDLE,
+            Stage.OPEN_AND_CLEAR,
+            Stage.RETREAT_ARM,
+        ):
             release_contact_clear = not np.any(handle_contact_present)
             gripper_open = abs(gripper_pos - float(self.q_open)) < 0.08
-            if self.release_substage == "RETURN_HANDLE":
+            if self.stage == Stage.RETURN_HANDLE:
                 handle_horizontal = abs(handle_joint) < 0.05
                 self.release_stable_steps = (
                     self.release_stable_steps + 1
@@ -6506,9 +6648,9 @@ class DoorController:
                     else 0
                 )
                 if self.release_stable_steps >= 10:
-                    self.release_substage = "OPEN_AND_CLEAR"
+                    self.stage = Stage.OPEN_AND_CLEAR
+                    self.stage_steps = 0
                     self.release_open_start_world = ee.copy()
-                    self.release_open_start_step = self.stage_steps
                     self.release_start_quat = _as_np(state["ee_orn"])[0].copy()
                     release_open_end_world = (
                         self.release_open_start_world
@@ -6540,15 +6682,15 @@ class DoorController:
                         f"vertical_delta={self.release_vertical_delta:.4f}",
                         flush=True,
                     )
-            elif self.release_substage == "OPEN_AND_CLEAR":
+            elif self.stage == Stage.OPEN_AND_CLEAR:
                 fully_released = gripper_open and release_contact_clear
                 self.release_stable_steps = (
                     self.release_stable_steps + 1 if fully_released else 0
                 )
                 if self.release_stable_steps >= 10:
-                    self.release_substage = "RETREAT"
+                    self.stage = Stage.RETREAT_ARM
+                    self.stage_steps = 0
                     self.release_retreat_start_world = ee.copy()
-                    self.release_retreat_start_step = self.stage_steps
                     self.release_retreat_target_world = (
                         self.release_retreat_start_world
                         + 0.10 * self.door_normal
@@ -6592,7 +6734,7 @@ class DoorController:
                         f"hinge={hinge:.4f}",
                         flush=True,
                     )
-            elif self.release_substage == "RETREAT":
+            elif self.stage == Stage.RETREAT_ARM:
                 retreat_path_complete = bool(
                     self.release_retreat_command_path is not None
                     and self.release_retreat_path_index
@@ -6610,8 +6752,8 @@ class DoorController:
                     self.release_stable_steps + 1 if retreat_complete else 0
                 )
                 if self.release_stable_steps >= 10:
-                    self.release_endpoint_world = (
-                        self.release_retreat_target_world.copy()
+                    self.release_endpoint_world = self._ee_world_target(
+                        self.push_retracted_ee_goal_local
                     )
                     current_orientation = _as_np(state["ee_orn"])[0].copy()
                     dof_names = list(state["dof_names"])
@@ -6631,6 +6773,19 @@ class DoorController:
                         _quat_axis_angle_np(wrist_axis_world, wrist_roll_delta),
                         current_orientation,
                     )
+                    restore_steps = max(
+                        50,
+                        int(
+                            math.ceil(
+                                float(
+                                    np.linalg.norm(
+                                        self.release_endpoint_world - ee
+                                    )
+                                )
+                                / 0.004
+                            )
+                        ),
+                    )
                     (
                         self.release_restore_command_path,
                         self.release_restore_orientation_path,
@@ -6642,7 +6797,7 @@ class DoorController:
                         self.release_endpoint_quat,
                         self.q_open,
                         self.q_closed,
-                        steps=50,
+                        steps=restore_steps,
                         label="release_restore_path",
                     )
                     print(
@@ -6657,23 +6812,17 @@ class DoorController:
                     )
                     self.arm_stability_window.clear()
                     self.release_stable_steps = 0
-                    self.stage = Stage.RETRACT_ARM; self.stage_steps = 0
-        elif self.stage == Stage.RETRACT_ARM:
+                    self.stage = Stage.RESTORE_GRIPPER; self.stage_steps = 0
+        elif self.stage == Stage.RESTORE_GRIPPER:
             gripper_closed = abs(gripper_pos - float(self.q_closed)) < 0.03
-            dof_names = list(state["dof_names"])
-            wrist_roll = float(
-                _as_np(state["dof_pos"])[0, dof_names.index("joint6")]
-            )
             orientation_restored = self._quat_distance(
                 _as_np(state["ee_orn"])[0], self.release_endpoint_quat
             ) < 0.05
-            wrist_roll_restored = abs(wrist_roll - self.initial_wrist_roll) < 0.05
             arm_stable = self._arm_pose_is_stable(state)
             restored = bool(
                 self.stage_steps >= 50
                 and gripper_closed
                 and orientation_restored
-                and wrist_roll_restored
                 and np.linalg.norm(ee - self.release_endpoint_world) <= 0.010
                 and arm_stable
             )
@@ -6681,6 +6830,10 @@ class DoorController:
                 self.release_stable_steps + 1 if restored else 0
             )
             if self.release_stable_steps >= 10:
+                arm_joint_ids = _as_np(self.env.arm_joint_ids).astype(int)
+                self.align_panel_arm_joint_target = _as_np(
+                    state["dof_pos"]
+                )[0, arm_joint_ids].copy()
                 self.panel_align_ee_goal_local = _as_np(
                     state["ee_goal_cart_local"]
                 )[0].copy()
@@ -6765,7 +6918,6 @@ class DoorController:
                 self.push_last_progress_hinge = hinge
                 self.push_no_progress_steps = 0
                 self.push_pause_steps = 0
-                self.push_substage = "ARM_TRACK"
                 self.push_contact_world = self.panel_contact_target_world.copy()
                 self.push_finger_clearance = self._panel_finger_clearance(state, hinge)
                 self.push_finger_approach_speed = 0.0
@@ -6774,7 +6926,6 @@ class DoorController:
                 self.push_contact_retreat_active = False
                 self.push_arm_detached = False
                 self.push_detached_ee_goal_local = None
-                self.push_recovery_phase = None
                 self.push_recovery_settle_steps = 0
                 self.push_comfort_reach_radius = 0.7
                 self.push_reengage_reachable = False
@@ -6802,7 +6953,11 @@ class DoorController:
                 self.push_base_start_xy = base_xy.copy()
                 self.push_panel_contact_start_world = self.push_contact_world.copy()
                 self.stage = Stage.PUSH_OPEN; self.stage_steps = 0
-        elif self.stage == Stage.PUSH_OPEN:
+        elif self.stage in (
+            Stage.PUSH_OPEN,
+            Stage.PUSH_ARM_RETRACT,
+            Stage.BASE_ADVANCE,
+        ):
             hinge_velocity = float(
                 _as_np(state["door_joint_velocity"])[0, self.hinge_idx]
             )
@@ -6824,18 +6979,15 @@ class DoorController:
                     f"limit={self.push_max_angular_speed:.4f}"
                 )
                 self.stage = Stage.FAILURE
-            elif (
-                self.push_substage == "ARM_TRACK"
-                and opening_angle > math.radians(94.0)
-            ):
+            elif opening_angle > math.radians(94.0):
                 self.failure_reason = (
                     f"push_angle_overshoot:hinge={opening_angle:.4f}"
                 )
                 self.stage = Stage.FAILURE
-            elif self.push_substage == "ARM_TRACK":
+            else:
                 near_goal = opening_angle >= math.radians(89.0)
                 if near_goal:
-                    self._begin_through(base_xy, opening_angle, opening_speed)
+                    self._begin_through(opening_angle, opening_speed)
                 else:
                     if self.push_arm_detached:
                         self.push_no_progress_steps = 0
@@ -6858,48 +7010,20 @@ class DoorController:
                             f"command={self.push_command_hinge_angle:.4f}"
                         )
                         self.stage = Stage.FAILURE
-            else:
-                raise RuntimeError(
-                    f"Unsupported arm push substage: {self.push_substage}"
-                )
         elif self.stage == Stage.THROUGH:
-            through_origin = (
-                self.through_start_base_xy
-                if self.through_start_base_xy is not None
-                else base_xy
-            )
-            through_distance = float(
-                np.dot(base_xy - through_origin, self.door_forward[:2])
-            )
+            tail_clearance = self._through_tail_clearance(state)
             opening_angle = hinge
             base_up = _quat_rotate_np(
                 base[3:7], np.array([0.0, 0.0, 1.0], dtype=np.float32)
             )
             upright = float(base_up[2])
-            if through_distance > self.through_best_distance + 0.01:
-                self.through_best_distance = through_distance
+            if station_dist < self.through_best_station_error - 0.01:
+                self.through_best_station_error = station_dist
                 self.through_no_progress_steps = 0
-            else:
+            elif station_dist >= self.station_tolerance:
                 self.through_no_progress_steps += 1
-            if upright < 0.75 or base[2] < 0.30:
-                self.failure_reason = (
-                    f"through_robot_fell:up={upright:.3f},height={base[2]:.3f}"
-                )
-                self.stage = Stage.FAILURE
-            elif opening_angle < math.radians(65.0) and through_distance < 0.8:
-                self.failure_reason = (
-                    f"through_door_swingback:hinge={hinge:.4f},"
-                    f"distance={through_distance:.3f}"
-                )
-                self.stage = Stage.FAILURE
-            elif self.through_no_progress_steps > 150:
-                self.failure_reason = (
-                    f"through_no_progress:distance={through_distance:.3f}"
-                )
-                self.stage = Stage.FAILURE
-            elif through_distance > 1.0:
-                self.stage = Stage.RESET_ARM; self.stage_steps = 0
-        elif self.stage == Stage.RESET_ARM:
+            else:
+                self.through_no_progress_steps = 0
             arm_joint_ids = _as_np(self.env.arm_joint_ids).astype(int)
             arm_position = _as_np(state["dof_pos"])[0, arm_joint_ids]
             arm_velocity = _as_np(state["dof_vel"])[0, arm_joint_ids]
@@ -6910,16 +7034,49 @@ class DoorController:
             reset_ee_speed = float(
                 np.linalg.norm(_as_np(state["ee_vel"])[0, :3])
             )
-            if (
-                self.stage_steps >= 80
+            base_stable_at_target = (
+                station_dist < self.station_tolerance
+                and yaw_error < 0.08
+                and speed < 0.02
+                and float(np.linalg.norm(base[10:13])) < 0.05
+            )
+            self.through_settle_steps = (
+                self.through_settle_steps + 1
+                if base_stable_at_target
+                else 0
+            )
+            if upright < 0.75 or base[2] < 0.30:
+                self.failure_reason = (
+                    f"through_robot_fell:up={upright:.3f},height={base[2]:.3f}"
+                )
+                self.stage = Stage.FAILURE
+            elif opening_angle < math.radians(65.0) and tail_clearance < 0.8:
+                self.failure_reason = (
+                    f"through_door_swingback:hinge={hinge:.4f},"
+                    f"tail_clearance={tail_clearance:.3f}"
+                )
+                self.stage = Stage.FAILURE
+            elif (
+                station_dist >= self.station_tolerance
+                and self.through_no_progress_steps > 150
+            ):
+                self.failure_reason = (
+                    f"through_no_progress:station_error={station_dist:.3f},"
+                    f"tail_clearance={tail_clearance:.3f}"
+                )
+                self.stage = Stage.FAILURE
+            elif (
+                self.through_settle_steps >= 20
                 and middle_joint_error < 0.05
                 and middle_joint_speed < 0.08
                 and reset_ee_speed < 0.08
-                and speed < 0.10
             ):
                 self.stage = Stage.SUCCESS; self.stage_steps = 0
         self.stage_steps += 1
-        if self.stage in self.stage_limits and self.stage_steps > self.stage_limits[self.stage]:
+        if (
+            self.stage in self.stage_limits
+            and self.stage_steps > self.stage_limits[self.stage]
+        ):
             if self.stage == Stage.TURN_HANDLE:
                 self.failure_reason = (
                     f"turn_timeout:handle_delta={abs(self.turn_last_handle_angle - self.turn_start_handle_angle):.4f},"
@@ -6943,7 +7100,9 @@ class DoorController:
                 f"panel_dist={panel_dist:.3f} pregrasp_dist={pregrasp_dist:.3f} "
                 f"panel_settle={self.panel_contact_settle_steps} "
                 f"push_progress={0.0 if self.push_start_hinge_angle is None else hinge - self.push_start_hinge_angle:.3f} "
-                f"through_distance={0.0 if self.through_start_base_xy is None else float(np.dot(base_xy - self.through_start_base_xy, self.door_forward[:2])):.3f} "
+                f"through_tail_clearance={self._through_tail_clearance(state):.3f} "
+                f"through_station_error={float(np.linalg.norm(base_xy - self.through_station_xy)):.3f} "
+                f"through_settle={self.through_settle_steps} "
                 f"grasp_contact_force={grasp_contact_force:.3f} "
                 f"finger_contact_forces={finger_contact_norms.round(3).tolist()} "
                 f"handle_contact_forces={handle_contact_norms.round(3).tolist()} "
@@ -6957,7 +7116,7 @@ class DoorController:
                 if isinstance(value, (float, int, np.floating))
             }
             print(
-                f"[doorman][center] substage={self.center_substage} q={actual_q if 'actual_q' in locals() else float('nan'):.4f} "
+                f"[doorman][center] q={actual_q if 'actual_q' in locals() else float('nan'):.4f} "
                 f"metrics={scalar_metrics}",
                 flush=True,
             )
@@ -7015,10 +7174,12 @@ def _serialize_episode(
         "handle_contact_points_w",
         "door_root_pose_w", "door_joint_position", "door_joint_velocity", "handle_pose_w",
         "base_command", "ee_goal_cart_local", "ee_goal_delta_rpy", "gripper_command",
-        "high_level_action", "low_level_action", "center_substage_id",
+        "high_level_action", "low_level_action",
         "q_open", "gripper_actual", "center_horizontal_error", "center_upper_gap",
         "center_lower_gap", "center_grasp_depth", "center_pocket_error",
-        "center_pocket_normal_error", "center_pocket_vertical_error", "center_panel_clearance",
+        "center_pocket_normal_error", "center_pocket_axial_error",
+        "center_pocket_vertical_error", "center_channel_vertical_error",
+        "center_panel_clearance",
         "handle_contact_force", "push_command_hinge_angle",
         "push_shoulder_min_clearance", "push_shoulder_predicted_min_clearance",
         "push_base_safety_scale", "push_finger_clearance",
@@ -7135,7 +7296,7 @@ def _serialize_episode(
                     )
                     break
                 if debug_stage == "retract_arm" and controller.stage == Stage.ALIGN_PANEL:
-                    controller.stage = Stage.RETRACT_ARM
+                    controller.stage = Stage.RESTORE_GRIPPER
                     controller.stage_steps = 100
                     debug_retract_hold_steps = 50
             else:
@@ -7172,13 +7333,9 @@ def _serialize_episode(
                 else float(door_joint_dbg[controller.hinge_idx])
                 - controller.push_start_hinge_angle
             )
-            through_distance_dbg = (
-                0.0
-                if controller.through_start_base_xy is None
-                else float(np.dot(
-                    base_dbg[:2] - controller.through_start_base_xy,
-                    controller.door_forward[:2],
-                ))
+            through_tail_clearance_dbg = controller._through_tail_clearance(state)
+            through_station_error_dbg = float(
+                np.linalg.norm(base_dbg[:2] - controller.through_station_xy)
             )
             print(
                 f"[doorman] step={step} stage={controller.stage.name} "
@@ -7189,7 +7346,6 @@ def _serialize_episode(
                 f"grasp_orientation_error={controller.ee_orientation_error:.3f} "
                 f"door_joints={door_joint_dbg} "
                 f"panel_settle={controller.panel_contact_settle_steps} "
-                f"push_substage={controller.push_substage} "
                 f"push_progress={push_progress_dbg:.3f} "
                 f"push_command_hinge={controller.push_command_hinge_angle} "
                 f"shoulder_clearance={controller.push_shoulder_min_clearance:.3f} "
@@ -7200,7 +7356,9 @@ def _serialize_episode(
                 f"finger_clearance_target={controller.push_target_finger_clearance:.4f} "
                 f"push_finger_force={controller.push_finger_force:.1f} "
                 f"contact_retreat={int(controller.push_contact_retreat_active)} "
-                f"through_distance={through_distance_dbg:.3f} "
+                f"through_tail_clearance={through_tail_clearance_dbg:.3f} "
+                f"through_station_error={through_station_error_dbg:.3f} "
+                f"through_settle={controller.through_settle_steps} "
                 f"finger_positions={finger_pos_dbg} finger_contact_forces={finger_force_dbg} "
                 f"handle_contact_forces={handle_force_dbg}",
                 flush=True,
@@ -7309,11 +7467,7 @@ def _serialize_episode(
         records["push_contact_retreat_active"].append(
             bool(controller.push_contact_retreat_active)
         )
-        center_substages = (
-            "CENTER_FORWARD",
-        )
         metrics = controller.center_metrics
-        records["center_substage_id"].append(center_substages.index(controller.center_substage) if controller.center_substage in center_substages else -1)
         records["q_open"].append(float(controller.q_open if controller.q_open is not None else np.nan))
         records["gripper_actual"].append(float(state_np["gripper_position"][0, 0]))
         for key, record_key in (
@@ -7323,7 +7477,9 @@ def _serialize_episode(
             ("grasp_depth", "center_grasp_depth"),
             ("pocket_center_error", "center_pocket_error"),
             ("pocket_normal_error", "center_pocket_normal_error"),
+            ("pocket_axial_error", "center_pocket_axial_error"),
             ("pocket_vertical_error", "center_pocket_vertical_error"),
+            ("channel_vertical_error", "center_channel_vertical_error"),
             ("panel_clearance", "center_panel_clearance"),
         ):
             records[record_key].append(float(metrics.get(key, np.nan)))
@@ -7393,7 +7549,7 @@ def _serialize_episode(
                 )
                 break
             if debug_stage == "retract_arm" and controller.stage == Stage.ALIGN_PANEL:
-                controller.stage = Stage.RETRACT_ARM
+                controller.stage = Stage.RESTORE_GRIPPER
                 controller.stage_steps = 100
                 debug_retract_hold_steps = 50
                 print(
@@ -7407,7 +7563,7 @@ def _serialize_episode(
                 controller.stage = Stage.SUCCESS
                 controller.failure_reason = None
                 print(
-                    "[doorman][debug] RELEASE_HANDLE and RETRACT_ARM validation passed",
+                    "[doorman][debug] handle-release stages and RESTORE_GRIPPER validation passed",
                     flush=True,
                 )
     success = controller.stage == Stage.SUCCESS
@@ -7529,6 +7685,10 @@ def _serialize_episode(
             "base_push_shoulder_safety_margin_m": controller.push_shoulder_safety_margin,
             "base_push_prediction_horizon_s": 0.45,
             "base_push_assumed_deceleration_m_s2": 0.60,
+            "through_tail_reference_local_m": [ROBOT_TRUNK_REAR_X, 0.0, 0.0],
+            "through_tail_target_distance_m": THROUGH_TAIL_TARGET_DISTANCE,
+            "through_station_xy_world_m": controller.through_station_xy.tolist(),
+            "through_station_yaw_rad": controller.through_station_yaw,
         },
         "assist_mode": "none",
         "door_effort_assist": False,
@@ -7922,7 +8082,13 @@ def _run_batched(args):
                 env_id
                 for env_id, controller in enumerate(controllers)
                 if active_env_mask[env_id]
-                and controller.stage in (Stage.CONTACT_PANEL, Stage.PUSH_OPEN)
+                and controller.stage
+                in (
+                    Stage.CONTACT_PANEL,
+                    Stage.PUSH_OPEN,
+                    Stage.PUSH_ARM_RETRACT,
+                    Stage.BASE_ADVANCE,
+                )
             ]
             if panel_clearance_env_ids:
                 panel_start = time.perf_counter()
@@ -8105,7 +8271,7 @@ def _run_batched(args):
             env_id
             for env_id, controller in enumerate(controllers)
             if active_env_mask[env_id]
-            and controller.stage not in (Stage.SUCCESS, Stage.FAILURE, Stage.RESET_ARM)
+            and controller.stage not in (Stage.SUCCESS, Stage.FAILURE)
         ]
         phase_start = time.perf_counter()
         orientation_delta = _batched_grasp_orientation_delta_gpu(
@@ -8148,7 +8314,12 @@ def _run_batched(args):
             env_id
             for env_id, controller in enumerate(controllers)
             if controller.stage
-            in (Stage.PREGRASP, Stage.CENTER_HANDLE, Stage.RETRACT_ARM)
+            in (
+                Stage.PREGRASP,
+                Stage.OPEN_GRIPPER,
+                Stage.CENTER_HANDLE,
+                Stage.RESTORE_GRIPPER,
+            )
         ]
         phase_start = time.perf_counter()
         stability_results = stability_tracker.update(
@@ -8196,7 +8367,13 @@ def _run_batched(args):
                 env_id
                 for env_id, controller in enumerate(controllers)
                 if active_env_mask[env_id]
-                and controller.stage in (Stage.CONTACT_PANEL, Stage.PUSH_OPEN)
+                and controller.stage
+                in (
+                    Stage.CONTACT_PANEL,
+                    Stage.PUSH_OPEN,
+                    Stage.PUSH_ARM_RETRACT,
+                    Stage.BASE_ADVANCE,
+                )
             ]
             if panel_clearance_env_ids:
                 panel_start = time.perf_counter()

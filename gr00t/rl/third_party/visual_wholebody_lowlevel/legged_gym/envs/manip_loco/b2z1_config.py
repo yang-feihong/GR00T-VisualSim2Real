@@ -144,6 +144,7 @@ class B2Z1IsaacLabCfg(LeggedRobotIsaacLabCfg):
         teleop_base_lin_vel_step = 0.05
         teleop_base_ang_vel_step = 0.05
         teleop_arm_joint_step = 0.05
+        teleop_arm_joint_speed_limits = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
         teleop_ee_goal_pos_step = 0.05
         teleop_ee_goal_orn_step = 0.05
         teleop_gripper_step = 0.05

@@ -340,6 +340,23 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         )
 
         self.teleop_arm_joint_pos_targets = self.dof_pos[:, self.arm_joint_ids].clone()
+        speed_limits = torch.as_tensor(
+            self.cfg.env.teleop_arm_joint_speed_limits,
+            device=self.device,
+            dtype=self.dof_pos.dtype,
+        ).reshape(-1)
+        if speed_limits.shape != (self.arm_joint_ids.numel(),):
+            raise ValueError(
+                "teleop_arm_joint_speed_limits must contain one value per arm "
+                f"joint: expected {self.arm_joint_ids.numel()}, "
+                f"got {speed_limits.numel()}"
+            )
+        if not bool(torch.all(speed_limits > 0.0)):
+            raise ValueError("teleop_arm_joint_speed_limits must all be positive")
+        self.teleop_arm_joint_speed_limits = speed_limits
+        self.teleop_arm_joint_limited_targets = (
+            self.teleop_arm_joint_pos_targets.clone()
+        )
         self.gripper_pos_targets = self.default_dof_pos[:, self.gripper_joint_ids].clone()
         self.teleop_debug = bool(self.cfg.env.teleop_debug)
         self._teleop_ee_synced_once = False
@@ -395,6 +412,36 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
                 self._arm_pos_targets_for_step = torch.where(
                     self.teleop_arm_joint_control_mask.unsqueeze(1),
                     self.teleop_arm_joint_pos_targets,
+                    self._arm_pos_targets_for_step,
+                )
+        if self.teleop_mode and self._arm_pos_targets_for_step is not None:
+            joint_mask = self.teleop_arm_joint_control_mask
+            ee_mask = ~joint_mask
+            if torch.any(ee_mask):
+                # Cartesian control already rate-limits the EE pose.  Applying
+                # another component-wise limiter to each freshly recomputed IK
+                # target changes the Cartesian path and can sweep the gripper
+                # into obstacles.  Keep only the mode-transition state synced.
+                self.teleop_arm_joint_limited_targets[ee_mask] = self.dof_pos[
+                    ee_mask
+                ][:, self.arm_joint_ids]
+            if torch.any(joint_mask):
+                max_step = self.teleop_arm_joint_speed_limits.unsqueeze(0) * float(
+                    self.dt
+                )
+                target_delta = torch.clamp(
+                    self._arm_pos_targets_for_step[joint_mask]
+                    - self.teleop_arm_joint_limited_targets[joint_mask],
+                    min=-max_step,
+                    max=max_step,
+                )
+                self.teleop_arm_joint_limited_targets[joint_mask] = (
+                    self.teleop_arm_joint_limited_targets[joint_mask]
+                    + target_delta
+                )
+                self._arm_pos_targets_for_step = torch.where(
+                    joint_mask.unsqueeze(1),
+                    self.teleop_arm_joint_limited_targets,
                     self._arm_pos_targets_for_step,
                 )
         self._profile_record("arm_target", time.perf_counter() - section_start)
@@ -934,6 +981,9 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         """ManipLoco-specific reset hook."""
         self._resample_goal_height_reference(env_ids, is_init=True)
         self._resample_ee_goal(env_ids, is_init=True)
+        self.teleop_arm_joint_limited_targets[env_ids] = self.dof_pos[env_ids][
+            :, self.arm_joint_ids
+        ]
 
     def _get_omnidirectional_goal_sampling_bounds(self, goal_yaw):
         rear_weight = self._get_omnidirectional_rear_weight(goal_yaw)
