@@ -400,9 +400,49 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         self.scene.articulations["robot"] = self.robot
 
         if self.cfg.enable_doorman_scene:
-            if self.cfg.doorman_door is None:
-                raise RuntimeError("cfg.doorman_door must be set when cfg.enable_doorman_scene is True.")
-            self.door = Articulation(self.cfg.doorman_door)
+            if self.cfg.doorman_door_groups:
+                from legged_gym.envs.manip_loco.grouped_articulation import (
+                    GroupedArticulation,
+                )
+
+                grouped_assets = []
+                grouped_env_ids = []
+                for door_cfg, env_ids in self.cfg.doorman_door_groups:
+                    multi_spawn = door_cfg.spawn
+                    if len(multi_spawn.assets_cfg) != len(env_ids):
+                        raise RuntimeError(
+                            "Grouped door spawner count does not match its environment ids"
+                        )
+                    side = multi_spawn.assets_cfg[0].articulation_root_name.removeprefix(
+                        "root_"
+                    )
+                    for env_id, asset_cfg in zip(
+                        env_ids, multi_spawn.assets_cfg, strict=True
+                    ):
+                        for attribute in (
+                            "mass_props",
+                            "rigid_props",
+                            "collision_props",
+                            "activate_contact_sensors",
+                        ):
+                            value = getattr(multi_spawn, attribute, None)
+                            if value is not None and hasattr(asset_cfg, attribute):
+                                setattr(asset_cfg, attribute, value)
+                        asset_cfg.func(
+                            f"/World/envs/env_{env_id}/door_{side}", asset_cfg
+                        )
+                    door_cfg.spawn = None
+                    grouped_assets.append(Articulation(door_cfg))
+                    grouped_env_ids.append(env_ids)
+                self.door = GroupedArticulation(
+                    grouped_assets, grouped_env_ids, self.num_envs
+                )
+            else:
+                if self.cfg.doorman_door is None:
+                    raise RuntimeError(
+                        "cfg.doorman_door must be set when the grouped door configuration is absent."
+                    )
+                self.door = Articulation(self.cfg.doorman_door)
             self.scene.articulations["door"] = self.door
             dome_light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.98, 0.95, 0.88))
             self.scene.extras["dome_light"] = dome_light_cfg.func("/World/DomeLight", dome_light_cfg)
@@ -430,7 +470,11 @@ class LeggedRobotIsaacLab(DirectRLEnv):
             # handle_outside collider.  Filter to its rigid parent here; the
             # DoorMan controller then accepts only contact points lying on the
             # measured handle_outside capsule.
-            handle_filter = ["/World/envs/env_.*/door/door_handle"]
+            handle_filter = [
+                "/World/envs/env_.*/door_(left|right)/door_handle"
+                if self.cfg.doorman_door_groups
+                else "/World/envs/env_.*/door/door_handle"
+            ]
             for sensor_name, body_name in (
                 ("fixed_handle_contact", "link06"),
                 ("moving_handle_contact", "gripperMover"),
@@ -456,6 +500,23 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
         self._init_terrain_height_samples()
         self.scene.clone_environments(copy_from_source=False)
+        if self.cfg.doorman_door_groups:
+            grouped_stage = sim_utils.get_current_stage()
+            expected_side_by_env = {}
+            for door_cfg, env_ids in self.cfg.doorman_door_groups:
+                side = door_cfg.prim_path.rsplit("/door_", 1)[1]
+                for env_id in env_ids:
+                    expected_side_by_env[int(env_id)] = side
+            for env_id, expected_side in expected_side_by_env.items():
+                for side in ("left", "right"):
+                    if side != expected_side:
+                        path = f"/World/envs/env_{env_id}/door_{side}"
+                        if grouped_stage.GetPrimAtPath(path).IsValid():
+                            # Environment clones inherit env_0 children.  A
+                            # delete only removes the local spec and reveals
+                            # the inherited door again; an inactive override
+                            # masks it in this environment.
+                            grouped_stage.OverridePrim(path).SetActive(False)
         global_prim_paths = [self.cfg.terrain.prim_path]
         if self.cfg.scene_usd_path:
             global_prim_paths.append(self.cfg.scene_prim_path)
@@ -1599,7 +1660,7 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         ).repeat(self.num_envs, 1)
         motor_strength_minus_1 = torch.tensor(
             [self.cfg.priv_motor_strength_minus_1], dtype=torch.float32, device=self.device
-        )
+        ).repeat(self.num_envs, 1)
         self.motor_strength = 1.0 + motor_strength_minus_1
         self._priv_obs_const = torch.cat(
             [
@@ -2858,6 +2919,10 @@ class LeggedRobotIsaacLab(DirectRLEnv):
                     f"x={(x_min, x_max)}, y={(y_min, y_max)}, "
                     f"yaw={(yaw_min, yaw_max)}"
                 )
+            root_state[:, 2] = (
+                self.scene.env_origins[env_ids, 2]
+                + float(self.cfg.doorman_robot_init_height)
+            )
             # The 0.75 m near bound is the closest verified reset with the
             # extended default B2Z1 arm that remains clear of the door plane.
             root_state[:, 0:1] = (
@@ -2895,7 +2960,6 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         self._reset_gait_state(env_ids)
         if self._rgb_camera_rigs:
             self._rgb_camera_requires_reset_sync = True
-
     def _reset_doorman_door_states(self, env_ids: torch.Tensor):
         if not self.cfg.enable_doorman_scene:
             return

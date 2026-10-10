@@ -164,21 +164,21 @@ class LeggedRobotIsaacLabCfg(DirectRLEnvCfg):
                 effort_limit_sim=80.0,
                 velocity_limit_sim=20.0,
                 stiffness={
-                    "joint1": 400.0,
-                    "joint2": 400.0,
-                    "joint3": 400.0,
-                    "joint4": 400.0,
-                    "joint5": 400.0,
-                    "joint6": 400.0,
+                    "joint1": 10000.0,
+                    "joint2": 10000.0,
+                    "joint3": 10000.0,
+                    "joint4": 10000.0,
+                    "joint5": 10000.0,
+                    "joint6": 10000.0,
                     "jointGripper": 400.0,
                 },
                 damping={
-                    "joint1": 40.0,
-                    "joint2": 40.0,
-                    "joint3": 40.0,
-                    "joint4": 40.0,
-                    "joint5": 40.0,
-                    "joint6": 40.0,
+                    "joint1": 200.0,
+                    "joint2": 200.0,
+                    "joint3": 200.0,
+                    "joint4": 200.0,
+                    "joint5": 200.0,
+                    "joint6": 200.0,
                     "jointGripper": 40.0,
                 },
             ),
@@ -219,12 +219,14 @@ class LeggedRobotIsaacLabCfg(DirectRLEnvCfg):
     doorman_robot_init_x_range: tuple[float, float] = (0.75, 2.0)
     doorman_robot_init_y_range: tuple[float, float] = (-2.0, 2.0)
     doorman_robot_init_yaw_range: tuple[float, float] = (-1.0471975512, 1.0471975512)
+    doorman_robot_init_height: float = 0.545
     doorman_arm_joint_init_center: list[float] = field(default_factory=list)
     doorman_arm_joint_init_delta_rad: float = 0.25
     doorman_arm_joint_limit_margin_rad: float = 0.02
     doorman_gripper_joint_init: float | None = None
     doorman_randomize_door_init_state: bool = False
     doorman_door: ArticulationCfg | None = None
+    doorman_door_groups: list | None = None
     rgb_camera_specs: list = field(default_factory=list)
     rgb_camera_draw_in_viewer: bool = False
     rgb_camera_backend: str = "auto"

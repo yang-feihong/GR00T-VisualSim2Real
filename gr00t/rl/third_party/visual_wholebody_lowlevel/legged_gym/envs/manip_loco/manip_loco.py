@@ -4,6 +4,7 @@ import time
 import torch
 from typing import Tuple
 from legged_gym.utils.math import orientation_error
+from legged_gym.utils.constrained_ik import batched_constrained_dls_delta
 from legged_gym.utils.isaaclab_math import (
     quat_rotate_inverse,
     quat_apply,
@@ -158,7 +159,9 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         self.sphere_error_scale = torch.tensor(self.cfg.goal_ee.sphere_error_scale, device=self.device)
         self.orn_error_scale = torch.tensor(self.cfg.goal_ee.orn_error_scale, device=self.device)
 
-        self.uses_goal_height_reference_mask = True
+        self.uses_goal_height_reference_mask = (
+            self.cfg.goal_ee.ranges.ee_goal_sampling_mode != "fk_reachable"
+        )
         self.observes_goal_height_reference_mask = (
             bool(self.cfg.goal_ee.sphere_center.mixed_height_reference)
             or self.cfg.goal_ee.ranges.ee_goal_sampling_mode in (
@@ -320,6 +323,12 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         """Initialize keyboard/XR teleop input buffers only."""
         self.teleop_raw_commands = torch.zeros_like(self.commands)
         self.teleop_arm_control_mode = self.cfg.env.teleop_arm_control_mode
+        self.teleop_arm_joint_control_mask = torch.full(
+            (self.num_envs,),
+            self.teleop_arm_control_mode == "joint",
+            dtype=torch.bool,
+            device=self.device,
+        )
 
         self.teleop_raw_ee_goal_cart = self.curr_ee_goal_cart.clone()
         self.teleop_raw_ee_goal_orn_delta_rpy = torch.zeros(self.num_envs, 3, device=self.device)
@@ -377,10 +386,17 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
 
         section_start = time.perf_counter()
         self._arm_pos_targets_for_step = None
-        if self.teleop_mode and self.teleop_arm_control_mode == "joint":
-            self._arm_pos_targets_for_step = self.teleop_arm_joint_pos_targets
-        elif self.ee_pos is not None and self.ee_j_eef is not None:
+        if self.ee_pos is not None and self.ee_j_eef is not None:
             self._arm_pos_targets_for_step = self._get_arm_pos_targets()
+        if self.teleop_mode and torch.any(self.teleop_arm_joint_control_mask):
+            if self._arm_pos_targets_for_step is None:
+                self._arm_pos_targets_for_step = self.teleop_arm_joint_pos_targets.clone()
+            else:
+                self._arm_pos_targets_for_step = torch.where(
+                    self.teleop_arm_joint_control_mask.unsqueeze(1),
+                    self.teleop_arm_joint_pos_targets,
+                    self._arm_pos_targets_for_step,
+                )
         self._profile_record("arm_target", time.perf_counter() - section_start)
         self._profile_record("pre_total", max(time.perf_counter() - profile_start - rgb_pose_elapsed, 0.0))
 
@@ -401,15 +417,15 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
 
         # When joint-controlling the arm, keep EE target synced
         # to actual pose so switching back to EE mode does not jump.
-        if self.teleop_arm_control_mode == "joint":
-            if self.ee_pos is not None and self.ee_orn is not None:
-                self._sync_teleop_ee_goal_to_current_pose()
-            self._teleop_inputs_dirty = False
-            return
-
-        self.curr_ee_goal_cart[:] = self.teleop_raw_ee_goal_cart
-        self.ee_goal_orn_delta_rpy[:] = self.teleop_raw_ee_goal_orn_delta_rpy
-        self.curr_ee_goal_sphere[:] = cart2sphere(self.curr_ee_goal_cart)
+        joint_ids = torch.nonzero(
+            self.teleop_arm_joint_control_mask, as_tuple=False
+        ).squeeze(-1)
+        if self.ee_pos is not None and self.ee_orn is not None and len(joint_ids) > 0:
+            self._sync_teleop_ee_goal_to_current_pose(joint_ids)
+        ee_mask = ~self.teleop_arm_joint_control_mask
+        self.curr_ee_goal_cart[ee_mask] = self.teleop_raw_ee_goal_cart[ee_mask]
+        self.ee_goal_orn_delta_rpy[ee_mask] = self.teleop_raw_ee_goal_orn_delta_rpy[ee_mask]
+        self.curr_ee_goal_sphere[ee_mask] = cart2sphere(self.curr_ee_goal_cart[ee_mask])
         if (
             self.uses_goal_height_reference_mask
             and bool(self.cfg.env.teleop_auto_height_reference)
@@ -879,17 +895,31 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
             euler_from_quat(self.ee_goal_orn_quat[env_ids]), dim=-1
         )
 
-    def _set_teleop_arm_control_mode(self, mode):
-        if mode == self.teleop_arm_control_mode:
+    def _set_teleop_arm_control_mode(self, mode, env_ids=None):
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        else:
+            env_ids = torch.as_tensor(env_ids, device=self.device, dtype=torch.long).reshape(-1)
+        if len(env_ids) == 0:
             return
         if mode == "joint":
-            self._sync_teleop_arm_joint_targets_to_current_pose()
+            changed = env_ids[~self.teleop_arm_joint_control_mask[env_ids]]
+            self._sync_teleop_arm_joint_targets_to_current_pose(changed)
+            self.teleop_arm_joint_control_mask[env_ids] = True
         elif mode == "ee":
-            self._sync_teleop_ee_goal_to_current_pose()
+            changed = env_ids[self.teleop_arm_joint_control_mask[env_ids]]
+            self._sync_teleop_ee_goal_to_current_pose(changed)
+            self.teleop_arm_joint_control_mask[env_ids] = False
         else:
             raise ValueError(f"Unsupported teleop arm control mode: {mode}")
-        self.teleop_arm_control_mode = mode
-        print(f"[teleop] arm control mode: {mode}")
+        if bool(torch.all(self.teleop_arm_joint_control_mask)):
+            self.teleop_arm_control_mode = "joint"
+        elif bool(torch.all(~self.teleop_arm_joint_control_mask)):
+            self.teleop_arm_control_mode = "ee"
+        else:
+            self.teleop_arm_control_mode = "mixed"
+        if self.num_envs == 1:
+            print(f"[teleop] arm control mode: {mode}")
 
     def _reset_teleop_ee_goal_to_default(self):
         self.curr_ee_goal_sphere[:] = self.reset_init_ee_sphere[:]
@@ -1434,12 +1464,28 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         dpos = self.curr_ee_goal_cart_world - self.ee_pos
         ee_orn_norm = self.ee_orn / torch.norm(self.ee_orn, dim=-1, keepdim=True).clamp_min(1e-8)
         drot = orientation_error(self.ee_goal_orn_quat, ee_orn_norm)
+        if self.teleop_mode:
+            orientation_gain = float(
+                getattr(self.cfg.goal_ee, "teleop_ik_orientation_gain", 1.0)
+            )
+            drot = drot * orientation_gain
         dpose = getattr(self, "_ik_dpose_buf", None)
         if dpose is None or dpose.shape != (self.num_envs, 6, 1) or dpose.device != dpos.device or dpose.dtype != dpos.dtype:
             dpose = torch.zeros(self.num_envs, 6, 1, device=dpos.device, dtype=dpos.dtype)
             self._ik_dpose_buf = dpose
         dpose[:, :3, 0] = dpos
         dpose[:, 3:, 0] = drot
+        if self.teleop_mode:
+            arm_position = self.dof_pos[:, self.arm_joint_ids]
+            arm_limits = self.dof_pos_limits[self.arm_joint_ids]
+            delta = batched_constrained_dls_delta(
+                self.ee_j_eef,
+                dpose.squeeze(-1),
+                arm_position,
+                arm_limits,
+                float(self.cfg.goal_ee.ik_damping),
+            )
+            return arm_position + delta
         return self._control_ik(dpose) + self.dof_pos[:, self.arm_joint_ids]
 
     def get_goal_reference_quat(self):
@@ -1548,9 +1594,7 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         pos_targets.copy_(self.dof_pos)
         pos_targets[:, self.gripper_joint_ids] = self.gripper_pos_targets
 
-        if self.teleop_mode and self.teleop_arm_control_mode == "joint":
-            pos_targets[:, self.arm_joint_ids] = self.teleop_arm_joint_pos_targets
-        elif self._arm_pos_targets_for_step is not None:
+        if self._arm_pos_targets_for_step is not None:
             pos_targets[:, self.arm_joint_ids] = self._arm_pos_targets_for_step
         else:
             pos_targets[:, self.arm_joint_ids] = self.target_pos[:, self.arm_joint_ids]

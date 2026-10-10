@@ -11,7 +11,12 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from doorman_auto_open import LOWLEVEL_ROOT, _default_paths, _parser
+from doorman_auto_open import (
+    LOWLEVEL_ROOT,
+    _arm_drive_stiffness,
+    _default_paths,
+    _parser,
+)
 
 sys.path.insert(0, str(LOWLEVEL_ROOT))
 
@@ -112,7 +117,10 @@ def main():
             / "resources/robots/b2z1/urdf/generated"
             / "b2z1_mount_90_x0p22_y0_z0p17.urdf"
         )
-        forward_model = B2Z1SteadyEeForwardModel(urdf_path)
+        forward_model = B2Z1SteadyEeForwardModel(
+            urdf_path,
+            stiffness=_arm_drive_stiffness(runner.env),
+        )
         desired_position = _numpy(warmup_state["ee_pos"]) + np.asarray(
             args.desired_offset_m, dtype=np.float64
         )

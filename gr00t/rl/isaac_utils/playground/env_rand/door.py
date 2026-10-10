@@ -3,6 +3,7 @@
 
 
 import os
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -41,9 +42,27 @@ from gr00t.rl.isaac_utils.playground.utils.usd_utils import (
 )
 
 
+@contextmanager
+def _numpy_random_stream(rng: np.random.RandomState):
+    """Run legacy NumPy-random code without advancing the physical RNG."""
+    physical_state = np.random.get_state()
+    np.random.set_state(rng.get_state())
+    try:
+        yield
+    finally:
+        rng.set_state(np.random.get_state())
+        np.random.set_state(physical_state)
+
+
+def _call_with_numpy_random_stream(rng, function, *args, **kwargs):
+    with _numpy_random_stream(rng):
+        return function(*args, **kwargs)
+
+
 @configclass
 class DoorSpawnerCfg(sim_utils.RigidObjectSpawnerCfg):
     articulation_props: sim_utils.ArticulationRootPropertiesCfg = None
+    articulation_root_name: str = "root"
     door_width: tuple[float, float] = (0.8, 1.1)
     door_height: tuple[float, float] = (1.9, 2.2)
     door_handle_tblr: tuple[float, float, float, float] = (1.0, 0.85, 0.08, 0.15)
@@ -151,11 +170,15 @@ def _update_joint_transform(stage, joint_path, prim0_path, prim1_path):
     if not prim0 or not prim1:
         raise ValueError(f"One or both prims not found at paths: {prim0_path}, {prim1_path}")
 
-    # Create an XformCache
+    # The two rigid bodies are siblings, not ancestor/descendant prims.
+    # ComputeRelativeTransform() only accepts an ancestor as its second
+    # argument; using body0 there bakes the translated environment origin
+    # into every downstream joint frame.  Compose the two world transforms
+    # explicitly so their common environment transform cancels out.
     xform_cache = UsdGeom.XformCache()
-
-    # Get the relative transform between the two prims
-    prim1_to_prim0, _ = xform_cache.ComputeRelativeTransform(prim1, prim0)
+    prim0_to_world = xform_cache.GetLocalToWorldTransform(prim0)
+    prim1_to_world = xform_cache.GetLocalToWorldTransform(prim1)
+    prim1_to_prim0 = prim1_to_world * prim0_to_world.GetInverse()
 
     # Get the joint's local position and orientation attributes
     local_pos0_attr = joint_prim.GetAttribute("physics:localPos0")
@@ -187,6 +210,11 @@ def spawn_door(
     **kwargs,
 ) -> Usd.Prim:
     global MR
+    # Rendering is optional, so its random draws must not alter door physics.
+    # Clone the current stream for visual-only choices while leaving the
+    # existing physical stream and its seed-to-scene mapping unchanged.
+    visual_rng = np.random.RandomState()
+    visual_rng.set_state(np.random.get_state())
     if cfg.randomize_material and cfg.dynamic_material_randomization and MR is None:
         MR = _get_material_randomization()
     stage: Usd.Stage = omni.usd.get_context().get_stage()
@@ -255,8 +283,12 @@ def spawn_door(
                 door_frame_material_prim_paths,
                 door_panel_material_prim_paths,
                 handle_material_prim_paths,
-            ) = preload_door_materials(
-                stage, cfg.preloaded_materials_num_transform, cfg.preloaded_materials_num_color
+            ) = _call_with_numpy_random_stream(
+                visual_rng,
+                preload_door_materials,
+                stage,
+                cfg.preloaded_materials_num_transform,
+                cfg.preloaded_materials_num_color,
             )
             wall_material_prim_paths = door_frame_material_prim_paths
         else:
@@ -267,7 +299,7 @@ def spawn_door(
 
     # spawn the prims
     create_prim(prim_path, "Xform")
-    root_prim_path = os.path.join(prim_path, "root")
+    root_prim_path = os.path.join(prim_path, cfg.articulation_root_name)
     create_prim(root_prim_path, "Xform")
     add_rigid_body(stage, root_prim_path)
     panel_prim_path = os.path.join(prim_path, "door_panel")
@@ -651,11 +683,11 @@ def spawn_door(
 
     # set material
     if cfg.randomize_material and door_frame_material_prim_paths and handle_material_prim_paths:
-        door_frame_material_prim_path = np.random.choice(door_frame_material_prim_paths)
-        door_panel_material_prim_path = np.random.choice(
+        door_frame_material_prim_path = visual_rng.choice(door_frame_material_prim_paths)
+        door_panel_material_prim_path = visual_rng.choice(
             door_panel_material_prim_paths if door_panel_material_prim_paths else door_frame_material_prim_paths
         )
-        handle_material_prim_path = np.random.choice(handle_material_prim_paths)
+        handle_material_prim_path = visual_rng.choice(handle_material_prim_paths)
         bind_visual_material(left_frame_prim_path, door_frame_material_prim_path, stage)
         bind_visual_material(right_frame_prim_path, door_frame_material_prim_path, stage)
         bind_visual_material(top_frame_prim_path, door_frame_material_prim_path, stage)
@@ -664,37 +696,37 @@ def spawn_door(
         bind_visual_material(covers_prim_path, handle_material_prim_path, stage)
 
         if cfg.dynamic_material_randomization:
-            MR.add_to_prim(
+            _call_with_numpy_random_stream(visual_rng, MR.add_to_prim,
                 stage,
                 left_frame_prim_path,
                 cfg.dynamic_material_randomization_interval,
                 door_frame_material_prim_paths,
             )
-            MR.add_to_prim(
+            _call_with_numpy_random_stream(visual_rng, MR.add_to_prim,
                 stage,
                 right_frame_prim_path,
                 cfg.dynamic_material_randomization_interval,
                 door_frame_material_prim_paths,
             )
-            MR.add_to_prim(
+            _call_with_numpy_random_stream(visual_rng, MR.add_to_prim,
                 stage,
                 top_frame_prim_path,
                 cfg.dynamic_material_randomization_interval,
                 door_frame_material_prim_paths,
             )
-            MR.add_to_prim(
+            _call_with_numpy_random_stream(visual_rng, MR.add_to_prim,
                 stage,
                 panel_prim_path,
                 cfg.dynamic_material_randomization_interval,
                 door_panel_material_prim_paths,
             )
-            MR.add_to_prim(
+            _call_with_numpy_random_stream(visual_rng, MR.add_to_prim,
                 stage,
                 handle_prim_path,
                 cfg.dynamic_material_randomization_interval,
                 handle_material_prim_paths,
             )
-            MR.add_to_prim(
+            _call_with_numpy_random_stream(visual_rng, MR.add_to_prim,
                 stage,
                 covers_prim_path,
                 cfg.dynamic_material_randomization_interval,
@@ -833,56 +865,56 @@ def spawn_door(
         # set material
         if cfg.randomize_material and wall_material_prim_paths:
             bind_visual_material(
-                front_wall_prim_path, np.random.choice(wall_material_prim_paths), stage
+                front_wall_prim_path, visual_rng.choice(wall_material_prim_paths), stage
             )
             bind_visual_material(
-                rear_wall_prim_path, np.random.choice(wall_material_prim_paths), stage
+                rear_wall_prim_path, visual_rng.choice(wall_material_prim_paths), stage
             )
             bind_visual_material(
-                left_front_wall_prim_path, np.random.choice(wall_material_prim_paths), stage
+                left_front_wall_prim_path, visual_rng.choice(wall_material_prim_paths), stage
             )
             bind_visual_material(
-                right_front_wall_prim_path, np.random.choice(wall_material_prim_paths), stage
+                right_front_wall_prim_path, visual_rng.choice(wall_material_prim_paths), stage
             )
             bind_visual_material(
-                left_rear_wall_prim_path, np.random.choice(wall_material_prim_paths), stage
+                left_rear_wall_prim_path, visual_rng.choice(wall_material_prim_paths), stage
             )
             bind_visual_material(
-                right_rear_wall_prim_path, np.random.choice(wall_material_prim_paths), stage
+                right_rear_wall_prim_path, visual_rng.choice(wall_material_prim_paths), stage
             )
 
             if cfg.dynamic_material_randomization:
-                MR.add_to_prim(
+                _call_with_numpy_random_stream(visual_rng, MR.add_to_prim,
                     stage,
                     front_wall_prim_path,
                     cfg.dynamic_material_randomization_interval,
                     wall_material_prim_paths,
                 )
-                MR.add_to_prim(
+                _call_with_numpy_random_stream(visual_rng, MR.add_to_prim,
                     stage,
                     rear_wall_prim_path,
                     cfg.dynamic_material_randomization_interval,
                     wall_material_prim_paths,
                 )
-                MR.add_to_prim(
+                _call_with_numpy_random_stream(visual_rng, MR.add_to_prim,
                     stage,
                     left_front_wall_prim_path,
                     cfg.dynamic_material_randomization_interval,
                     wall_material_prim_paths,
                 )
-                MR.add_to_prim(
+                _call_with_numpy_random_stream(visual_rng, MR.add_to_prim,
                     stage,
                     right_front_wall_prim_path,
                     cfg.dynamic_material_randomization_interval,
                     wall_material_prim_paths,
                 )
-                MR.add_to_prim(
+                _call_with_numpy_random_stream(visual_rng, MR.add_to_prim,
                     stage,
                     left_rear_wall_prim_path,
                     cfg.dynamic_material_randomization_interval,
                     wall_material_prim_paths,
                 )
-                MR.add_to_prim(
+                _call_with_numpy_random_stream(visual_rng, MR.add_to_prim,
                     stage,
                     right_rear_wall_prim_path,
                     cfg.dynamic_material_randomization_interval,
@@ -902,7 +934,7 @@ def spawn_door(
         )
         if cfg.randomize_material and wall_material_prim_paths:
             bind_visual_material(
-                ceiling_prim_path, np.random.choice(wall_material_prim_paths), stage
+                ceiling_prim_path, visual_rng.choice(wall_material_prim_paths), stage
             )
 
     if cfg.add_floors:
@@ -921,20 +953,20 @@ def spawn_door(
 
         if cfg.randomize_material and wall_material_prim_paths:
             bind_visual_material(
-                front_floor_prim_path, np.random.choice(wall_material_prim_paths), stage
+                front_floor_prim_path, visual_rng.choice(wall_material_prim_paths), stage
             )
             bind_visual_material(
-                rear_floor_prim_path, np.random.choice(wall_material_prim_paths), stage
+                rear_floor_prim_path, visual_rng.choice(wall_material_prim_paths), stage
             )
 
             if cfg.dynamic_material_randomization:
-                MR.add_to_prim(
+                _call_with_numpy_random_stream(visual_rng, MR.add_to_prim,
                     stage,
                     front_floor_prim_path,
                     cfg.dynamic_material_randomization_interval,
                     wall_material_prim_paths,
                 )
-                MR.add_to_prim(
+                _call_with_numpy_random_stream(visual_rng, MR.add_to_prim,
                     stage,
                     rear_floor_prim_path,
                     cfg.dynamic_material_randomization_interval,
@@ -948,15 +980,15 @@ def spawn_door(
             stage,
             front_light_prim_path,
             (1.2, 0.6),
-            temperature=np.random.uniform(4000, 6000),
-            intensity=np.random.uniform(4000, 5000),
+            temperature=visual_rng.uniform(4000, 6000),
+            intensity=visual_rng.uniform(4000, 5000),
         )
         set_prim_transform(
             stage,
             front_light_prim_path,
             (
                 -front / 2,
-                np.random.uniform(-right_front + 0.5, left_front - 0.5) / 2,
+                visual_rng.uniform(-right_front + 0.5, left_front - 0.5) / 2,
                 total_wall_height - 0.05,
             ),
             (0, 0, 0),
@@ -968,15 +1000,15 @@ def spawn_door(
             stage,
             rear_light_prim_path,
             (1.2, 0.6),
-            temperature=np.random.uniform(4000, 6000),
-            intensity=np.random.uniform(4000, 5000),
+            temperature=visual_rng.uniform(4000, 6000),
+            intensity=visual_rng.uniform(4000, 5000),
         )
         set_prim_transform(
             stage,
             rear_light_prim_path,
             (
                 rear / 2,
-                np.random.uniform(-right_rear + 0.5, left_rear - 0.5) / 2,
+                visual_rng.uniform(-right_rear + 0.5, left_rear - 0.5) / 2,
                 total_wall_height - 0.05,
             ),
             (0, 0, 0),

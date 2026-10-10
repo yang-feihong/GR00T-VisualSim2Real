@@ -10,6 +10,7 @@ the simulator and does not use measured or fitted correction tables.
 
 from __future__ import annotations
 
+import math
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -68,7 +69,8 @@ def _rotation_from_quaternion_wxyz(quaternion: Sequence[float]) -> np.ndarray:
 
 def _quaternion_wxyz_from_rotation(rotation: np.ndarray) -> np.ndarray:
     quaternion_xyzw = pin.Quaternion(np.asarray(rotation, dtype=np.float64)).coeffs()
-    quaternion = np.roll(np.asarray(quaternion_xyzw, dtype=np.float64), 1)
+    quaternion_xyzw = np.asarray(quaternion_xyzw, dtype=np.float64)
+    quaternion = quaternion_xyzw[[3, 0, 1, 2]]
     if quaternion[0] < 0.0:
         quaternion *= -1.0
     return quaternion
@@ -125,12 +127,13 @@ class B2Z1SteadyEeForwardModel:
             "joint5",
             "joint6",
         ),
-        stiffness: float | Sequence[float] = 400.0,
+        stiffness: float | Sequence[float],
         effort_limit: float | Sequence[float] = 80.0,
         ik_damping: float = 0.05,
         orientation_gain: float = 4.0,
         joint_limit_margin: float = 1.0e-3,
         gravity_magnitude: float = 9.81,
+        emit_tolerance_warnings: bool = True,
     ):
         self.urdf_path = Path(urdf_path).resolve()
         if not self.urdf_path.is_file():
@@ -168,6 +171,8 @@ class B2Z1SteadyEeForwardModel:
         self.orientation_gain = float(orientation_gain)
         self.joint_limit_margin = float(joint_limit_margin)
         self.gravity_magnitude = float(gravity_magnitude)
+        self.emit_tolerance_warnings = bool(emit_tolerance_warnings)
+        self._tolerance_warning_stats = self._empty_tolerance_warning_stats()
 
         self.lower_limits = self.model.lowerPositionLimit[self.arm_q_indices].copy()
         self.upper_limits = self.model.upperPositionLimit[self.arm_q_indices].copy()
@@ -175,6 +180,25 @@ class B2Z1SteadyEeForwardModel:
         self.upper_limits -= self.joint_limit_margin
         if np.any(self.lower_limits >= self.upper_limits):
             raise ValueError("joint_limit_margin collapses an arm joint range")
+
+    @staticmethod
+    def _empty_tolerance_warning_stats():
+        return {
+            "count": 0,
+            "position_error_m_min": math.inf,
+            "position_error_m_max": 0.0,
+            "orientation_error_min": math.inf,
+            "orientation_error_max": 0.0,
+            "equilibrium_error_nm_min": math.inf,
+            "equilibrium_error_nm_max": 0.0,
+        }
+
+    def consume_tolerance_warning_stats(self):
+        stats = self._tolerance_warning_stats
+        self._tolerance_warning_stats = self._empty_tolerance_warning_stats()
+        if stats["count"] == 0:
+            return {"count": 0}
+        return stats
 
     def configuration_from_joint_positions(
         self, joint_positions: Mapping[str, float]
@@ -640,20 +664,35 @@ class B2Z1SteadyEeForwardModel:
             self.effort_limit,
         )
         equilibrium_residual = drive_efforts - gravity_efforts
+        position_error_norm = float(np.linalg.norm(position_error))
+        orientation_error_norm = float(np.linalg.norm(orientation_error))
+        equilibrium_error_norm = float(
+            np.linalg.norm(equilibrium_residual, ord=np.inf)
+        )
         if (
-            float(np.linalg.norm(position_error)) > float(position_tolerance_m)
-            or float(np.linalg.norm(orientation_error)) > float(orientation_tolerance)
-            or float(np.linalg.norm(equilibrium_residual, ord=np.inf)) > 1.0e-7
+            position_error_norm > float(position_tolerance_m)
+            or orientation_error_norm > float(orientation_tolerance)
+            or equilibrium_error_norm > 1.0e-7
         ):
-            warnings.warn(
-                "steady EE inverse back-substitution exceeds the requested tolerance; "
-                "returning the best feasible compensated command: "
-                f"position_error_m={np.linalg.norm(position_error):.9g} "
-                f"orientation_error={np.linalg.norm(orientation_error):.9g} "
-                f"equilibrium_error_nm={np.linalg.norm(equilibrium_residual, ord=np.inf):.9g}",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+            stats = self._tolerance_warning_stats
+            stats["count"] += 1
+            for name, value in (
+                ("position_error_m", position_error_norm),
+                ("orientation_error", orientation_error_norm),
+                ("equilibrium_error_nm", equilibrium_error_norm),
+            ):
+                stats[f"{name}_min"] = min(stats[f"{name}_min"], value)
+                stats[f"{name}_max"] = max(stats[f"{name}_max"], value)
+            if self.emit_tolerance_warnings:
+                warnings.warn(
+                    "steady EE inverse back-substitution exceeds the requested tolerance; "
+                    "returning the best feasible compensated command: "
+                    f"position_error_m={position_error_norm:.9g} "
+                    f"orientation_error={orientation_error_norm:.9g} "
+                    f"equilibrium_error_nm={equilibrium_error_norm:.9g}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
         forward_result = SteadyEeForwardResult(
             position_world=actual_position_world.copy(),
             orientation_world_wxyz=actual_orientation_world.copy(),

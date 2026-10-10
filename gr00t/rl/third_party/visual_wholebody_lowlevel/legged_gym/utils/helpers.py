@@ -114,6 +114,7 @@ def build_common_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rl_device", type=str, default="cuda:0")
     parser.add_argument("--viewer_display_mode", type=str, default="mesh")
     parser.add_argument("--num_envs", type=int, default=1)
+    parser.add_argument("--env_spacing", type=float, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--teleop_mode", action="store_true")
     parser.add_argument("--teleop_input_regularization", action="store_true")
@@ -124,6 +125,7 @@ def build_common_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--enable_doorman_scene", action="store_true")
     parser.add_argument("--doorman_door_open_lr", type=str, choices=["left", "right"], default=None)
     parser.add_argument("--doorman_randomize_robot_init", type=str_to_bool, nargs="?", const=True, default=True)
+    parser.add_argument("--doorman_robot_init_height", type=float, default=None)
     parser.add_argument("--doorman_arm_joint_init_center", type=float, nargs=6, default=None)
     parser.add_argument("--doorman_gripper_joint_init", type=float, default=None)
     parser.add_argument("--doorman_randomize_door_init_state", type=str_to_bool, nargs="?", const=True, default=False)
@@ -277,6 +279,8 @@ def _apply_cli_basic_env_args(cfg, args):
     cfg.sim.device = str(args.sim_device)
     cfg.scene.num_envs = int(args.num_envs)
     cfg.env.num_envs = int(args.num_envs)
+    if args.env_spacing is not None:
+        cfg.scene.env_spacing = float(args.env_spacing)
     cfg.env.teleop_mode = bool(args.teleop_mode)
     cfg.env.teleop_input_regularization = bool(args.teleop_input_regularization)
     if args.action_delay_mode is not None:
@@ -294,19 +298,40 @@ def _apply_cli_scene_args(cfg, args):
     if args.scene_position is not None:
         cfg.scene_position = [float(value) for value in args.scene_position]
     if args.enable_doorman_scene:
-        from legged_gym.envs.manip_loco.training_doorman_scene import build_training_doorman_door_cfg
+        from legged_gym.envs.manip_loco.training_doorman_scene import (
+            build_grouped_training_doorman_door_cfgs,
+            build_training_doorman_door_cfg,
+        )
 
         cfg.enable_doorman_scene = True
         cfg.scene.replicate_physics = False
         cfg.doorman_randomize_robot_init = bool(args.doorman_randomize_robot_init)
         cfg.doorman_robot_side = str(getattr(args, "robot_side", "positive_x"))
+        if args.doorman_robot_init_height is not None:
+            cfg.doorman_robot_init_height = float(args.doorman_robot_init_height)
+        initial_position = list(cfg.robot.init_state.pos)
+        initial_position[2] = float(cfg.doorman_robot_init_height)
+        cfg.robot.init_state.pos = tuple(initial_position)
         if args.doorman_arm_joint_init_center is not None:
             cfg.doorman_arm_joint_init_center = [
                 float(value) for value in args.doorman_arm_joint_init_center
             ]
         cfg.doorman_gripper_joint_init = args.doorman_gripper_joint_init
         cfg.doorman_randomize_door_init_state = bool(args.doorman_randomize_door_init_state)
-        cfg.doorman_door = build_training_doorman_door_cfg(args.num_envs, args.doorman_door_open_lr)
+        if args.doorman_door_open_lr is None and int(args.num_envs) > 1:
+            cfg.doorman_door = None
+            cfg.doorman_door_groups = build_grouped_training_doorman_door_cfgs(
+                int(args.num_envs),
+                int(args.seed if args.seed is not None else 0),
+                physics_only=bool(getattr(args, "disable_rgb_cameras", False)),
+            )
+        else:
+            cfg.doorman_door_groups = None
+            cfg.doorman_door = build_training_doorman_door_cfg(
+                args.num_envs,
+                args.doorman_door_open_lr,
+                physics_only=bool(getattr(args, "disable_rgb_cameras", False)),
+            )
         print("[doorman] using the high-level training DoorSpawner configuration")
 
 
