@@ -1,5 +1,41 @@
 # AutoOpen 单 App GPU 批量采集进展
 
+## 当前工作区 1000 seed 能力与性能基线（2026-10-10）
+
+当前工作区在 seed `1700--2699` 上完成四卡、四进程、每进程 250 env、3000 control tick
+的无相机回归。四个进程均使用同一代码，分别连续覆盖 250 个 seed；四个退出码均为 0，
+落盘 metadata 为 `1000/1000` 条且 seed 唯一、无缺口。输出位于
+`logs_rl/auto_open_current_headless1000_4gpu_20261010`。
+
+- 成功 `709/1000`，成功率 `70.9%`；失败 `291/1000`。
+- 完整 launcher 墙钟 `1257 s`，即 `20 分 57 秒`。
+- 四个分片成功数依次为 `171/250`、`183/250`、`179/250`、`176/250`。
+- 本轮明确使用 `--disable_rgb_cameras --summary_only`，没有创建 RGB camera sensor 或视频。
+
+失败阶段按 metadata 的 `failure_stage` 统计；对没有填写该字段的 11 条安全/总步数失败，
+使用同一 metadata 中终止时的 `acceptance_diagnostics.stage` 归属：
+
+| 失败阶段 | 数量 | 占全部 seed | 占失败样本 |
+|---|---:|---:|---:|
+| `BASE_ADVANCE` | 105 | 10.5% | 36.1% |
+| `APPROACH` | 66 | 6.6% | 22.7% |
+| `GRASP_HANDLE` | 36 | 3.6% | 12.4% |
+| `CONTACT_PANEL` | 30 | 3.0% | 10.3% |
+| `RESTORE_GRIPPER` | 14 | 1.4% | 4.8% |
+| `TURN_HANDLE` | 13 | 1.3% | 4.5% |
+| `PREGRASP` | 11 | 1.1% | 3.8% |
+| `OPEN_GRIPPER` | 9 | 0.9% | 3.1% |
+| `PUSH_OPEN` | 3 | 0.3% | 1.0% |
+| `CENTER_HANDLE` | 2 | 0.2% | 0.7% |
+| `THROUGH` | 2 | 0.2% | 0.7% |
+
+按四个并行分片取均值，非重叠主分项为 `command=427.085 s`、
+`policy_physics=246.864 s`、`state_to_host=52.563 s`、`advance=320.870 s`、
+`teleop_prepare=9.091 s`。其中 `command` 和 `advance` 合计约占完整 launcher 墙钟的
+`59.5%`，是后续严格行为等价优化的首要分析对象。worker/backend 计时嵌套在上述主分项中，
+不能重复相加；其中延迟路径 backend 均值为 `121.410 s`，稳态路径 worker 等待均值为
+`94.462 s`。
+
 ## 当前结论摘要（2026-10-09）
 
 | 当前版本 | 运行组织 | 成功率 | 总墙钟 | 完整总表 |
@@ -646,3 +682,88 @@ EE 目标。
 按现有 `位置 <10 mm、姿态 <0.05 rad` 标准只有 `156/342` 可达。主因是 APPROACH 只验收
 底盘站位范围，部分通过后的实际站位与固定抓取朝向组合无法在关节限位内满足 PREGRASP
 六维目标；不是接触、重力或等待时间问题。
+# 当前双任务执行状态（2026-10-11）
+
+## 任务边界
+
+1. 无损加速：只处理真实 profile 中占用显著、可证明机械等价的热点。候选先进入隔离
+   worktree，逐 seed A/B 验证后才允许进入正式工作区；不改变控制、物理、阈值、轨迹、
+   IK 精度、随机化或 seed 映射。
+2. 标准数据链路：按仓库根目录 `DATA_STANARD.md` 接通旁路采集。物理三阶段固定为
+   `APPROACH`、`PREGRASP..RESTORE_GRIPPER`、其余流程；本任务不优化 AutoOpen 成功率。
+
+## 无损加速：CONTACT_PANEL 跨环境批量 IK 候选已淘汰
+
+隔离候选位于 `experiments/auto_open_lossless_candidate_20261011`，没有进入正式工作区。
+64 个相同 seed 的 scalar/gpu_batch A/B 均为 `42/64`，但 `command_s` 仅从
+`98.013 s` 变为 `97.443 s`，收益不足 1%；更重要的是 8/64 的最终结果或失败原因不同，
+54/64 的阶段出口轨迹不同。根因是跨环境延后统一求解改变了部分环境进入
+`CONTACT_PANEL` 的控制 tick。该方案不满足机械等价要求，正式淘汰。
+
+## 标准数据链路：当前进度
+
+- 已实现 58 维 observation、25 维 action、height-invariant pose、三段物理边界及 50 帧
+  终止保持；相关纯逻辑、reset geometry 与 batch IK 测试当前 `13 passed`。
+- 已实现 LeRobot v2 Parquet/MP4 writer、隔离目录、元数据、统计与 PyAV 解码验证；
+  容器内 PyAV `18.1.0` 可用。
+- 已增加仅含 `base_0_rgb` 与 `left_wrist_0_rgb` 的 50 Hz 双相机配置。
+- 独立 PhysX `RigidContactView` 已验证每个 20 ms 控制 tick 恰好观察 4 个 5 ms 子步，
+  并保存接触对、最大法向冲量、最大力和最大穿透。数据模式启用机器人自碰撞；CCD
+  当前关闭并在 provenance 中明确记录，不伪造检测结果。
+- 双相机改为采集时直接流式编码 H.264/yuv420p/CRF23，内存不再随 episode 图像数增长。
+  10 帧故意失败探针的两路视频均完整解码，失败视频与 Parquet 一起保留在
+  `quarantine/`。
+- 首个完整 seed 1700 诊断样本成功走完 AutoOpen 并记录 `2206` 帧，但被正确隔离：旧
+  Stage 2 仍发底盘站位修正，且原流程只有 2 mm 门缝和 `-0.785 rad` 打开目标，不满足
+  标准的底盘静止、20 mm 门缝和 `-pi/3 rad` 完全打开。修复只在显式数据模式生效：
+  记录完整 25 帧零指令停稳、Stage 2 实际底盘指令置零、按 URDF 合法下限完全打开，
+  并将已有门缝目标设为 20 mm；普通 AutoOpen 行为不变。
+- 固定启动脚本 `run_auto_open_standard_shards.sh` 使用每 seed 独立 Isaac App、每张物理
+  GPU 同时最多一个进程，输出独立 LeRobot shard 与总 manifest，避免同 App 重建环境
+  的历史状态污染。
+
+## 无损加速：状态行复用候选均已淘汰
+
+真实 profile 中 `_slice_all_control_states` 占主循环约 `3.04%`，因此只在隔离 worktree
+测试了两种机械等价候选，均未迁入正式工作区：
+
+1. 只读 `Mapping` 行视图：64 seed 的成败、失败原因、最终阶段、步数、阶段出口集合和
+   阶段步数一致，最大诊断差 `5.72e-6 m`；但干净 A/B 中五项非重叠主耗时由
+   `391.075 s` 增为 `393.402 s`。`state_to_host` 虽由 `12.747 s` 降到 `3.823 s`，
+   Mapping 查询成本转移到了 command/advance，端到端净回归 `2.327 s`。
+2. 原生 `dict` 原地复用：64/64 的成败和 headline 字段一致，48/64 metadata 逐字节
+   一致，其余仅有最大 `3.815e-6` 的浮点诊断差；但五项主耗时为 `392.724 s`，仍比
+   原始 `391.075 s` 慢 `1.649 s`，且 `state_to_host=12.699 s`，没有实际收益。
+
+本轮没有把“局部计时下降、总耗时不降”的候选写入正式代码。当前正式性能基线仍为本文件
+开头的 `709/1000`、`1257 s`；控制、物理、阈值、轨迹、IK 和随机化均未因加速任务改变。
+
+## 标准数据链路：首个无例外通过样本
+
+最终小样本位于
+`artifacts/auto_open_standard_sample_seed1700_20261011_v6`，对应控制日志位于
+`logs_rl/auto_open_standard_sample_seed1700_20261011_v6`。自动验收为 `1/1 accepted`、
+`0 quarantine`、`0 exceptions`，共 `2366` 个 50 Hz frame：
+
+| 物理阶段 | 半开区间 | 仿真时间 |
+|---|---:|---:|
+| `approach` | `[0, 410)` | `0.00--8.20 s` |
+| `handle_press` | `[410, 1347)` | `8.20--26.94 s` |
+| `traversal` | `[1347, 2366)` | `26.94--47.32 s` |
+
+- Stage 1 的 Z1 全程 `inactive`，夹爪命令全程 `0 rad`；机械臂动作前保留完整 25 帧停稳。
+- Stage 2 实际下发的 B2 三维速度逐帧严格为 0，`arm_reset=0`；夹爪完整达到
+  `-pi/3 rad`，随后抓握、释放并最终闭合。
+- 把手解锁、门边首次达到 20 mm、整机越过门平面的事件帧分别为 `831`、`941`、`2065`；
+  traversal 前实际 `q6=-0.02095 rad`。
+- 两路 H.264/yuv420p/CRF23 视频均为 50 fps、各 `2366` 帧；base 输出为
+  `480x640`，wrist 输出为 `640x480`，两相机记录时间戳最大差为 `0 ns`。
+- raw audit 为 `2366` 行、43 列，raw contacts 为 `16415` 行。最大穿透 `2.768 mm`
+  来自足端与地面接触；最大接触力 `730.612 N` 也来自足地接触，不是门或机器人内部穿模。
+- 标准模式在 spawn、PhysX tensor view 创建之前启用 self-collision；只过滤四个 USD 中
+  正常站姿即与 trunk 几何重叠的 `base_link <-> {FR,FL,RR,RL}_thigh` 设计性非碰撞对。
+  最终样本没有非零机器人内部接触力。普通 AutoOpen 仍使用原碰撞配置。
+
+数据采集必须显式传入 `--standard_dataset_dir`，否则所有标准专用行为均不启用。批量入口
+`gr00t/rl/scripts/run_auto_open_standard_shards.sh` 按物理 GPU 启动独立 seed shard，输出
+独立 LeRobot v2 目录和总 `manifest.json`；失败 episode 会完整保留在 `quarantine/`。

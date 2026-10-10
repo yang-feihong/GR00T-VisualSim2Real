@@ -26,6 +26,26 @@ MAX_STEPS=3000 \
     bash gr00t/rl/scripts/run_auto_open_four_seed_video.sh
 ```
 
+## AutoOpen Standard Dataset Shards
+
+`DATA_STANARD.md` collection uses two 50 Hz RGB cameras per environment, so it
+scales across physical GPUs rather than placing thousands of camera-equipped
+environments in one App. Each seed runs in an independent Isaac App and writes
+one LeRobot v2 shard; `manifest.json` records all shard reports.
+
+```bash
+DATASET_ROOT=artifacts/auto_open_standard_sample \
+NUM_EPISODES=4 \
+SEED_START=1700 \
+GPU_IDS=0,1,2,3 \
+    bash gr00t/rl/scripts/run_auto_open_standard_shards.sh
+```
+
+Existing roots are never overwritten. The launcher isolates each process with
+`CUDA_VISIBLE_DEVICES`, schedules at most one App at a time on each GPU, and
+stores failed episodes under each shard's `quarantine/` tree. Process isolation
+also prevents simulator teardown or reset history from contaminating later seeds.
+
 Generate randomized articulated door USD assets offline, matching the same distributions used during training in `spawn_door()`.
 
 <p align="center">

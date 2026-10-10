@@ -54,6 +54,10 @@ dev = [
     "isort",
     "pre-commit",
 ]
+dataset = [
+    "av>=13",
+    "pyarrow>=15",
+]
 
 [tool.setuptools.packages.find]
 where = ["."]

@@ -1,0 +1,52 @@
+{
+  "enabled": true,
+  "draw_in_viewer": false,
+  "preview_window": false,
+  "preview_scale": 1.0,
+  "preview_fps": 50.0,
+  "sensor_update_period_s": 0.02,
+  "defaults": {
+    "mode": "mono",
+    "width": 640,
+    "height": 480,
+    "fps": 50.0,
+    "mono_offset": [0.0, 0.0, 0.0],
+    "left_offset": [0.0, 0.03, 0.0],
+    "right_offset": [0.0, -0.03, 0.0],
+    "projection_type": "opencvFisheye",
+    "horizontal_fov": 45.0,
+    "calibration_name": "b2_z1_sim_door_v1_narrow_fisheye",
+    "fx": 265.84349,
+    "fy": 270.51708,
+    "cx": 326.60297,
+    "cy": 249.30456,
+    "skew": 0.96231,
+    "distortion_coefficients": [-0.245617, -0.024594, 0.128775, -0.052686],
+    "valid_circle_mask": {
+      "enabled": true,
+      "center": [320.0, 240.0],
+      "radius": 262.0,
+      "feather": 2.0
+    }
+  },
+  "cameras": [
+    {
+      "name": "left_wrist_0_rgb",
+      "enabled": true,
+      "mode": "mono",
+      "body_name": "link06",
+      "topic_prefix": "/dataset/left_wrist_0_rgb",
+      "position": [0.06, 0.0, 0.11],
+      "rotation": [0.0, 0.2443460953, 0.0]
+    },
+    {
+      "name": "base_0_rgb",
+      "enabled": true,
+      "mode": "mono",
+      "body_name": "base_link",
+      "topic_prefix": "/dataset/base_0_rgb",
+      "position": [0.46, 0.0, 0.01],
+      "rotation": [-1.5707963268, 0.0, 0.0]
+    }
+  ]
+}

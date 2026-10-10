@@ -77,6 +77,7 @@ def rgb_camera_specs_from_config(config):
             "preview_scale": 1.0,
             "preview_fps": 0.0,
             "cameras": [],
+            "sensor_update_period_s": None,
         }
 
     defaults = dict(require_config_value(config, "defaults", "RGB camera config"))
@@ -329,6 +330,11 @@ def rgb_camera_specs_from_config(config):
         "preview_scale": preview_scale,
         "preview_fps": float(require_config_value(config, "preview_fps", "RGB camera config")),
         "door_diagnostics": diagnostic_configs,
+        "sensor_update_period_s": (
+            None
+            if config.get("sensor_update_period_s") is None
+            else float(config["sensor_update_period_s"])
+        ),
         "cameras": specs,
     }
 

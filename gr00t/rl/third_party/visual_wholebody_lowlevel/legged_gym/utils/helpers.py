@@ -398,6 +398,48 @@ def _apply_cli_rgb_camera_args(cfg, args):
 
     cfg.rgb_camera_specs = list(rgb_camera_config["cameras"])
     cfg.rgb_camera_draw_in_viewer = bool(rgb_camera_config["draw_in_viewer"])
+    sensor_update_period_s = rgb_camera_config.get("sensor_update_period_s")
+    if sensor_update_period_s is not None:
+        if float(sensor_update_period_s) <= 0.0:
+            raise ValueError("RGB sensor_update_period_s must be positive")
+        cfg.rgb_camera_update_period_s = float(sensor_update_period_s)
+
+
+def _enable_standard_self_collision_audit(cfg):
+    """Enable self-contact while filtering four intentional trunk overlaps."""
+    original_spawn = cfg.robot.spawn.func
+
+    def spawn_with_standard_filters(
+        prim_path, spawn_cfg, translation=None, orientation=None, **kwargs
+    ):
+        prim = original_spawn(
+            prim_path,
+            spawn_cfg,
+            translation=translation,
+            orientation=orientation,
+            **kwargs,
+        )
+        from pxr import Sdf, UsdPhysics
+
+        stage = prim.GetStage()
+        robot_root = str(prim.GetPath())
+        base_path = f"{robot_root}/base_link"
+        base_prim = stage.GetPrimAtPath(base_path)
+        if not base_prim.IsValid():
+            raise RuntimeError(f"standard-data collision body not found: {base_path}")
+        relation = UsdPhysics.FilteredPairsAPI.Apply(
+            base_prim
+        ).CreateFilteredPairsRel()
+        for leg in ("FR", "FL", "RR", "RL"):
+            thigh_path = f"{robot_root}/{leg}_thigh"
+            if not stage.GetPrimAtPath(thigh_path).IsValid():
+                raise RuntimeError(
+                    f"standard-data collision body not found: {thigh_path}"
+                )
+            relation.AddTarget(Sdf.Path(thigh_path))
+        return prim
+
+    cfg.robot.spawn.func = spawn_with_standard_filters
 
 
 def _apply_cli_play_args(cfg, args):
@@ -410,7 +452,10 @@ def _apply_cli_play_args(cfg, args):
     cfg.profile_env_step = bool(args.print_timing_breakdown)
     cfg.check_terminations = False
     cfg.robot.spawn.activate_contact_sensors = bool(cfg.enable_contact_sensor)
-    cfg.robot.spawn.articulation_props.enabled_self_collisions = False
+    standard_dataset = bool(getattr(args, "standard_dataset_dir", None))
+    cfg.robot.spawn.articulation_props.enabled_self_collisions = standard_dataset
+    if standard_dataset:
+        _enable_standard_self_collision_audit(cfg)
     cfg.env.teleop_debug = False
     cfg.commands.curriculum_playback_counter = (
         float(args.curriculum_iter)

@@ -17,6 +17,7 @@ import math
 import multiprocessing as mp
 import os
 import signal
+import subprocess
 import sys
 import time
 import traceback
@@ -230,6 +231,15 @@ def _parser() -> argparse.ArgumentParser:
         help="Backend for guarded CENTER_HANDLE geometry fallback rows.",
     )
     parser.add_argument("--output_dir", type=Path, required=True)
+    parser.add_argument(
+        "--standard_dataset_dir",
+        type=Path,
+        default=None,
+        help=(
+            "Opt-in DATA_STANARD.md output root. This passive collector is "
+            "disabled by default and does not alter AutoOpen control."
+        ),
+    )
     parser.add_argument("--max_steps", type=int, default=3000)
     parser.add_argument("--save_failures", action="store_true")
     parser.add_argument(
@@ -278,10 +288,86 @@ def _default_paths(args):
         args.run_metadata_path = str(run_dir / "run_metadata.json")
     if not args.robot_usd_path:
         args.robot_usd_path = str(repo / "gr00t" / "rl" / "data" / "robots" / "b2z1_lab30" / "b2z1_mount_90_x0p22_y0_z0p17.usd")
-    if args.disable_rgb_cameras:
+    if args.standard_dataset_dir is not None:
+        if args.disable_rgb_cameras:
+            raise SystemExit("standard data collection requires both RGB cameras")
+        args.rgb_camera_config = str(
+            LOWLEVEL_ROOT / "legged_gym" / "scripts" / "rgb_cameras_dataset.json"
+        )
+    elif args.disable_rgb_cameras:
         args.rgb_camera_config = None
     elif not args.rgb_camera_config:
         args.rgb_camera_config = str(LOWLEVEL_ROOT / "legged_gym" / "scripts" / "rgb_cameras.json")
+
+
+def _standard_simulation_provenance(args, runner, base_seed):
+    """Build reproducibility metadata without changing simulator state."""
+    from gr00t.rl.data_collection.auto_open_writer import file_sha256
+
+    repo = SCRIPT_ROOT.parent.parent
+
+    def git(*git_args):
+        try:
+            return subprocess.check_output(
+                ("git", *git_args), cwd=repo, text=True, stderr=subprocess.DEVNULL
+            ).strip()
+        except (OSError, subprocess.CalledProcessError):
+            return None
+
+    def hashed(path):
+        path = Path(path)
+        return {"path": str(path), "sha256": file_sha256(path)} if path.is_file() else None
+
+    try:
+        import omni.kit.app
+
+        isaac_sim_version = str(omni.kit.app.get_app().get_app_version())
+    except Exception:
+        isaac_sim_version = "unknown"
+    try:
+        driver_version = subprocess.check_output(
+            ("nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"),
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).splitlines()[0]
+    except (OSError, subprocess.CalledProcessError, IndexError):
+        driver_version = "unknown"
+
+    robot_props = runner.env.cfg.robot.spawn.articulation_props
+    door_asset = getattr(getattr(runner.env.door.cfg, "spawn", None), "usd_path", None)
+    camera_path = Path(args.rgb_camera_config)
+    return {
+        "collector": "auto_open_standard_sidecar",
+        "repository_commit": git("rev-parse", "HEAD"),
+        "repository_dirty": bool(git("status", "--porcelain")),
+        "python_version": sys.version.split()[0],
+        "torch_version": torch.__version__,
+        "cuda_runtime_version": torch.version.cuda,
+        "nvidia_driver_version": driver_version,
+        "isaac_sim_version": isaac_sim_version,
+        "scene_id": "door_open_b2z1_autoopen",
+        "robot_asset": hashed(args.robot_usd_path),
+        "door_asset": hashed(door_asset) if door_asset else None,
+        "checkpoint": hashed(args.ckpt_path),
+        "run_metadata": hashed(args.run_metadata_path),
+        "camera_config": hashed(camera_path),
+        "camera_calibration_id": file_sha256(camera_path),
+        "physics_dt_s": float(runner.env.physics_dt),
+        "control_dt_s": float(runner.env.dt),
+        "decimation": int(runner.env.cfg.decimation),
+        "solver_position_iterations": int(
+            getattr(robot_props, "solver_position_iteration_count", 0)
+        ),
+        "solver_velocity_iterations": int(
+            getattr(robot_props, "solver_velocity_iteration_count", 0)
+        ),
+        "ccd_enabled": bool(getattr(robot_props, "enable_ccd", False)),
+        "self_collisions_enabled": bool(robot_props.enabled_self_collisions),
+        "seed_start": int(base_seed),
+        "randomization": "DoorSpawner metadata recorded per episode",
+        "control_backend": "B2Z1 low-level policy plus AutoOpen FSM",
+        "rendering": "RTX headless, two DATA_STANARD.md RGB sensors at 50 Hz",
+    }
 
 
 def _as_np(value, shape_last=None):
@@ -1628,6 +1714,7 @@ class DoorController:
         shared_steady_model=None,
         shared_robot_geometry=None,
         build_open_loop_trajectory=True,
+        standard_gripper_semantics=False,
     ):
         self.runner = runner
         self.env = runner.env
@@ -1639,6 +1726,7 @@ class DoorController:
         self.env_id = int(env_id)
         self.shared_robot_geometry = shared_robot_geometry
         self.build_open_loop_trajectory = bool(build_open_loop_trajectory)
+        self.standard_gripper_semantics = bool(standard_gripper_semantics)
         self.stage = Stage.RESET
         self.stage_steps = 0
         self.stage_limits = {
@@ -1832,7 +1920,7 @@ class DoorController:
         self.handle_collider_path = None
         self.panel_half_thickness = 0.03
         self.panel_hinge_to_free_edge = None
-        self.turn_gap_clearance = 0.002
+        self.turn_gap_clearance = 0.020 if self.standard_gripper_semantics else 0.002
         self.turn_gap_angle = None
         self.grasp_orientation_tolerance = 0.050
         self.ee_orientation_error = 999.0
@@ -2768,10 +2856,11 @@ class DoorController:
         finite = limits[np.isfinite(limits)]
         if len(finite) < 2:
             raise RuntimeError(f"jointGripper has no finite limits: {limits.tolist()}")
-        # Match the B2Z1 control interface: the allowed open command is -0.785
-        # rad.  The URDF lower limit is a mechanical bound, not an operating
-        # command, and must not be treated as the fully-open target.
-        self.q_open = float(np.clip(-0.785, finite.min(), finite.max()))
+        # Normal AutoOpen retains its validated -0.785 rad operating target.
+        # DATA_STANARD.md explicitly defines fully open as -pi/3, which is the
+        # legal lower limit of this gripper and is enabled only for collection.
+        requested_open = -math.pi / 3 if self.standard_gripper_semantics else -0.785
+        self.q_open = float(np.clip(requested_open, finite.min(), finite.max()))
         self.q_closed = float(np.clip(0.0, finite.min(), finite.max()))
         # q_closed is only the search limit.  GRASP_HANDLE closes toward it
         # and latches the measured joint angle when both jaw faces reach the
@@ -7161,8 +7250,57 @@ def _serialize_episode(
     save_failures,
     debug_stage=None,
     summary_only=False,
+    standard_dataset_dir=None,
 ):
     state = controller.reset()
+    # Match the batched runner's reset contract: advance one neutral physics
+    # frame before the episode starts so ContactSensor reads the new reset
+    # pose instead of the previous PhysX solve.  Reinitialize the controller
+    # from that measured state; the priming frame is not part of the episode.
+    neutral_actions = torch.zeros(
+        (runner.env.num_envs, runner.env.num_actions),
+        dtype=torch.float32,
+        device=runner.env.device,
+    )
+    runner.obs, *_ = runner.env.step(neutral_actions)
+    state = controller.reset(
+        state=runner.get_control_state(),
+        reset_env=False,
+    )
+    standard_collector = None
+    standard_approach_hold_remaining = 0
+    if standard_dataset_dir is not None:
+        from gr00t.rl.data_collection.auto_open_collector import (
+            AutoOpenStandardEpisodeCollector,
+        )
+
+        standard_collector = AutoOpenStandardEpisodeCollector(
+            runner,
+            controller,
+            episode_index=episode_id - 1,
+            seed=seed,
+            video_staging_root=(
+                Path(standard_dataset_dir)
+                / ".staging"
+                / f"episode_{episode_id - 1:06d}"
+            ),
+        )
+
+    standard_handle_press_stages = {
+        Stage.PREGRASP,
+        Stage.OPEN_GRIPPER,
+        Stage.CENTER_HANDLE,
+        Stage.GRASP_HANDLE,
+        Stage.TURN_HANDLE,
+        Stage.RETURN_HANDLE,
+        Stage.OPEN_AND_CLEAR,
+        Stage.RETREAT_ARM,
+        Stage.RESTORE_GRIPPER,
+    }
+
+    def zero_collection_base_command():
+        runner.env.teleop_raw_commands.zero_()
+        runner.env._teleop_inputs_dirty = True
     door_prim = runner.env.sim.stage.GetPrimAtPath("/World/envs/env_0/door")
     door_randomization = dict(door_prim.GetMetadata("customData") or {})
     records = {k: [] for k in (
@@ -7242,8 +7380,22 @@ def _serialize_episode(
                 flush=True,
             )
             break
+        if (
+            standard_collector is not None
+            and controller.stage in standard_handle_press_stages
+        ):
+            # Stage 2 of DATA_STANARD.md requires the actually dispatched base
+            # command to be zero.  Keep the original planner value in the
+            # collector's pre-processing field, but dispatch a stationary base.
+            zero_collection_base_command()
         if summary_only:
+            if standard_collector is not None:
+                standard_collector.capture_before_step(
+                    state, high, stage_name=controller.stage.name
+                )
             result = runner.step_once()
+            if standard_collector is not None:
+                standard_collector.complete_after_step(result)
             low = _as_np(result["low_level_action"])[0]
             finite_keys = (
                 "root_states",
@@ -7285,6 +7437,7 @@ def _serialize_episode(
                 controller.replan_counter + 1
             ) % controller.replan_interval
             if debug_retract_hold_steps is None:
+                stage_before_advance = controller.stage
                 try:
                     controller._legacy_feedback_advance(state, dist, yaw_error)
                 except RuntimeError as exc:
@@ -7295,6 +7448,26 @@ def _serialize_episode(
                         flush=True,
                     )
                     break
+                if (
+                    standard_collector is not None
+                    and stage_before_advance == Stage.APPROACH
+                    and controller.stage == Stage.PREGRASP
+                ):
+                    standard_approach_hold_remaining = 25
+                    zero_collection_base_command()
+                while standard_approach_hold_remaining > 0:
+                    # DATA_STANARD.md requires 25 zero-command ticks before the
+                    # first active arm command.  AutoOpen settles measured base
+                    # motion, but its station controller may still issue a
+                    # small correction, so collection records a fresh 25-tick
+                    # zero-command interval.
+                    standard_collector.capture_before_step(
+                        state, high, stage_name="APPROACH"
+                    )
+                    hold_result = runner.step_once()
+                    standard_collector.complete_after_step(hold_result)
+                    state = hold_result["state"]
+                    standard_approach_hold_remaining -= 1
                 if debug_stage == "retract_arm" and controller.stage == Stage.ALIGN_PANEL:
                     controller.stage = Stage.RESTORE_GRIPPER
                     controller.stage_steps = 100
@@ -7489,7 +7662,13 @@ def _serialize_episode(
         )
         if step and step % 100 == 0:
             print(f"[doorman] env step begin step={step}", flush=True)
+        if standard_collector is not None:
+            standard_collector.capture_before_step(
+                state, high, stage_name=controller.stage.name
+            )
         result = runner.step_once()
+        if standard_collector is not None:
+            standard_collector.complete_after_step(result)
         if step and step % 100 == 0:
             print(f"[doorman] env step end step={step}", flush=True)
         low = _as_np(result["low_level_action"])[0]; records["low_level_action"].append(low)
@@ -7538,6 +7717,7 @@ def _serialize_episode(
             )
         controller.replan_counter = (controller.replan_counter + 1) % controller.replan_interval
         if debug_retract_hold_steps is None:
+            stage_before_advance = controller.stage
             try:
                 controller._legacy_feedback_advance(state, dist, yaw_error)
             except RuntimeError as exc:
@@ -7548,6 +7728,22 @@ def _serialize_episode(
                     flush=True,
                 )
                 break
+            if (
+                standard_collector is not None
+                and stage_before_advance == Stage.APPROACH
+                and controller.stage == Stage.PREGRASP
+            ):
+                # Keep the default AutoOpen trajectory untouched.  Collection
+                # mode adds the standard's complete 25-tick zero-command tail
+                # before PREGRASP can issue active Cartesian control.
+                zero_collection_base_command()
+                for _ in range(25):
+                    standard_collector.capture_before_step(
+                        state, high, stage_name="APPROACH"
+                    )
+                    hold_result = runner.step_once()
+                    standard_collector.complete_after_step(hold_result)
+                    state = hold_result["state"]
             if debug_stage == "retract_arm" and controller.stage == Stage.ALIGN_PANEL:
                 controller.stage = Stage.RESTORE_GRIPPER
                 controller.stage_steps = 100
@@ -7567,11 +7763,41 @@ def _serialize_episode(
                     flush=True,
                 )
     success = controller.stage == Stage.SUCCESS
+    if success and standard_collector is not None:
+        # DATA_STANARD.md requires the complete 1 s terminal rest interval.
+        # AutoOpen has already succeeded; these steps only hold its SUCCESS
+        # command and do not participate in the success decision.
+        for _ in range(50):
+            high, _, _ = controller._legacy_feedback_command(state)
+            standard_collector.capture_before_step(
+                state, high, stage_name="terminal_hold"
+            )
+            result = runner.step_once()
+            standard_collector.complete_after_step(result)
+            state = result["state"]
+    standard_episode = None
+    if standard_collector is not None:
+        reasons = () if success else (
+            f"autoopen_failure:{controller.failure_stage or controller.stage.name}:"
+            f"{controller.failure_reason or 'unknown'}",
+        )
+        standard_episode = standard_collector.finish(
+            acceptance_reasons=reasons,
+            provenance={
+                "seed": int(seed),
+                "initial_root_pose_w": initial_root_state.tolist(),
+                "initial_dof_position": initial_dof_position.tolist(),
+                "initial_gripper_position": initial_gripper_position,
+                "door_randomization": door_randomization,
+                "contact_audit": standard_collector.contact_view_description,
+            },
+        )
+        standard_collector.close()
     if records["done"]:
         records["done"][-1] = True; records["success"][-1] = success
     if not success and not save_failures:
         print(f"[doorman] episode {episode_id} failed at stage={controller.stage.name}")
-        return False
+        return False, standard_episode
     episode_dir = output_dir / f"episode_{episode_id:06d}"
     episode_dir.mkdir(parents=True, exist_ok=False)
     rgb_dir = episode_dir / "rgb"
@@ -7712,7 +7938,7 @@ def _serialize_episode(
         f"[doorman] wrote {episode_dir} success={success} steps={step_count} "
         f"frames={{{', '.join(f'{name}: {len(camera_frames[name])}' for name in camera_names)}}}"
     )
-    return success
+    return success, standard_episode
 
 
 def _write_batched_episode_result(
@@ -8734,6 +8960,11 @@ def main():
             raise SystemExit(f"{label} not found: {path}")
     if args.rgb_camera_config and not Path(args.rgb_camera_config).is_file():
         raise SystemExit(f"RGB camera config not found: {args.rgb_camera_config}")
+    if args.standard_dataset_dir is not None and args.batched_envs:
+        raise SystemExit(
+            "standard camera collection currently scales by independent shards; "
+            "do not combine --standard_dataset_dir with --batched_envs"
+        )
     try:
         args.output_dir.mkdir(parents=True, exist_ok=True)
     except PermissionError as exc:
@@ -8744,6 +8975,7 @@ def main():
         ) from exc
     simulation_app = launch_app(args)
     successes = 0
+    standard_writer = None
     try:
         if args.batched_envs:
             _run_batched(args)
@@ -8764,16 +8996,38 @@ def main():
                 args.position_only_center,
                 args.disable_push_base_assist,
                 args.push_base_forward_speed,
+                standard_gripper_semantics=args.standard_dataset_dir is not None,
             )
-            successes += int(_serialize_episode(
+            success, standard_episode = _serialize_episode(
                 controller, runner, next_episode_id, episode_seed, args.output_dir,
                 args.max_steps, args.save_failures, args.debug_stage, args.summary_only,
-            ))
+                standard_dataset_dir=args.standard_dataset_dir,
+            )
+            successes += int(success)
+            if standard_episode is not None:
+                if standard_writer is None:
+                    from gr00t.rl.data_collection.auto_open_writer import (
+                        AutoOpenDatasetWriter,
+                    )
+
+                    camera_calibration = json.loads(
+                        Path(args.rgb_camera_config).read_text(encoding="utf-8")
+                    )
+                    standard_writer = AutoOpenDatasetWriter(
+                        args.standard_dataset_dir,
+                        camera_calibration=camera_calibration,
+                        simulation_provenance=_standard_simulation_provenance(
+                            args, runner, base_seed
+                        ),
+                    )
+                standard_writer.write_episode(standard_episode)
             next_episode_id += 1
             runner.close()
             del controller
             del runner
             gc.collect()
+        if standard_writer is not None:
+            standard_writer.finalize()
     except BaseException:
         traceback.print_exc()
         raise
