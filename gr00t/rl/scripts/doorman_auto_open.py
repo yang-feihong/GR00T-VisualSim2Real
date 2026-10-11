@@ -147,6 +147,25 @@ STAGE_TO_TASK_PHASE = {
     Stage.THROUGH: 2,
 }
 
+# These stages do not prescribe base travel.  They inherit and hold the last
+# target owned by the preceding movement stage.
+BASE_HOLD_STAGES = frozenset(
+    {
+        Stage.PREGRASP,
+        Stage.OPEN_GRIPPER,
+        Stage.CENTER_HANDLE,
+        Stage.GRASP_HANDLE,
+        Stage.TURN_HANDLE,
+        Stage.RETURN_HANDLE,
+        Stage.OPEN_AND_CLEAR,
+        Stage.RETREAT_ARM,
+        Stage.RESTORE_GRIPPER,
+        Stage.CONTACT_PANEL,
+        Stage.PUSH_OPEN,
+        Stage.PUSH_ARM_RETRACT,
+    }
+)
+
 MAX_BASE_PLANAR_SPEED = 0.4
 MAX_BASE_YAW_RATE = 0.6
 ROBOT_TRUNK_REAR_X = -0.284
@@ -1062,9 +1081,15 @@ def _batched_default_base_commands_exact(state, station_xy, station_yaw):
     distance = np.linalg.norm(error[:, :2], axis=1).astype(np.float32)
     planar_norm = np.linalg.norm(command[:, :2], axis=1).astype(np.float32)
     deadzone = (
-        (distance > 0.08) & (planar_norm > 1.0e-6) & (planar_norm < 0.25)
+        (distance > 0.08) & (planar_norm > 1.0e-6) & (planar_norm < 0.15)
     )
-    command[deadzone, :2] *= (0.25 / planar_norm[deadzone])[:, None]
+    command[deadzone, :2] *= (0.15 / planar_norm[deadzone])[:, None]
+    yaw_deadzone = (
+        (np.abs(yaw_error) > 0.08)
+        & (np.abs(command[:, 2]) > 1.0e-6)
+        & (np.abs(command[:, 2]) < 0.2)
+    )
+    command[yaw_deadzone, 2] = np.copysign(0.2, command[yaw_deadzone, 2])
     return command, distance, np.abs(yaw_error)
 
 
@@ -1685,7 +1710,7 @@ class _BatchedStabilityTracker:
         dots = torch.abs(torch.sum(orientations * current[:, None, :], dim=-1))
         orientation_span = (2.0 * torch.acos(dots.clamp(0.0, 1.0))).amax(dim=1)
         enough = self.counts[rows] >= self.window_size
-        stable = enough & (position_span <= 0.0003) & (orientation_span <= 0.003)
+        stable = enough & (position_span <= 0.001) & (orientation_span <= 0.003)
         position_span = position_span.cpu().numpy()
         orientation_span = orientation_span.cpu().numpy()
         enough = enough.cpu().numpy()
@@ -1730,7 +1755,7 @@ class DoorController:
         self.stage = Stage.RESET
         self.stage_steps = 0
         self.stage_limits = {
-            Stage.APPROACH: 700,
+            Stage.APPROACH: 1000,
             Stage.PREGRASP: 500,
             Stage.OPEN_GRIPPER: 100,
             Stage.CENTER_HANDLE: 800,
@@ -1795,7 +1820,6 @@ class DoorController:
         self.turn_path_replan_count = 0
         self.turn_gap_started = False
         self.turn_command_bias_world = np.zeros(3, dtype=np.float32)
-        self.turn_base_start_xy = None
         self.release_start_world = None
         self.release_start_quat = None
         self.release_endpoint_world = None
@@ -1849,6 +1873,9 @@ class DoorController:
         self.panel_contact_settle_steps = 0
         self.panel_station_xy = None
         self.panel_station_settle_steps = 0
+        self.base_hold_stage = None
+        self.base_hold_target_xy = None
+        self.base_hold_target_yaw = None
         self.panel_align_ee_goal_local = None
         self.panel_align_ee_orientation_local = None
         self.push_start_hinge_angle = None
@@ -1887,10 +1914,12 @@ class DoorController:
         self.push_comfort_reach_radius = None
         self.push_reengage_reach_radius = 0.4
         self.push_reengage_release_radius = 0.45
+        self.push_reengage_target_lead = 0.05
         self.push_reengage_reachable = False
         self.push_overspeed_steps = 0
         self.push_base_start_xy = None
         self.push_panel_contact_start_world = None
+        self.base_advance_target_longitudinal = None
         # A 0.155 m planar envelope around each front hip covers the B2 base
         # box, front camera enclosure, and the laterally offset upper-leg
         # collider in the deployment URDF.  Door thickness is added at run
@@ -2081,6 +2110,9 @@ class DoorController:
             self.runner.obs = self.env.get_observations()
         self.stage = Stage.APPROACH
         self.stage_steps = 0
+        self.base_hold_stage = None
+        self.base_hold_target_xy = None
+        self.base_hold_target_yaw = None
         self.approach_settle_steps = 0
         self.pregrasp_settle_steps = 0
         self.handle_align_settle_steps = 0
@@ -2112,7 +2144,6 @@ class DoorController:
         self.turn_gap_started = False
         self.turn_release_slow_steps = 0
         self.turn_command_bias_world[:] = 0.0
-        self.turn_base_start_xy = None
         self.release_start_world = None
         self.release_start_quat = None
         self.release_endpoint_world = None
@@ -2180,6 +2211,7 @@ class DoorController:
         self.push_overspeed_steps = 0
         self.push_base_start_xy = None
         self.push_panel_contact_start_world = None
+        self.base_advance_target_longitudinal = None
         self.push_shoulder_min_clearance = float("nan")
         self.push_shoulder_predicted_min_clearance = float("nan")
         self.push_base_safety_scale = 1.0
@@ -3500,12 +3532,44 @@ class DoorController:
         ))
         station_dist = float(np.linalg.norm(error_w[:2]))
         planar_command_norm = float(np.linalg.norm(cmd[:2]))
-        # The imported locomotion policy has an effective planar dead-zone
-        # around 0.2 m/s.  Preserve direction but keep moving until the base is
-        # well inside the station tolerance, then let velocity damping settle.
-        if station_dist > 0.08 and 1.0e-6 < planar_command_norm < 0.25:
-            cmd[:2] *= 0.25 / planar_command_norm
+        # Keep nonzero commands above their locomotion dead zones until the
+        # base is inside the corresponding position or yaw tolerance.
+        if station_dist > 0.08 and 1.0e-6 < planar_command_norm < 0.15:
+            cmd[:2] *= 0.15 / planar_command_norm
+        if abs(yaw_error) > 0.08 and 1.0e-6 < abs(float(cmd[2])) < 0.2:
+            cmd[2] = math.copysign(0.2, float(cmd[2]))
         return cmd, station_dist, abs(yaw_error)
+
+    def _set_base_tracking_target(self, target_xy, target_yaw):
+        """Record the target currently owned by a base movement stage."""
+        self.base_hold_target_xy = np.asarray(target_xy, dtype=np.float32).copy()
+        self.base_hold_target_yaw = float(target_yaw)
+
+    def _approach_base_target(self):
+        """Return the base target shared by scalar and batched APPROACH."""
+        target_yaw = math.atan2(
+            float(-self.door_normal[1]), float(-self.door_normal[0])
+        )
+        return self.station_xy, target_yaw
+
+    def _base_hold_target(self):
+        """Return the preceding movement target unchanged for a hold stage."""
+        if self.stage not in BASE_HOLD_STAGES:
+            self.base_hold_stage = None
+            return None
+        if self.base_hold_target_xy is None or self.base_hold_target_yaw is None:
+            raise RuntimeError(
+                f"{self.stage.name} entered without a base target to hold"
+            )
+        if self.base_hold_stage != self.stage:
+            self.base_hold_stage = self.stage
+            print(
+                f"[doorman][base-hold] stage={self.stage.name} "
+                f"inherited_xy={self.base_hold_target_xy.round(4).tolist()} "
+                f"inherited_yaw={self.base_hold_target_yaw:.4f}",
+                flush=True,
+            )
+        return self.base_hold_target_xy, self.base_hold_target_yaw
 
     def _ee_local_target(self, world_target):
         origin = self.env.get_goal_reference_origin()
@@ -4629,6 +4693,7 @@ class DoorController:
                                 self.stage_steps = 0
                                 self.push_recovery_settle_steps = 0
                                 self.push_reengage_reachable = False
+                                self.base_advance_target_longitudinal = None
                                 print(
                                     "[doorman][push] arm comfortable; "
                                     "begin base-only advance",
@@ -4784,109 +4849,57 @@ class DoorController:
         else:
             self.ee_command_world = _as_np(state["ee_pos"])[0].copy()
 
-        if self.stage == Stage.TURN_HANDLE:
-            joints = _as_np(state["door_joint_position"])[0]
-            latch_released = float(joints[self.latch_joint_idx]) >= 0.02
-            hinge_now = float(joints[self.hinge_idx])
-            hinge_goal = self.turn_target_hinge_angle
-            pushing_to_handoff = (
-                latch_released
-                and hinge_goal is not None
-                and abs(hinge_now - self.turn_start_hinge_angle)
-                < abs(hinge_goal - self.turn_start_hinge_angle) * 0.98
+        if self.stage == Stage.APPROACH:
+            approach_target_xy, approach_target_yaw = self._approach_base_target()
+            self._set_base_tracking_target(
+                approach_target_xy, approach_target_yaw
             )
-            base_cmd = np.zeros(3, dtype=np.float32)
-            if self.turn_base_start_xy is None:
-                self.turn_base_start_xy = _as_np(state["root_states"])[0, :2].copy()
-            # Keep the base fixed through initial lever engagement.  Once the
-            # arm is well into the fixed turn trajectory, unfold a slow,
-            # preplanned 80 mm forward translation over four seconds.  Yaw is
-            # held fixed; the base only restores arm workspace near the lower
-            # end of the lever arc.
-            assist_start_step = 240
-            assist_duration_steps = 200
-            if self.stage_steps >= assist_start_step:
-                fraction = min(
-                    1.0,
-                    (self.stage_steps - assist_start_step)
-                    / float(assist_duration_steps),
-                )
-                turn_base_target = (
-                    self.turn_base_start_xy
-                    + (0.08 * fraction) * self.door_forward[:2]
-                )
-                target_yaw = math.atan2(
-                    float(self.door_forward[1]), float(self.door_forward[0])
-                )
-                base_cmd, _, _ = self._base_command(
-                    state, turn_base_target, target_yaw
-                )
-                base_cmd[:2] = np.clip(base_cmd[:2], -0.04, 0.04)
-                base_cmd[2] = 0.0
-            if pushing_to_handoff:
-                travel_cmd = self._travel_command(state, 0.35)
-                base_cmd[:2] = travel_cmd[:2]
+            self.base_hold_stage = None
         elif self.stage == Stage.BASE_ADVANCE:
-            base_cmd = (
-                self._arm_push_base_command(state)
-                if not self.disable_push_base_assist
-                else np.zeros(3, dtype=np.float32)
+            if self.disable_push_base_assist:
+                base_advance_target = _as_np(state["root_states"])[0, :2].copy()
+                base_advance_yaw = _quat_yaw(_as_np(state["root_states"])[0, 3:7])
+            else:
+                base_advance_target, base_advance_yaw = (
+                    self._base_advance_target(state)
+                )
+            base_cmd, station_dist, yaw_error = self._base_command(
+                state,
+                base_advance_target,
+                base_advance_yaw,
             )
-        elif self.stage in (Stage.PUSH_OPEN, Stage.PUSH_ARM_RETRACT):
-            base_cmd = np.zeros(3, dtype=np.float32)
+            self._set_base_tracking_target(
+                base_advance_target, base_advance_yaw
+            )
+            self.base_hold_stage = None
         elif self.stage == Stage.ALIGN_PANEL:
             panel_station_xy, panel_station_yaw = self._current_panel_station(state)
-            base_cmd, _, _ = self._base_command(
+            base_cmd, station_dist, yaw_error = self._base_command(
                 state,
                 panel_station_xy,
                 panel_station_yaw,
             )
-        elif self.stage == Stage.THROUGH:
+            self._set_base_tracking_target(
+                panel_station_xy, panel_station_yaw
+            )
+            self.base_hold_stage = None
+        elif self.stage in (Stage.THROUGH, Stage.SUCCESS):
             base_cmd, station_dist, yaw_error = self._base_command(
                 state,
                 self.through_station_xy,
                 self.through_station_yaw,
             )
+            self._set_base_tracking_target(
+                self.through_station_xy, self.through_station_yaw
+            )
+            self.base_hold_stage = None
+        elif self.stage in BASE_HOLD_STAGES:
+            hold_target = self._base_hold_target()
+            base_cmd, station_dist, yaw_error = self._base_command(
+                state, hold_target[0], hold_target[1]
+            )
         elif self.stage != Stage.APPROACH:
             base_cmd[:] = 0.0
-
-        # Hold the accepted station against arm reaction forces while the
-        # measured base itself remains stationary.
-        if self.stage in (
-            Stage.PREGRASP,
-            Stage.OPEN_GRIPPER,
-            Stage.CENTER_HANDLE,
-            Stage.GRASP_HANDLE,
-            Stage.TURN_HANDLE,
-        ):
-            base_cmd, _, _ = self._base_command(state)
-            base_cmd[:2] = np.clip(base_cmd[:2], -0.25, 0.25)
-            base_cmd[2] = float(np.clip(base_cmd[2], -0.40, 0.40))
-        elif self.stage in (
-            Stage.CENTER_HANDLE,
-            Stage.GRASP_HANDLE,
-            Stage.RETURN_HANDLE,
-            Stage.OPEN_AND_CLEAR,
-            Stage.RETREAT_ARM,
-            Stage.RESTORE_GRIPPER,
-            Stage.CONTACT_PANEL,
-            Stage.PUSH_ARM_RETRACT,
-        ):
-            base_cmd[:] = 0.0
-
-        # Dampen residual base momentum at the TURN->RELEASE handoff.  This
-        # brakes the robot in place; it is not a door-pushing command.
-        if self.stage == Stage.RETURN_HANDLE and self.stage_steps < 20:
-            base = _as_np(state["root_states"])[0]
-            yaw = _quat_yaw(base[3:7])
-            c, s = math.cos(yaw), math.sin(yaw)
-            vel = base[7:10]
-            local_vel = np.array(
-                [c * vel[0] + s * vel[1], -s * vel[0] + c * vel[1]],
-                dtype=np.float32,
-            )
-            base_cmd[:2] = np.clip(-1.5 * local_vel, -0.25, 0.25)
-            base_cmd[2] = np.clip(-0.8 * float(base[12]), -0.25, 0.25)
 
         base_cmd = _limit_base_commands(base_cmd)
 
@@ -5317,13 +5330,14 @@ class DoorController:
             )
         )
 
-    def _arm_push_base_command(self, state):
-        """Advance along door-forward while keeping both front shoulders clear."""
+    def _base_advance_target(self, state):
+        """Target the nearer of panel reachability and shoulder clearance."""
         if (
             self.push_base_start_xy is None
             or self.push_panel_contact_start_world is None
         ):
-            return np.zeros(3, dtype=np.float32)
+            base = _as_np(state["root_states"])[0]
+            return base[:2].copy(), _quat_yaw(base[3:7])
         base = _as_np(state["root_states"])[0]
         hinge = float(
             _as_np(state["door_joint_position"])[0, self.hinge_idx]
@@ -5334,39 +5348,72 @@ class DoorController:
             self.hinge_axis_sign * (hinge - self.push_start_hinge_angle),
         )
         forward = np.asarray(self.door_forward[:2], dtype=np.float32)
-        panel_forward_displacement = max(
-            0.0,
-            float(
-                np.dot(
-                    current_contact[:2]
-                    - self.push_panel_contact_start_world[:2],
-                    forward,
-                )
+        target_yaw = math.atan2(float(forward[1]), float(forward[0]))
+        line_origin = np.asarray(self.panel_station_xy, dtype=np.float32)
+        current_longitudinal = float(
+            np.dot(base[:2] - line_origin, forward)
+        )
+        line_position = line_origin + current_longitudinal * forward
+
+        def monotonic_target(proposed_longitudinal):
+            previous = self.base_advance_target_longitudinal
+            target_longitudinal = max(
+                current_longitudinal,
+                float(proposed_longitudinal),
+                -math.inf if previous is None else float(previous),
+            )
+            self.base_advance_target_longitudinal = target_longitudinal
+            return (
+                line_origin + target_longitudinal * forward
+            ).astype(np.float32)
+
+        if self.push_reengage_reachable:
+            # The forward lead only keeps the locomotion command outside its
+            # dead zone while approaching.  Once the physical reach condition
+            # is met, latch the current centre-line position and settle here.
+            self.base_advance_target_longitudinal = current_longitudinal
+            return line_position.astype(np.float32), target_yaw
+
+        contact_local = _as_np(self._ee_local_target(current_contact))[0]
+        contact_xy = np.asarray(contact_local[:2], dtype=np.float64)
+        goal_ref_quat = _as_np(self.env.get_goal_reference_quat())[0]
+        forward_local = _quat_rotate_inverse_np(
+            goal_ref_quat,
+            np.array([forward[0], forward[1], 0.0], dtype=np.float32),
+        )[:2].astype(np.float64)
+        lateral_shift_world = line_position - base[:2]
+        lateral_shift_local = _quat_rotate_inverse_np(
+            goal_ref_quat,
+            np.array(
+                [lateral_shift_world[0], lateral_shift_world[1], 0.0],
+                dtype=np.float32,
             ),
+        )[:2].astype(np.float64)
+        contact_xy -= lateral_shift_local
+        radius = float(self.push_reengage_reach_radius)
+        quadratic_a = float(np.dot(forward_local, forward_local))
+        quadratic_b = float(np.dot(contact_xy, forward_local))
+        quadratic_c = float(np.dot(contact_xy, contact_xy) - radius * radius)
+        discriminant = (
+            quadratic_b * quadratic_b - quadratic_a * quadratic_c
         )
-        target_xy = (
-            self.push_base_start_xy
-            + panel_forward_displacement * forward
-        )
-        forward_error = max(
-            0.0, float(np.dot(target_xy - base[:2], forward))
-        )
-        if self.push_base_forward_speed is not None:
-            forward_speed = max(0.0, float(self.push_base_forward_speed))
-        elif forward_error <= 0.025:
-            forward_speed = 0.0
+        if quadratic_c <= 0.0:
+            required_advance = 0.0
+        elif quadratic_a <= 1.0e-10 or discriminant < 0.0:
+            self.push_base_safety_scale = 0.0
+            return monotonic_target(current_longitudinal), target_yaw
         else:
-            forward_speed = min(0.18, 1.2 * forward_error)
-            measured_speed = float(np.linalg.norm(base[7:9]))
-            if forward_error > 0.08 and measured_speed < 0.03:
-                forward_speed = 0.21
-        # The contact point is farther from the hinge than the near shoulder,
-        # so blindly copying its forward displacement can sweep that shoulder
-        # into the smaller-radius part of the panel.  Treat the current panel
-        # as a finite XY segment and conservatively sweep both measured front
-        # hip positions through the command horizon.  Keeping the panel fixed
-        # over this prediction is conservative because a push-opening panel
-        # rotates away from the robot.
+            root = math.sqrt(max(0.0, discriminant))
+            interval_start = (quadratic_b - root) / quadratic_a
+            interval_end = (quadratic_b + root) / quadratic_a
+            if interval_end < 0.0:
+                self.push_base_safety_scale = 0.0
+                return monotonic_target(current_longitudinal), target_yaw
+            required_advance = max(0.0, interval_start)
+        required_advance += self.push_reengage_target_lead
+
+        # Search shoulder clearance only at candidate target positions.  The
+        # target remains on the fixed doorway-centre line for every candidate.
         closed_free_end = 2.0 * self.panel_center_world - self.hinge_world
         panel_free_end = self._rotate_about_z(
             closed_free_end,
@@ -5380,85 +5427,93 @@ class DoorController:
             raise RuntimeError(
                 "robot_body_state_w is required for shoulder-safe push assistance"
             )
-        shoulder_xy = shoulders[0, self.front_shoulder_body_indices, :2]
-        collision_envelope = (
-            self.push_shoulder_collision_radius + self.panel_half_thickness
-        )
-
-        def shoulder_clearance(advance):
-            points = shoulder_xy + float(advance) * forward[None, :]
-            segment = panel_end - panel_start
-            segment_norm_sq = float(np.dot(segment, segment))
-            if segment_norm_sq < 1.0e-10:
-                center_distances = np.linalg.norm(points - panel_start, axis=1)
-            else:
-                projection = np.clip(
-                    ((points - panel_start) @ segment) / segment_norm_sq,
-                    0.0,
-                    1.0,
-                )
-                closest = panel_start + projection[:, None] * segment[None, :]
-                center_distances = np.linalg.norm(points - closest, axis=1)
-            return float(np.min(center_distances) - collision_envelope)
-
-        current_clearance = shoulder_clearance(0.0)
-        measured_forward_speed = max(
-            0.0, float(np.dot(np.asarray(base[7:9], dtype=np.float32), forward))
-        )
-        braking_distance = (
-            0.15 * measured_forward_speed
-            + measured_forward_speed * measured_forward_speed / (2.0 * 0.60)
-        )
-        command_horizon_distance = forward_speed * 0.45
-        predicted_advance = max(braking_distance, command_horizon_distance)
-        advances = np.linspace(0.0, predicted_advance, 17, dtype=np.float32)
-        clearances = np.asarray(
-            [shoulder_clearance(advance) for advance in advances],
+        shoulder_xy = np.asarray(
+            shoulders[0, self.front_shoulder_body_indices, :2],
             dtype=np.float32,
         )
-        predicted_clearance = float(np.min(clearances))
-        unsafe = np.flatnonzero(clearances < self.push_shoulder_safety_margin)
-        swept_scale = 1.0
-        if unsafe.size:
-            first_unsafe = int(unsafe[0])
-            swept_scale = max(0.0, (first_unsafe - 1) / max(len(advances) - 1, 1))
-        clearance_scale = float(
-            np.clip(
-                (current_clearance - self.push_shoulder_safety_margin)
-                / self.push_shoulder_slowdown_band,
+        required_clearance = (
+            self.push_shoulder_collision_radius + self.panel_half_thickness
+            + self.push_shoulder_safety_margin
+        )
+        candidate_count = max(
+            2, int(math.ceil(required_advance / 0.005)) + 1
+        )
+        candidate_advances = np.linspace(
+            0.0, required_advance, candidate_count, dtype=np.float32
+        )
+        candidate_targets = (
+            line_position[None, :]
+            + candidate_advances[:, None] * forward[None, :]
+        )
+        candidate_displacements = candidate_targets - base[None, :2]
+        points = (
+            shoulder_xy[None, :, :]
+            + candidate_displacements[:, None, :]
+        )
+        segment = panel_end - panel_start
+        segment_norm_sq = float(np.dot(segment, segment))
+        if segment_norm_sq < 1.0e-10:
+            center_distances = np.linalg.norm(
+                points - panel_start[None, None, :], axis=-1
+            )
+        else:
+            projection = np.clip(
+                np.sum(
+                    (points - panel_start[None, None, :])
+                    * segment[None, None, :],
+                    axis=-1,
+                )
+                / segment_norm_sq,
                 0.0,
                 1.0,
             )
+            closest = (
+                panel_start[None, None, :]
+                + projection[:, :, None] * segment[None, None, :]
+            )
+            center_distances = np.linalg.norm(points - closest, axis=-1)
+        candidate_min_distances = np.min(center_distances, axis=1)
+        candidate_clearances = candidate_min_distances - (
+            self.push_shoulder_collision_radius + self.panel_half_thickness
         )
-        self.push_shoulder_min_clearance = current_clearance
-        self.push_shoulder_predicted_min_clearance = predicted_clearance
-        self.push_base_safety_scale = min(swept_scale, clearance_scale)
-        forward_speed *= self.push_base_safety_scale
-        # Tiny commands sit below the walking policy's useful range and add
-        # foot motion without creating clearance.  Stop and let the arm rotate
-        # the door farther away before trying the same forward-only move again.
-        if forward_speed < 0.08:
-            forward_speed = 0.0
+        candidate_safe = candidate_min_distances >= required_clearance
+        unsafe = np.flatnonzero(~candidate_safe)
+        if unsafe.size:
+            last_safe = int(unsafe[0]) - 1
+            target_index = max(0, last_safe)
+        else:
+            target_index = len(candidate_targets) - 1
+        target_advance = float(candidate_advances[target_index])
+        current_projection = np.clip(
+            ((shoulder_xy - panel_start[None, :]) @ segment)
+            / max(segment_norm_sq, 1.0e-10),
+            0.0,
+            1.0,
+        )
+        current_closest = (
+            panel_start[None, :]
+            + current_projection[:, None] * segment[None, :]
+        )
+        current_center_distances = np.linalg.norm(
+            shoulder_xy - current_closest, axis=1
+        )
+        self.push_shoulder_min_clearance = float(
+            np.min(current_center_distances)
+            - self.push_shoulder_collision_radius
+            - self.panel_half_thickness
+        )
+        self.push_shoulder_predicted_min_clearance = float(
+            candidate_clearances[target_index]
+        )
+        if required_advance > 1.0e-6:
+            self.push_base_safety_scale = float(
+                np.clip(target_advance / required_advance, 0.0, 1.0)
+            )
+        else:
+            self.push_base_safety_scale = 1.0
 
-        yaw = _quat_yaw(base[3:7])
-        c, s = math.cos(yaw), math.sin(yaw)
-        velocity_world = self._door_centerline_velocity_world(
-            base[:2], forward_speed
-        )
-        target_yaw = math.atan2(float(forward[1]), float(forward[0]))
-        yaw_error = ((target_yaw - yaw + math.pi) % (2 * math.pi)) - math.pi
-        return _limit_base_commands(np.array(
-            [
-                c * velocity_world[0] + s * velocity_world[1],
-                -s * velocity_world[0] + c * velocity_world[1],
-                np.clip(
-                    1.5 * yaw_error - 0.35 * base[12],
-                    -MAX_BASE_YAW_RATE,
-                    MAX_BASE_YAW_RATE,
-                ),
-            ],
-            dtype=np.float32,
-        ))
+        proposed_longitudinal = current_longitudinal + target_advance
+        return monotonic_target(proposed_longitudinal), target_yaw
 
     def _body_push_command(self, state, forward_speed):
         """Push forward while rejecting lateral sliding along the panel."""
@@ -6154,7 +6209,7 @@ class DoorController:
             position_span = batched_result["position_span"]
             orientation_span = batched_result["orientation_span"]
             if (
-                abs(position_span - 0.0003) > 0.00005
+                abs(position_span - 0.001) > 0.00005
                 and abs(orientation_span - 0.003) > 0.0005
             ):
                 self.gpu_stability_uses += 1
@@ -6176,7 +6231,7 @@ class DoorController:
             self._quat_distance(orientation, sample) for sample in orientations
         )
         stable = bool(
-            position_span <= 0.0003
+            position_span <= 0.001
             and orientation_span <= 0.003
         )
         self.last_stability_diagnostics = {
@@ -6630,7 +6685,6 @@ class DoorController:
                 self.turn_path_quat = None
                 self.turn_path_index = 0
                 self.turn_path_stage = None
-                self.turn_base_start_xy = base_xy.copy()
                 self.turn_release_slow_steps = 0
                 self.stage = Stage.TURN_HANDLE; self.stage_steps = 0
         elif self.stage == Stage.TURN_HANDLE:
@@ -8280,17 +8334,11 @@ def _run_batched(args):
         [controller.env.arm_induced_pitch for controller in controllers],
         dtype=np.float64,
     )
-    station_xy = np.stack([controller.station_xy for controller in controllers])
-    station_yaw = np.asarray(
-        [
-            math.atan2(
-                float(-controller.door_normal[1]),
-                float(-controller.door_normal[0]),
-            )
-            for controller in controllers
-        ],
-        dtype=np.float64,
-    )
+    approach_targets = [
+        controller._approach_base_target() for controller in controllers
+    ]
+    station_xy = np.stack([target[0] for target in approach_targets])
+    station_yaw = np.asarray([target[1] for target in approach_targets], dtype=np.float64)
     base_command_exact_s = 0.0
     for step in range(args.max_steps):
         phase_start = time.perf_counter()
@@ -8366,6 +8414,10 @@ def _run_batched(args):
                 ):
                     if controller.stage == Stage.APPROACH:
                         base_command, distance, yaw_errors = batched_base_command
+                        controller._set_base_tracking_target(
+                            station_xy[env_id], station_yaw[env_id]
+                        )
+                        controller.base_hold_stage = None
                         controller.active_grasp_quat = controller._slew_orientation(
                             controller.initial_ee_orientation
                         )

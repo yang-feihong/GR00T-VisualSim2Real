@@ -2910,12 +2910,12 @@ class LeggedRobotIsaacLab(DirectRLEnv):
             if robot_side not in ("positive_x", "negative_x"):
                 raise ValueError(f"Unsupported doorman_robot_side={robot_side!r}")
             side_sign = 1.0 if robot_side == "positive_x" else -1.0
-            x_min, x_max = map(float, self.cfg.doorman_robot_init_x_range)
-            y_min, y_max = map(float, self.cfg.doorman_robot_init_y_range)
-            yaw_min, yaw_max = map(float, self.cfg.doorman_robot_init_yaw_range)
+            x_min, x_max = map(float, self.cfg.doorman_front_camera_init_x_range)
+            y_min, y_max = map(float, self.cfg.doorman_front_camera_init_y_range)
+            yaw_min, yaw_max = map(float, self.cfg.doorman_front_camera_init_yaw_range)
             if not (0.0 < x_min <= x_max and y_min <= y_max and yaw_min <= yaw_max):
                 raise ValueError(
-                    "Invalid DoorMan robot reset ranges: "
+                    "Invalid DoorMan front-camera reset ranges: "
                     f"x={(x_min, x_max)}, y={(y_min, y_max)}, "
                     f"yaw={(yaw_min, yaw_max)}"
                 )
@@ -2923,24 +2923,36 @@ class LeggedRobotIsaacLab(DirectRLEnv):
                 self.scene.env_origins[env_ids, 2]
                 + float(self.cfg.doorman_robot_init_height)
             )
-            # The 0.75 m near bound is the closest verified reset with the
-            # extended default B2Z1 arm that remains clear of the door plane.
-            root_state[:, 0:1] = (
+            camera_x = (
                 self.scene.env_origins[env_ids, 0:1]
                 + side_sign
                 * torch_rand_float(x_min, x_max, (len(env_ids), 1), self.device)
             )
-            root_state[:, 1:2] = (
+            camera_y = (
                 self.scene.env_origins[env_ids, 1:2]
                 + torch_rand_float(y_min, y_max, (len(env_ids), 1), self.device)
             )
-            random_yaw = torch_rand_float(
+            camera_yaw = torch_rand_float(
                 yaw_min, yaw_max, (len(env_ids), 1), self.device
             ).squeeze(-1)
             if side_sign > 0:
-                random_yaw = torch.pi + random_yaw
-            zero_angle = torch.zeros_like(random_yaw)
-            root_state[:, 3:7] = quat_from_euler_xyz(zero_angle, zero_angle, random_yaw)
+                camera_yaw = torch.pi + camera_yaw
+
+            camera_offset = self.cfg.doorman_front_camera_offset_xy
+            if len(camera_offset) != 2:
+                raise ValueError(
+                    "doorman_front_camera_offset_xy must contain exactly two values"
+                )
+            offset_x, offset_y = map(float, camera_offset)
+            base_yaw = camera_yaw - float(self.cfg.doorman_front_camera_yaw_offset)
+            cos_yaw = torch.cos(base_yaw)
+            sin_yaw = torch.sin(base_yaw)
+            camera_offset_world_x = cos_yaw * offset_x - sin_yaw * offset_y
+            camera_offset_world_y = sin_yaw * offset_x + cos_yaw * offset_y
+            root_state[:, 0] = camera_x.squeeze(-1) - camera_offset_world_x
+            root_state[:, 1] = camera_y.squeeze(-1) - camera_offset_world_y
+            zero_angle = torch.zeros_like(base_yaw)
+            root_state[:, 3:7] = quat_from_euler_xyz(zero_angle, zero_angle, base_yaw)
         elif not self.cfg.enable_doorman_scene:
             root_state[:, :2] += torch_rand_float(-0.5, 0.5, (len(env_ids), 2), self.device)
         self.robot.write_root_pose_to_sim(root_state[:, :7], env_ids=env_ids)

@@ -216,9 +216,13 @@ class LeggedRobotIsaacLabCfg(DirectRLEnvCfg):
     enable_doorman_scene: bool = False
     doorman_randomize_robot_init: bool = True
     doorman_robot_side: str = "positive_x"
-    doorman_robot_init_x_range: tuple[float, float] = (0.75, 2.0)
-    doorman_robot_init_y_range: tuple[float, float] = (-2.0, 2.0)
-    doorman_robot_init_yaw_range: tuple[float, float] = (-1.0471975512, 1.0471975512)
+    # The sampled planar pose belongs to the front fisheye camera.  Reset
+    # converts it to the base pose using this fixed camera-to-base extrinsic.
+    doorman_front_camera_init_x_range: tuple[float, float] = (0.75, 2.0)
+    doorman_front_camera_init_y_range: tuple[float, float] = (-2.0, 2.0)
+    doorman_front_camera_init_yaw_range: tuple[float, float] = (-1.0471975512, 1.0471975512)
+    doorman_front_camera_offset_xy: tuple[float, float] = (0.46, 0.0)
+    doorman_front_camera_yaw_offset: float = 0.0
     doorman_robot_init_height: float = 0.545
     doorman_arm_joint_init_center: list[float] = field(default_factory=list)
     doorman_arm_joint_init_delta_rad: float = 0.25
