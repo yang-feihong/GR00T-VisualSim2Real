@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from gr00t.rl.auto_open.control import _through_tail_clearance
 from gr00t.rl.envs.door.b2z1_reset_geometry import (
     b2z1_gripper_pose_and_jacobian,
 )
@@ -359,7 +360,12 @@ class AutoOpenStandardEpisodeCollector:
         self.audit["door_latch_position"].append(latch)
         self.audit["door_latch_state"].append("unlocked" if latch >= 0.02 else "locked")
         self.audit["robot_clear_of_door"].append(
-            bool(controller._through_tail_clearance(self._pending_state_view(value)) > 0.0)
+            bool(
+                _through_tail_clearance(
+                    controller, self._pending_state_view(value)
+                )
+                > 0.0
+            )
         )
         self.audit["autoopen_stage"].append(stage_name)
         self.audit["physical_phase"].append(_phase_for_stage(stage_name))

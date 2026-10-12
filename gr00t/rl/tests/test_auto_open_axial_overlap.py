@@ -4,6 +4,7 @@ from gr00t.rl.scripts.doorman_auto_open import (
     DoorController,
     _solve_center_vertical_shift,
 )
+from gr00t.rl.auto_open.geometry import _center_handle_axial_overlap
 
 
 def _controller():
@@ -18,10 +19,12 @@ def _controller():
 
 def test_axial_overlap_accepts_an_offset_grasp_on_the_handle():
     controller = _controller()
-    centered = controller._center_handle_axial_overlap(
+    centered = _center_handle_axial_overlap(
+        controller,
         {"valid": True, "pocket_axial_error": 0.0}
     )
-    offset = controller._center_handle_axial_overlap(
+    offset = _center_handle_axial_overlap(
+        controller,
         {"valid": True, "pocket_axial_error": 0.020}
     )
     assert math.isclose(centered, 0.030, abs_tol=1.0e-12)
@@ -30,7 +33,8 @@ def test_axial_overlap_accepts_an_offset_grasp_on_the_handle():
 
 def test_axial_overlap_rejects_a_grasp_beyond_the_handle_end():
     controller = _controller()
-    overlap = controller._center_handle_axial_overlap(
+    overlap = _center_handle_axial_overlap(
+        controller,
         {"valid": True, "pocket_axial_error": 0.071}
     )
     assert overlap == 0.0

@@ -1828,3 +1828,78 @@ episode 全部通过、隔离为 0、例外为空。固定入口现已直接记�
 最后通过唯一固定入口运行 `1 env / 1 step` 的真实 SimulationApp smoke，21 秒内正常初始化、
 执行并生成完整 metadata。此次清理不修改控制公式、阈值、阶段转移或既有阶段数值，因此不重跑
 1000-seed 能力统计，当前基线仍为 `798/1000 = 79.8%`。
+
+### AutoOpen 按所有权重构（已完成）
+
+本轮重构以提交 `1f26cda` 和固定能力基线
+`logs_rl/final_unified_1000_20261012` 为行为基准。顶层
+`gr00t/rl/scripts/doorman_auto_open.py` 不再是 8000 多行的控制、仿真、视频和批处理混合文件，
+也没有改成只负责启动的空包装层；当前约 3000 行，仍直接包含：
+
+- `Stage`、按真实执行顺序排列的 `STAGE_SPECS`、每阶段控制职责、验收语义、预算和合法后继；
+- 唯一 `DoorController`、真实 `command()` / `advance()` 阶段分派、同帧转移和失败处理；
+- 固定入口检查、SimulationApp 生命周期和主程序。
+
+`STAGE_SPECS` 不是说明性副本：controller 的阶段预算直接由它生成，所有运行时阶段转移统一经
+`_transition_to()` 并根据该表检查合法后继；episode reset 是唯一允许直接回到 `APPROACH` 的
+位置。职责下沉结果如下：
+
+| 模块 | 唯一职责 |
+|---|---|
+| `gr00t/rl/auto_open/cli.py` | 固定命令行契约和默认资产路径 |
+| `gr00t/rl/auto_open/lifecycle.py` | episode reset 与场景派生初态 |
+| `gr00t/rl/auto_open/control.py` | 底盘反馈、坐标控制、姿态限速与稳定性原语 |
+| `gr00t/rl/auto_open/geometry.py` | USD 碰撞几何、抓取/门板几何和 GPU/NumPy 批量几何 |
+| `gr00t/rl/auto_open/planning.py` | IK 可达性、稳态逆映射、把手/释放/门板路径规划及 worker 请求 |
+| `gr00t/rl/auto_open/runtime.py` | 单一标量/多环境 GPU 执行路径、worker 调度、仿真步进和结果落盘 |
+| `gr00t/rl/auto_open/io.py` | 资产/仿真溯源快照和 RGB 视频输出 |
+| `gr00t/rl/auto_open/target_noise.py` | episode 级语义目标随机化采样与记录 |
+| `gr00t/rl/auto_open/utils.py` | 跨模块张量到 NumPy 的无状态转换 |
+
+迁移按完整函数/类 AST 节点执行，没有按原文件行号拆 mixin，也没有保留同名转发方法或旧兼容
+路径。下沉实现统一放在 `gr00t/rl/auto_open/` 包内，而不是平铺到 `scripts/`。当前静态契约
+覆盖：唯一入口、唯一 controller、stage graph 完整性、禁止绕过阶段跳转、所有跨模块 import
+可解析、无未绑定全局名、无已删除 controller 方法调用、领域包禁止反向 import 可执行脚本、
+包内依赖图无环，以及原 `@staticmethod` 几何函数的调用参数个数。当前相关测试为
+`53 passed`，Python 全量编译和 `git diff --check` 通过。
+
+以上下沉模块统一属于 `gr00t.rl.auto_open` 包；AutoOpen 主流程在 `gr00t/rl/scripts/` 中只保留
+真实顶层编排入口 `doorman_auto_open.py` 和唯一固定实验入口 `run_auto_open.sh`，不保留旧模块
+路径兼容壳。`analyze_auto_open_target_noise.py` 是不被主流程 import 的离线结果分析命令，不是
+第二套实验入口或控制实现。
+
+固定入口对 seed 1700 的单环境无相机完整闭环已完成，墙钟 `201 s`。它与重构前同配置基线
+`logs_rl/auto_open_standard_dataset_verified_20261012/logs/episode-seed1700-control` 的结果逐值
+一致：成功状态、初始机器人状态、阶段序列及阶段步数、全部 `stage_exit_diagnostics`、最终
+`acceptance_diagnostics`、最大夹爪接触力、最大门铰链速度、场景随机化和目标随机化均无差异。
+阶段步数为：
+
+`APPROACH 425 -> PREGRASP 164 -> OPEN_GRIPPER 36 -> CENTER_HANDLE 69 ->`
+`GRASP_HANDLE 149 -> TURN_HANDLE 309 -> RETREAT_ARM 60 -> RESTORE_GRIPPER 113 ->`
+`ALIGN_PANEL 138 -> CONTACT_PANEL 147 -> PUSH_OPEN 40 -> THROUGH 485`。
+
+包路径迁移和运行时依赖注入完成后，通过唯一固定入口四卡并行重跑 seed 1700--1703，墙钟
+`207 s`。四个 seed 均成功，
+并分别与重构前标准采集基线逐值对比；以下字段全部完全相等：`robot_state`、`scene`、
+`stage_exit_diagnostics`（含阶段序列、每阶段步数和阶段退出状态）、`acceptance_diagnostics`、
+`target_noise`、最终成败和失败原因。验证中发现声明式阶段图最初遗漏了原控制逻辑已有的
+`BASE_ADVANCE -> THROUGH` 和 `PUSH_ARM_RETRACT -> THROUGH` 边；根因确认后只补齐既有边声明和
+契约测试，没有修改控制逻辑。
+
+最终四卡 1000-seed 回归位于
+`logs_rl/auto_open_architecture_final_1000_20261012`，墙钟 `1464 s`；基线为 `1406 s`，增加
+`58 s / 4.1%`。两次结果均为 `798/1000 = 79.8%`，1000 个 seed 集合、逐 seed 成败、成功 seed
+集合、失败阶段和失败原因全部一致，失败分布均为：`GRASP_HANDLE=125`、
+`RESTORE_GRIPPER=23`、`max_steps=14`、`APPROACH=13`、`BASE_ADVANCE=8`、`PREGRASP=7`、
+`TURN_HANDLE=7`、`CONTACT_PANEL=4`、`ALIGN_PANEL=1`。全部 seed 的阶段序列和阶段步数也一致；
+301 个 seed 的接触诊断存在 GPU 浮点末位差异，最大几何差 `1.14e-5 m`，未改变任何阈值判断、
+阶段转移或结果。
+
+最终双相机标准采集位于
+`artifacts/auto_open_architecture_standard_verified_20261012`，四卡 seed 1700--1703 墙钟
+`541 s`，四个 episode 全部验收通过。共生成 8 个 MP4、12 个 parquet、完整 manifest、机器
+验收报告、中文验收报告、资产/仿真 provenance、阶段边界和真实非零接触力/冲量记录；四个
+control metadata 与重构前标准采集基线逐值完全一致。第一次采集尝试暴露了采集器仍调用已删除
+controller 转发方法的问题，四个任务在首帧审计处失败并卡在 Isaac 原生退出；修复改为直接调用
+`auto_open.control` 的共享函数，并把数据采集模块纳入“禁止调用已删除 controller 方法”的静态
+契约。失败尝试不作为性能或行为结果。

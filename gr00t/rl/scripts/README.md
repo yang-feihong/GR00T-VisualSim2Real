@@ -1,111 +1,40 @@
-# Door Asset Generation Scripts
+# AutoOpen Fixed Entry
 
-## AutoOpen Four-Seed Video Regression
-
-Run the accepted seeds `1700` through `1703` concurrently on four physical
-GPUs, with six-camera video recording enabled:
+AutoOpen experiments have one maintained entry:
 
 ```bash
-RUN_NAME=auto_open_flat_stages_v1 \
-    bash gr00t/rl/scripts/run_auto_open_four_seed_video.sh
+bash gr00t/rl/scripts/run_auto_open.sh
 ```
 
-The launcher isolates one physical GPU per Isaac Sim process with
-`CUDA_VISIBLE_DEVICES`; every process therefore uses `--device cuda:0` inside
-its own CUDA namespace. Results are written below
-`logs_rl/${RUN_NAME}_seed<seed>_6cam`, with one adjacent `.console.log` file per
-seed. Existing result directories are never overwritten.
+Run it inside the `doorman_train` runtime container. It accepts no command-line
+arguments and refuses to overwrite existing output. Select exactly one reviewed
+workflow with `AUTO_OPEN_WORKFLOW`:
 
-The defaults can be overridden without editing the launcher:
+| Workflow | Required output variable | Purpose |
+|---|---|---|
+| `capability` | `OUTPUT_ROOT` | Camera-free vectorized capability regression |
+| `semantic_collection` | `OUTPUT_ROOT` | Validated episode-level semantic target variation |
+| `video_regression` | `RUN_NAME` | Four-seed visual regression |
+| `standard_collection` | `DATASET_ROOT` | Two-camera `DATA_STANARD.md` shards |
+
+`standard_collection` accepts a comma-separated `SEEDS` list selected from a
+completed capability regression. If omitted, it uses `SEED_START` and
+`NUM_EPISODES`. Control, physics, camera, and acceptance options remain fixed.
+The dataset root receives a manifest, a machine-readable aggregate acceptance
+report, a Chinese aggregate summary, and the measured collection wall time in
+addition to each independently validated shard.
+
+Example:
 
 ```bash
-RUN_NAME=auto_open_check \
-GPU_IDS=0,1,2,3 \
-SEEDS=1700,1701,1702,1703 \
-MAX_STEPS=3000 \
-    bash gr00t/rl/scripts/run_auto_open_four_seed_video.sh
+docker exec doorman_train bash -lc '
+  cd /workspace/GR00T-VisualSim2Real &&
+  AUTO_OPEN_WORKFLOW=capability \
+  OUTPUT_ROOT=logs_rl/auto_open_baseline_1000 \
+  bash gr00t/rl/scripts/run_auto_open.sh
+'
 ```
 
-## AutoOpen Standard Dataset Shards
-
-`DATA_STANARD.md` collection uses two 50 Hz RGB cameras per environment, so it
-scales across physical GPUs rather than placing thousands of camera-equipped
-environments in one App. Each seed runs in an independent Isaac App and writes
-one LeRobot v2 shard; `manifest.json` records all shard reports.
-
-```bash
-DATASET_ROOT=artifacts/auto_open_standard_sample \
-NUM_EPISODES=4 \
-SEED_START=1700 \
-GPU_IDS=0,1,2,3 \
-    bash gr00t/rl/scripts/run_auto_open_standard_shards.sh
-```
-
-Existing roots are never overwritten. The launcher isolates each process with
-`CUDA_VISIBLE_DEVICES`, schedules at most one App at a time on each GPU, and
-stores failed episodes under each shard's `quarantine/` tree. Process isolation
-also prevents simulator teardown or reset history from contaminating later seeds.
-
-Generate randomized articulated door USD assets offline, matching the same distributions used during training in `spawn_door()`.
-
-<p align="center">
-  <img src="../../../media/door_assets.gif" width="90%">
-</p>
-
-## Generate Door Assets
-
-```bash
-python gr00t/rl/scripts/generate_door_assets.py \
-    --num_doors 100 \
-    --output_dir data/door_assets \
-    --build_latch \
-    --add_floors \
-    --door_open_lr right \
-    --door_open_io out \
-    --randomize_material \
-    --seed 42
-```
-
-Each door is saved as a self-contained `.usd` file with randomized geometry (width, height, weight), handle placement, joint dynamics, optional latch, and Omniverse materials. A `metadata.json` with all sampled parameters is saved alongside the USD files.
-
-Multiple values can be passed to `--door_open_lr` and `--door_open_io` to sample from both:
-
-```bash
---door_open_lr left right --door_open_io in out
-```
-
-### Options
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--num_doors N` | Number of doors to generate | 100 |
-| `--output_dir DIR` | Output directory | `data/door_assets` |
-| `--seed S` | Random seed | 0 |
-| `--build_latch` | Add latch mechanism | off |
-| `--add_floors` | Add floor planes | off |
-| `--add_walls` | Add surrounding walls | off |
-| `--door_open_lr` | Hinge side(s): `left`, `right`, or both | `right` |
-| `--door_open_io` | Open direction(s): `in`, `out`, or both | `out` |
-| `--door_handle_tblr T B L R` | Handle position range (fraction of door) | `0.95 0.85 0.08 0.15` |
-| `--randomize_material` | Apply random Omniverse materials | off |
-| `--preloaded_materials_num_transform` | UV-transform variants per texture | 20 |
-| `--preloaded_materials_num_color` | Random-color paint variants | 100 |
-
-## Generate 1000 Doors (Batch)
-
-A convenience script generates 1000 doors across 7 diverse configurations:
-
-```bash
-bash gr00t/rl/scripts/generate_1000_doors.sh            # default: data/door_assets/
-bash gr00t/rl/scripts/generate_1000_doors.sh /my/path    # custom output dir
-```
-
-| Subdirectory | Count | Hinge | Direction | Latch | Walls |
-|---|---|---|---|---|---|
-| `right_out_latch/` | 200 | right | out | yes | no |
-| `left_out_latch/` | 200 | left | out | yes | no |
-| `right_in_latch/` | 150 | right | in | yes | no |
-| `left_in_latch/` | 150 | left | in | yes | no |
-| `mixed_walls/` | 100 | both | both | yes | yes |
-| `mixed_no_latch/` | 100 | both | both | no | no |
-| `wide_handle_range/` | 100 | both | both | yes | no |
+The launcher owns the Python options, GPU sharding, seed mapping, camera mode,
+and output validation. Environment variables expose only reviewed run-scale and
+destination choices; arbitrary Python argument forwarding is not supported.

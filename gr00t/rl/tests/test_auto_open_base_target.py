@@ -3,10 +3,10 @@ import numpy as np
 from gr00t.rl.scripts.doorman_auto_open import (
     _approach_stop_latch,
     _base_pose_accepted,
-    _base_commands_exact,
-    _resolved_door_prim_path,
     _through_stop_latch,
 )
+from gr00t.rl.auto_open.control import _base_commands_exact
+from gr00t.rl.auto_open.geometry import _resolved_door_prim_path
 
 
 def _state(x, speed):

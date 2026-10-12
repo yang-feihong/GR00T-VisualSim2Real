@@ -3,7 +3,7 @@ import math
 import numpy as np
 import pytest
 
-from gr00t.rl.scripts.auto_open_target_noise import (
+from gr00t.rl.auto_open.target_noise import (
     EpisodeTargetNoise,
     SemanticTargetNoiseConfig,
 )
