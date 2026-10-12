@@ -5,8 +5,6 @@
 from __future__ import annotations
 
 import torch
-from tensordict import TensorDict
-from torch.distributions import Normal
 
 from gr00t.rl.trl.modules.actor_critic_modules import Actor, Critic
 from gr00t.rl.trl.modules.memory import Memory
@@ -63,6 +61,7 @@ class RecurrentActor(Actor):
             module_dim_dict=module_dim_dict_recurrent,
             _resolve=False,
         )
+        self._zero_initialize_action_output()
 
         print(f"RecurrentActor RNN: {self.memory}")
         print(f"RecurrentActor MLP: {self.actor_module}")
@@ -70,6 +69,20 @@ class RecurrentActor(Actor):
     def reset(self, dones=None):
         """Reset memory hidden states for done environments."""
         self.memory.reset(dones)
+
+    def _get_action_reference(self, obs_dict):
+        if self.action_residual_obs_slice is None:
+            return None
+        action_reference = obs_dict[self.input_key][
+            ..., self.action_residual_obs_slice
+        ]
+        if action_reference.shape[-1] != self.num_actions:
+            raise RuntimeError(
+                "action_residual_obs_slice must select one reference value per "
+                f"action, got {action_reference.shape[-1]} values for "
+                f"{self.num_actions} actions"
+            )
+        return action_reference
 
     def forward(
         self,
@@ -81,6 +94,8 @@ class RecurrentActor(Actor):
         **kwargs,
     ):
         obs_dict = obs_dict.copy()
+        action_residual_mask = self._get_action_residual_mask(obs_dict)
+        action_reference = self._get_action_reference(obs_dict)
         if self.running_mean_std is not None:
             with torch.no_grad():
                 input_obs = obs_dict[self.input_key]
@@ -136,7 +151,12 @@ class RecurrentActor(Actor):
         if self.algo_config.get("use_clampped_std", False):
             self.std.clamp_(min=self.algo_config.std_clamp_min, max=self.algo_config.std_clamp_max)
 
-        return self.actor_module(memory_out, **kwargs)
+        action_mean = self.actor_module(memory_out, **kwargs)
+        if action_residual_mask is not None:
+            action_mean = action_mean * action_residual_mask
+        if action_reference is not None:
+            action_mean = action_mean + action_reference
+        return action_mean
 
     def get_hidden_states(self):
         """Get current hidden states from memory."""
@@ -159,6 +179,8 @@ class RecurrentActor(Actor):
         masks=None,
         hidden_states=None,
         original_dones=None,
+        action_noise_context=None,
+        marginalize_temporal=False,
         **kwargs,
     ):
         """Forward pass for sampling actions during training."""
@@ -169,16 +191,12 @@ class RecurrentActor(Actor):
             masks=masks,
             hidden_states=hidden_states,
             original_dones=original_dones,
+            action_noise_context=action_noise_context,
+            marginalize_temporal=marginalize_temporal,
             **kwargs,
         )
         actions = self.distribution.sample()
-        return TensorDict(
-            {
-                "actions": actions,
-                "action_mean": self.action_mean,
-                "action_sigma": self.action_std,
-            }
-        )
+        return self._action_state_dict(actions)
 
     def update_distribution(
         self,
@@ -188,6 +206,8 @@ class RecurrentActor(Actor):
         masks=None,
         hidden_states=None,
         original_dones=None,
+        action_noise_context=None,
+        marginalize_temporal=False,
         **kwargs,
     ):
         mean = self.forward(
@@ -202,14 +222,26 @@ class RecurrentActor(Actor):
             mean = mean[:, -1]
 
         if self.clamp_noise_std:
-            with torch.no_grad():
-                self.std.clamp_(max=self.max_noise_std)
+            self._clamp_action_noise_std()
 
-        self.distribution = Normal(mean, mean * 0.0 + self.std)
+        marginal_std = self._compute_action_std(mean, obs_dict, last_step_only)
+        temporal_fraction = self._compute_temporal_action_noise_fraction(
+            mean, obs_dict, last_step_only
+        )
+        self._set_action_distribution(
+            mean,
+            marginal_std,
+            action_noise_context,
+            marginalize_temporal=marginalize_temporal,
+            temporal_action_noise_fraction=temporal_fraction,
+        )
 
     def rollout(self, obs_dict, episode_attnmask=None, cur_dones=None, **kwargs):
         """Rollout method for recurrent actor during environment interaction."""
         episode_attnmask = self._update_obs_buffer(obs_dict, episode_attnmask, cur_dones)
+        raw_obs_dict = obs_dict
+        action_residual_mask = self._get_action_residual_mask(obs_dict)
+        action_reference = self._get_action_reference(obs_dict)
 
         if self.running_mean_std is not None:
             with torch.no_grad():
@@ -226,23 +258,34 @@ class RecurrentActor(Actor):
 
         # Update distribution using memory output
         mean = self.actor_module(memory_out, **kwargs)
+        if action_residual_mask is not None:
+            mean = mean * action_residual_mask
+        if action_reference is not None:
+            mean = mean + action_reference
         if self.clamp_noise_std:
-            with torch.no_grad():
-                self.std.clamp_(max=self.max_noise_std)
-        self.distribution = Normal(mean, mean * 0.0 + self.std)
+            self._clamp_action_noise_std()
+        marginal_std = self._compute_action_std(mean, raw_obs_dict)
+        temporal_fraction = self._compute_temporal_action_noise_fraction(
+            mean, raw_obs_dict
+        )
+        action_noise_context = self._advance_temporal_action_noise_context(
+            mean, cur_dones
+        )
+        self._set_action_distribution(
+            mean,
+            marginal_std,
+            action_noise_context,
+            temporal_action_noise_fraction=temporal_fraction,
+        )
 
         self.steps += 1
-        return TensorDict(
-            {
-                "actions": self.distribution.sample(),
-                "action_mean": self.action_mean,
-                "action_sigma": self.action_std,
-            }
-        )
+        return self._action_state_dict(self.distribution.sample())
 
     def act_inference(self, obs_dict, episode_attnmask=None, cur_dones=None, **kwargs):
         """Inference method for recurrent actor."""
         episode_attnmask = self._update_obs_buffer(obs_dict, episode_attnmask, cur_dones)
+        action_residual_mask = self._get_action_residual_mask(obs_dict)
+        action_reference = self._get_action_reference(obs_dict)
 
         # For recurrent models, pass through memory
         if self.running_mean_std is not None:
@@ -257,6 +300,10 @@ class RecurrentActor(Actor):
             memory_out = memory_out.squeeze(0)  # [batch_size, hidden_dim]
 
         actions_mean = self.actor_module(memory_out, **kwargs)
+        if action_residual_mask is not None:
+            actions_mean = actions_mean * action_residual_mask
+        if action_reference is not None:
+            actions_mean = actions_mean + action_reference
 
         self.steps += 1
         return actions_mean

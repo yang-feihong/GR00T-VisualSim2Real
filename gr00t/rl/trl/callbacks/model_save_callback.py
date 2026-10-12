@@ -31,13 +31,15 @@ class ModelSaveCallback(TrainerCallback):
         optimizer = kwargs.get("optimizer")
         lr_scheduler = kwargs.get("lr_scheduler")
         env = kwargs.get("env")
+        save_model_step = (
+            state.global_step % self.save_frequency == 0 and not env.is_evaluating
+        )
+        save_last = state.global_step % 50 == 0 and not env.is_evaluating
+        env_state_dict = None
+        if save_model_step or save_last:
+            env_state_dict = self.collect_env_state_dict(env)
 
-        if (
-            state.is_world_process_zero
-            and state.global_step % self.save_frequency == 0
-            and not env.is_evaluating
-        ):
-            env_state_dict = env.get_env_state_dict()
+        if state.is_world_process_zero and save_model_step:
             ModelSaveCallback.save_checkpoint(
                 model,
                 optimizer,
@@ -48,8 +50,7 @@ class ModelSaveCallback(TrainerCallback):
                 f"{self.save_dir}/model_step_{state.global_step:06d}.pt",
             )
 
-        if state.is_world_process_zero and state.global_step % 50 == 0 and not env.is_evaluating:
-            env_state_dict = env.get_env_state_dict()
+        if state.is_world_process_zero and save_last:
             ModelSaveCallback.save_checkpoint(
                 model,
                 optimizer,
@@ -60,6 +61,41 @@ class ModelSaveCallback(TrainerCallback):
                 f"{self.save_dir}/last.pt",
             )
             # self.export_policy_to_onnx(env, state, model)
+
+    @staticmethod
+    def collect_env_state_dict(env):
+        """Collect rank-local environment state into one portable checkpoint value."""
+        local_state = env.get_env_state_dict()
+        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+            return local_state
+
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        gathered = [None] * world_size if rank == 0 else None
+        torch.distributed.gather_object(local_state, gathered, dst=0)
+        if rank != 0:
+            return None
+        return {
+            "_format": "per_rank_v1",
+            "world_size": world_size,
+            "states": gathered,
+        }
+
+    @staticmethod
+    def select_rank_env_state_dict(env_state_dict, rank, world_size):
+        """Select the matching rank's environment state during resume."""
+        if not isinstance(env_state_dict, dict) or env_state_dict.get("_format") != "per_rank_v1":
+            return env_state_dict
+        saved_world_size = int(env_state_dict.get("world_size", -1))
+        states = env_state_dict.get("states", [])
+        if saved_world_size != world_size or len(states) != saved_world_size:
+            print(
+                "Skipping rank-local environment state because distributed topology "
+                f"changed: checkpoint={saved_world_size}, current={world_size}",
+                flush=True,
+            )
+            return None
+        return states[rank]
 
     def get_example_obs(self, env):
         obs_dict = copy.deepcopy(env.obs_buf_dict)

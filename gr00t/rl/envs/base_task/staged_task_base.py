@@ -7,12 +7,24 @@ from typing import Callable, Optional
 import torch
 import torch.nn.functional as F
 from isaaclab.assets import Articulation, RigidObject
+from loguru import logger
 from typing_extensions import override
 
 from gr00t.rl.envs.legged_base_task.legged_robot_base import LeggedRobotBase
+from gr00t.rl.envs.base_task.staged_task_events import (
+    advance_stage_for_next_observation,
+    compute_stage_advance_event,
+    mask_stage_advance_event,
+)
+from gr00t.rl.envs.base_task.staged_reset_library import (
+    pack_stage_initial_state_library,
+    restore_stage_initial_state_library,
+)
 
 
 class StagedTaskBase(LeggedRobotBase):
+    _STAGED_RESET_CHECKPOINT_KEY = "_staged_reset_library_v2"
+
     def __init__(self, config, device):
         super().__init__(config, device)
 
@@ -85,6 +97,23 @@ class StagedTaskBase(LeggedRobotBase):
         self.staged_reset_max_samples_per_stage = self.config.get(
             "staged_reset_max_samples_per_stage", None
         )
+        self.staged_reset_fixed_stage = self.config.get(
+            "staged_reset_fixed_stage", None
+        )
+        if self.staged_reset_fixed_stage is not None:
+            self.staged_reset_fixed_stage = int(self.staged_reset_fixed_stage)
+        self.staged_reset_eval_stage = self.config.get(
+            "staged_reset_eval_stage", None
+        )
+        if self.staged_reset_eval_stage is not None:
+            self.staged_reset_eval_stage = int(self.staged_reset_eval_stage)
+        self.staged_reset_initial_state_source = self.config.get(
+            "staged_reset_initial_state_source", None
+        )
+        self.staged_reset_checkpoint_samples_per_env = int(
+            self.config.get("staged_reset_checkpoint_samples_per_env", 1)
+        )
+        self._staged_reset_initial_state_loaded = False
 
         if self.enable_staged_reset:
             assert (
@@ -103,6 +132,17 @@ class StagedTaskBase(LeggedRobotBase):
             assert (
                 self.staged_reset_max_samples_per_stage > 0
             ), "staged_reset_max_samples_per_stage must be greater than 0"
+            assert self.staged_reset_checkpoint_samples_per_env > 0, (
+                "staged_reset_checkpoint_samples_per_env must be positive"
+            )
+            if self.staged_reset_fixed_stage is not None:
+                assert 0 <= self.staged_reset_fixed_stage < self.num_stages, (
+                    "staged_reset_fixed_stage must be in [0, num_stages)"
+                )
+            if self.staged_reset_eval_stage is not None:
+                assert 0 <= self.staged_reset_eval_stage < self.num_stages, (
+                    "staged_reset_eval_stage must be in [0, num_stages)"
+                )
             self.staged_reset_num_samples = torch.zeros(
                 self.num_stages, self.num_envs, device=self.device, dtype=torch.long
             )
@@ -154,6 +194,9 @@ class StagedTaskBase(LeggedRobotBase):
         self.current_max_stage_buf = torch.zeros(
             self.num_envs, dtype=torch.long, device=self.device
         )  # max stage index of the current episode
+        self.stage_advance_event_buf = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )  # current action satisfies the active stage's advance condition
         self.last_last_stage_completed_task_buf = torch.zeros(
             self.num_envs, dtype=torch.bool, device=self.device
         )  # whether the env has completed the last stage in the past episode
@@ -161,15 +204,16 @@ class StagedTaskBase(LeggedRobotBase):
             self.num_envs, dtype=torch.bool, device=self.device
         )  # whether the env has completed the last stage in the current episode
 
-    def _post_compute_observations_callback(self):
-        # advance stage
-        advance_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
-        for i in range(self.num_stages - 1):
-            advance_cond = self.stage_advance_cond_funcs[i]()
-            assert advance_cond.shape == (self.num_envs,)
-            assert advance_cond.dtype == torch.bool
-            advance_mask |= advance_cond & self._make_mask(i)
-        advance_mask &= ~self.just_resetted_buf  # avoid advancing on reset
+    def _prepare_next_observations_callback(self):
+        # Reward computation and stage mutation consume the same event, so the
+        # completing action owns the old-stage credit while the next observation
+        # and policy action consistently use the new stage.
+        advance_mask, next_stage = advance_stage_for_next_observation(
+            self.stage_buf,
+            self.stage_advance_event_buf,
+            self.reset_buf,
+            self.just_resetted_buf,
+        )
         self.just_resetted_buf[:] = False  # reset the flag
         if self.config.get("award_remaining_time_on_advance", False):
             self.time_in_stage_buf[advance_mask] -= self.max_stage_time[
@@ -178,7 +222,7 @@ class StagedTaskBase(LeggedRobotBase):
         else:
             self.time_in_stage_buf[advance_mask] = 0
         self.actual_time_in_stage_buf[advance_mask] = 0
-        self.stage_buf[advance_mask] += 1
+        self.stage_buf.copy_(next_stage)
         self.time_in_stage_buf[~advance_mask] += 1
         self.actual_time_in_stage_buf[~advance_mask] += 1
         self.total_time_buf[:] += 1
@@ -200,14 +244,61 @@ class StagedTaskBase(LeggedRobotBase):
         if self.enable_staged_reset:
             self._take_snapshot_of_buffered_states(advance_mask)
 
-        return super()._post_compute_observations_callback()
+        self.stage_advance_event_buf.zero_()
+
+        return super()._prepare_next_observations_callback()
+
+    def _fixed_stage_for_current_mode(self) -> int | None:
+        from gr00t.rl.envs.base_task.staged_task_events import fixed_stage_for_mode
+
+        return fixed_stage_for_mode(
+            self.staged_reset_fixed_stage,
+            self.staged_reset_eval_stage,
+            self.is_evaluating,
+        )
+
+    def _compute_stage_advance_event(self) -> torch.Tensor:
+        if self._fixed_stage_for_current_mode() is not None:
+            return torch.zeros_like(self.stage_buf, dtype=torch.bool)
+        conditions = [
+            self.stage_advance_cond_funcs[stage_idx]()
+            for stage_idx in range(self.num_stages - 1)
+        ]
+        return compute_stage_advance_event(self.stage_buf, conditions)
+
+    def _active_task_completion_condition(self) -> torch.Tensor:
+        fixed_stage = self._fixed_stage_for_current_mode()
+        if fixed_stage is not None:
+            stage = fixed_stage
+            return self.stage_reward_cond_funcs[stage]() & (self.stage_buf == stage)
+        return self.stage_complete_cond_func()
+
+    def _staged_reset_snapshot_exclusion(self) -> torch.Tensor:
+        """Return physical failure events that must never enter an initial-state bank."""
+        return torch.zeros_like(self.stage_buf, dtype=torch.bool)
+
+    def _get_stage_advance_event(self) -> torch.Tensor:
+        return mask_stage_advance_event(
+            self.stage_advance_event_buf,
+            self.reset_buf,
+            self.just_resetted_buf,
+        )
 
     @override
     def _check_termination(self):
         super()._check_termination()
         is_overtime = self.time_in_stage_buf >= self.max_stage_time[self.stage_buf]
-        is_last_stage = self._make_mask(self.num_stages - 1)
-        is_complete = self.stage_complete_cond_func() & (self.episode_length_buf >= 2)
+        fixed_stage = self._fixed_stage_for_current_mode()
+        fixed_stage_run = fixed_stage is not None
+        fixed_stage_training = fixed_stage_run and not self.is_evaluating
+        is_last_stage = (
+            torch.ones_like(self.stage_buf, dtype=torch.bool)
+            if fixed_stage_run
+            else self._make_mask(self.num_stages - 1)
+        )
+        is_complete = self._active_task_completion_condition() & (
+            self.episode_length_buf >= 2
+        )
         assert is_complete.shape == (self.num_envs,)
         assert is_complete.dtype == torch.bool
 
@@ -233,9 +324,55 @@ class StagedTaskBase(LeggedRobotBase):
 
         self.just_completed_task_buf |= is_complete
 
+        self.stage_advance_event_buf.copy_(self._compute_stage_advance_event())
+
         self.time_since_completion_buf[self.time_since_completion_buf > 0] += 1
         first_complete = is_complete & (self.time_since_completion_buf == 0)
         self.time_since_completion_buf[first_complete] = 1
+        if hasattr(self, "eval_metrics"):
+            self.eval_metrics["episode_goal_reached"] |= is_complete
+        if (
+            fixed_stage_training
+            and self.enable_staged_reset
+            and self.staged_reset_fixed_stage < self.num_stages - 1
+            and torch.any(first_complete & ~self._staged_reset_snapshot_exclusion())
+        ):
+            snapshot_mask = first_complete & ~self._staged_reset_snapshot_exclusion()
+            next_stages = torch.full(
+                (int(snapshot_mask.sum().item()),),
+                self.staged_reset_fixed_stage + 1,
+                dtype=torch.long,
+                device=self.device,
+            )
+            self._take_snapshot_of_buffered_states(
+                snapshot_mask, snapshot_stages=next_stages
+            )
+
+    @override
+    def init_eval_metrics_tracking(self, device):
+        super().init_eval_metrics_tracking(device)
+        self.eval_metrics["goal_reached_buffer"] = []
+
+    @override
+    def process_eval_episode_completions(
+        self, completed_env_ids, cur_reward_sum, cur_episode_length
+    ):
+        completed = self.eval_metrics["episode_goal_reached"][
+            completed_env_ids
+        ].reshape(-1)
+        self.eval_metrics["goal_reached_buffer"].extend(
+            completed.detach().cpu().tolist()
+        )
+
+    @override
+    def reset_eval_episode_tracking(self, completed_env_ids):
+        self.eval_metrics["episode_goal_reached"][completed_env_ids] = False
+
+    @override
+    def get_eval_metrics_summary(self):
+        summary = super().get_eval_metrics_summary().copy()
+        summary["episode_goal_reached"] = list(summary["goal_reached_buffer"])
+        return summary
 
     @override
     def _reset_tasks_callback(self, env_ids: torch.Tensor):
@@ -274,8 +411,14 @@ class StagedTaskBase(LeggedRobotBase):
 
     def _reward_penalty_overtime(self):
         is_overtime = self.time_in_stage_buf >= self.max_stage_time[self.stage_buf]
-        is_last_stage = self._make_mask(self.num_stages - 1)
-        is_complete = self.stage_complete_cond_func() & (self.episode_length_buf >= 2)
+        is_last_stage = (
+            torch.ones_like(self.stage_buf, dtype=torch.bool)
+            if self._fixed_stage_for_current_mode() is not None
+            else self._make_mask(self.num_stages - 1)
+        )
+        is_complete = self._active_task_completion_condition() & (
+            self.episode_length_buf >= 2
+        )
         is_overtime &= ~(is_last_stage & is_complete)
         return is_overtime.float()
 
@@ -359,6 +502,7 @@ class StagedTaskBase(LeggedRobotBase):
         self.time_in_stage_buf[env_ids] = 0
         self.actual_time_in_stage_buf[env_ids] = 0
         self.just_resetted_buf[env_ids] = True
+        self.stage_advance_event_buf[env_ids] = False
         self.time_since_completion_buf[env_ids] = 0
         self.current_max_stage_buf[env_ids] = stage
         self.total_time_buf[env_ids] = 0
@@ -509,12 +653,105 @@ class StagedTaskBase(LeggedRobotBase):
             ),
         }
 
-    def _take_snapshot_of_buffered_states(self, advance_mask: torch.Tensor):
+    def _get_staged_reset_checkpoint(self):
+        """Pack recent per-environment acceptance states as a reusable library."""
+        return pack_stage_initial_state_library(
+            self.staged_reset_buf,
+            self.staged_reset_num_samples,
+            self.staged_reset_max_samples_per_stage,
+            self.staged_reset_checkpoint_samples_per_env,
+        )
+
+    def _load_staged_reset_checkpoint(self, checkpoint):
+        """Restore per-environment stage initial states into the reset rings."""
+        sample_counts = restore_stage_initial_state_library(
+            checkpoint,
+            self.staged_reset_buf,
+            self.num_stages,
+            self.num_envs,
+            self.staged_reset_max_samples_per_stage,
+            self.device,
+        )
+        self.staged_reset_num_samples.zero_()
+        self.staged_reset_num_samples[0] = self.staged_reset_max_samples_per_stage
+        self.staged_reset_num_samples[1:] = sample_counts[1:]
+        logger.info(
+            "Restored staged-reset curriculum snapshots: "
+            f"{sample_counts[1:].sum().item()} stage/environment samples"
+        )
+
+    def _extract_staged_reset_checkpoint(self, payload):
+        if payload.get("format") == "per_environment_stage_initial_states_v2":
+            return payload
+        if self._STAGED_RESET_CHECKPOINT_KEY in payload:
+            return payload[self._STAGED_RESET_CHECKPOINT_KEY]
+        env_state = payload.get("env_state_dict")
+        if isinstance(env_state, dict) and env_state.get("_format") == "per_rank_v1":
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_available()
+                and torch.distributed.is_initialized()
+                else 0
+            )
+            states = env_state.get("states", [])
+            if rank >= len(states):
+                raise ValueError(
+                    f"Stage-initial-state source has no state for rank {rank}"
+                )
+            env_state = states[rank]
+        if isinstance(env_state, dict) and self._STAGED_RESET_CHECKPOINT_KEY in env_state:
+            return env_state[self._STAGED_RESET_CHECKPOINT_KEY]
+        raise ValueError(
+            "Stage-initial-state source does not contain a staged-reset library"
+        )
+
+    def _ensure_staged_reset_initial_state_loaded(self):
+        if self._staged_reset_initial_state_loaded:
+            return
+        self._staged_reset_initial_state_loaded = True
+        if self.staged_reset_initial_state_source is None:
+            return
+        payload = torch.load(
+            str(self.staged_reset_initial_state_source),
+            map_location="cpu",
+            weights_only=False,
+        )
+        checkpoint = self._extract_staged_reset_checkpoint(payload)
+        self._load_staged_reset_checkpoint(checkpoint)
+
+    def get_env_state_dict(self):
+        state_dict = super().get_env_state_dict()
+        if self.enable_staged_reset:
+            state_dict[self._STAGED_RESET_CHECKPOINT_KEY] = (
+                self._get_staged_reset_checkpoint()
+            )
+        return state_dict
+
+    def load_env_state_dict(self, state_dict):
+        state_dict = dict(state_dict)
+        staged_reset_checkpoint = state_dict.pop(
+            self._STAGED_RESET_CHECKPOINT_KEY, None
+        )
+        super().load_env_state_dict(state_dict)
+        if self.enable_staged_reset and staged_reset_checkpoint is not None:
+            self._load_staged_reset_checkpoint(staged_reset_checkpoint)
+
+    def _take_snapshot_of_buffered_states(
+        self,
+        advance_mask: torch.Tensor,
+        snapshot_stages: torch.Tensor | None = None,
+    ):
         """
         Take a snapshot of the buffered states.
         """
         advance_env_ids = torch.where(advance_mask)[0]
-        advanced_stages = self.stage_buf[advance_mask]
+        advanced_stages = (
+            self.stage_buf[advance_mask]
+            if snapshot_stages is None
+            else snapshot_stages
+        )
+        if advanced_stages.shape != advance_env_ids.shape:
+            raise ValueError("snapshot_stages must match selected environments")
         sample_idx_to_overwrite = (
             self.staged_reset_num_samples[advanced_stages, advance_env_ids]
             % self.staged_reset_max_samples_per_stage
@@ -525,9 +762,16 @@ class StagedTaskBase(LeggedRobotBase):
                     state_case["store_callback"](advance_env_ids).clone()
                 )
             elif state_case["type"] == "rigid_object" or state_case["type"] == "articulation":
+                if name == "robot":
+                    # Robot reset buffers use the repository-wide xyzw convention;
+                    # Isaac Lab articulation states are wxyz.  Use the simulator
+                    # adapter here so restore does not permute the root quaternion.
+                    root_state = self.simulator.robot_root_states[advance_env_ids]
+                else:
+                    root_state = state_case["obj"].data.root_state_w[advance_env_ids]
                 state_case["root_state"][
                     advanced_stages, sample_idx_to_overwrite, advance_env_ids
-                ] = (state_case["obj"].data.root_state_w[advance_env_ids].clone())
+                ] = root_state.clone()
                 if state_case["type"] == "articulation":
                     if name == "robot":
                         state_case["dof_state"][
@@ -545,6 +789,35 @@ class StagedTaskBase(LeggedRobotBase):
                         ] = (state_case["obj"].data.joint_vel[advance_env_ids].clone())
         self.staged_reset_num_samples[advanced_stages, advance_env_ids] += 1
 
+    def _post_staged_reset_state_selected(
+        self, env_ids: torch.Tensor, selected_stages: torch.Tensor
+    ):
+        """Rebuild task-specific state derived from selected snapshots."""
+        pass
+
+    def _procedural_reset_stages(self) -> tuple[int, ...]:
+        """Stages whose initial states are generated directly by the task."""
+        return ()
+
+    def _unsupported_fixed_reset_stages(self) -> tuple[int, ...]:
+        """Stages that must not silently fall back to a snapshot for fixed training."""
+        return ()
+
+    def _reset_procedural_stage_initial_states(
+        self, env_ids: torch.Tensor, selected_stages: torch.Tensor
+    ):
+        """Populate robot, object, and task state for procedural stage resets."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement procedural staged reset"
+        )
+
+    def _procedural_stage_mask(self, selected_stages: torch.Tensor) -> torch.Tensor:
+        procedural_stages = self._procedural_reset_stages()
+        mask = torch.zeros_like(selected_stages, dtype=torch.bool)
+        for stage in procedural_stages:
+            mask |= selected_stages == stage
+        return mask
+
     @override
     def reset_envs_idx(self, env_ids, target_states=None, target_buf=None):
         """
@@ -559,19 +832,25 @@ class StagedTaskBase(LeggedRobotBase):
         if len(env_ids) == 0:
             return
 
+        self._ensure_staged_reset_initial_state_loaded()
+
         # sample stages to reset to
         selected_stages = self._sample_reset_stages(env_ids)
 
-        # within the selected stages, uniformly sample a sample to reset to
-        # TODO(haoru): importance sampling based on return
-        selected_sample_indices = self._sample_reset_sample_indices(env_ids, selected_stages)
+        procedural_mask = self._procedural_stage_mask(selected_stages)
 
-        # exclude stage 0 - those are handled by the user class
+        # Stage 0 is the canonical task reset. Procedural stages are generated
+        # from task geometry, while all remaining stages use recorded snapshots.
         stage_0_mask = selected_stages == 0
         user_env_ids = env_ids[stage_0_mask]
-        selected_env_ids = env_ids[~stage_0_mask]
-        selected_stages = selected_stages[~stage_0_mask]
-        selected_sample_indices = selected_sample_indices[~stage_0_mask]
+        procedural_env_ids = env_ids[procedural_mask]
+        procedural_stages = selected_stages[procedural_mask]
+        snapshot_mask = ~(stage_0_mask | procedural_mask)
+        snapshot_env_ids = env_ids[snapshot_mask]
+        snapshot_stages = selected_stages[snapshot_mask]
+        selected_sample_indices = self._sample_reset_sample_indices(
+            snapshot_env_ids, snapshot_stages
+        )
 
         # reset
         self.need_to_refresh_envs[env_ids] = True
@@ -587,18 +866,25 @@ class StagedTaskBase(LeggedRobotBase):
             self._reset_object_states_callback(user_env_ids)
             self._post_reset_callback(user_env_ids)
 
+        if len(procedural_env_ids) > 0:
+            self.set_to_stage(procedural_env_ids, procedural_stages)
+            self._reset_procedural_stage_initial_states(
+                procedural_env_ids, procedural_stages
+            )
+            self._post_reset_callback(procedural_env_ids)
+
         # handle staged reset
-        if len(selected_env_ids) > 0:
-            self.set_to_stage(selected_env_ids, selected_stages)
+        if len(snapshot_env_ids) > 0:
+            self.set_to_stage(snapshot_env_ids, snapshot_stages)
             root_states = {}
             dof_states = {}
             for name, state_case in self.staged_reset_buf.items():
                 if name == "robot":
-                    self.target_robot_root_states[selected_env_ids] = state_case["root_state"][
-                        selected_stages, selected_sample_indices, selected_env_ids
+                    self.target_robot_root_states[snapshot_env_ids] = state_case["root_state"][
+                        snapshot_stages, selected_sample_indices, snapshot_env_ids
                     ].clone()
-                    self.target_robot_dof_state[selected_env_ids] = state_case["dof_state"][
-                        selected_stages, selected_sample_indices, selected_env_ids
+                    self.target_robot_dof_state[snapshot_env_ids] = state_case["dof_state"][
+                        snapshot_stages, selected_sample_indices, snapshot_env_ids
                     ].clone()
                 elif state_case["type"] == "rigid_object" or state_case["type"] == "articulation":
                     root_states[name] = torch.zeros(
@@ -608,8 +894,8 @@ class StagedTaskBase(LeggedRobotBase):
                         dtype=torch.float,
                         requires_grad=False,
                     )
-                    root_states[name][selected_env_ids] = state_case["root_state"][
-                        selected_stages, selected_sample_indices, selected_env_ids
+                    root_states[name][snapshot_env_ids] = state_case["root_state"][
+                        snapshot_stages, selected_sample_indices, snapshot_env_ids
                     ].clone()
                     if state_case["type"] == "articulation":
                         obj: Articulation = state_case["obj"]
@@ -627,11 +913,11 @@ class StagedTaskBase(LeggedRobotBase):
                             dtype=torch.float,
                             requires_grad=False,
                         )  # dof_vel
-                        dof_pos[selected_env_ids] = state_case["dof_state"][
-                            selected_stages, selected_sample_indices, selected_env_ids, :, 0
+                        dof_pos[snapshot_env_ids] = state_case["dof_state"][
+                            snapshot_stages, selected_sample_indices, snapshot_env_ids, :, 0
                         ].clone()
-                        dof_vel[selected_env_ids] = state_case["dof_state"][
-                            selected_stages, selected_sample_indices, selected_env_ids, :, 1
+                        dof_vel[snapshot_env_ids] = state_case["dof_state"][
+                            snapshot_stages, selected_sample_indices, snapshot_env_ids, :, 1
                         ].clone()
                         dof_states[name] = (
                             dof_pos,
@@ -640,15 +926,19 @@ class StagedTaskBase(LeggedRobotBase):
                         )
                 elif state_case["type"] == "buffer":
                     state_case["load_callback"](
-                        selected_env_ids,
+                        snapshot_env_ids,
                         state_case["data"][
-                            selected_stages, selected_sample_indices, selected_env_ids
+                            snapshot_stages, selected_sample_indices, snapshot_env_ids
                         ].clone(),
                     )
 
+            self._post_staged_reset_state_selected(
+                snapshot_env_ids, snapshot_stages
+            )
+
             if root_states:
-                self.simulator.set_task_root_state_tensor(selected_env_ids, root_states)
-                self.simulator.set_task_dof_state_tensor(selected_env_ids, dof_states)
+                self.simulator.set_task_root_state_tensor(snapshot_env_ids, root_states)
+                self.simulator.set_task_dof_state_tensor(snapshot_env_ids, dof_states)
 
         # fill extras
         # haoru: this part of the code must be periodically synced with LeggedRobotBase
@@ -667,10 +957,33 @@ class StagedTaskBase(LeggedRobotBase):
         """
         Sample stages to reset for the given envs.
         """
-        # Evaluation metrics must measure complete episodes from the task's
-        # canonical initial state, not curriculum snapshots from later stages.
-        if self.is_evaluating:
+        # Evaluation defaults to complete episodes from the canonical initial
+        # state. An explicit eval stage enables isolated stage acceptance.
+        fixed_stage = self._fixed_stage_for_current_mode()
+        if self.is_evaluating and fixed_stage is None:
             return torch.zeros_like(env_ids)
+
+        if fixed_stage is not None:
+            if fixed_stage in self._unsupported_fixed_reset_stages():
+                raise RuntimeError(
+                    f"Fixed stage {fixed_stage} has no "
+                    "procedural initial-state generator yet; snapshot fallback is "
+                    "disabled for independent stage training."
+                )
+            selected_stages = torch.full_like(env_ids, fixed_stage)
+            if self._procedural_stage_mask(selected_stages).all():
+                return selected_stages
+            unavailable = (
+                self.staged_reset_num_samples[selected_stages, env_ids] <= 0
+            )
+            if torch.any(unavailable):
+                missing = int(unavailable.sum().item())
+                raise RuntimeError(
+                    f"Fixed stage {fixed_stage} has no "
+                    f"procedural initializer or validated snapshot for {missing} "
+                    "environments."
+                )
+            return selected_stages
 
         # Create weight matrix: (len(env_ids), num_stages)
         # Start with base ratios for all environments
@@ -679,6 +992,8 @@ class StagedTaskBase(LeggedRobotBase):
         # Get validity mask for the environments we're resetting
         # Shape: (num_stages, len(env_ids))
         valid_mask = self.staged_reset_num_samples[:, env_ids] > 0
+        for stage in self._procedural_reset_stages():
+            valid_mask[stage] = True
 
         # Set invalid stages to zero weight
         # Transpose to match weights shape: (len(env_ids), num_stages)
@@ -703,6 +1018,8 @@ class StagedTaskBase(LeggedRobotBase):
         Returns:
             selected_sample_indices: Sample index for each environment (shape: [n])
         """
+        if len(env_ids) == 0:
+            return torch.empty(0, dtype=torch.long, device=self.device)
         # Gather number of available samples per (stage, env) pair; shape: [n]
         num_samples_per_env = self.staged_reset_num_samples[selected_stages, env_ids].clamp(
             max=self.staged_reset_max_samples_per_stage

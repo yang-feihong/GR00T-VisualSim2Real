@@ -13,7 +13,7 @@ defaults:
   - override /trainer: trl
 
 exp_base: ${hydra:runtime.choices.exp}
-exp_var: lstm
+exp_var: mlp
 experiment_name: ${exp_base}_${exp_var}
 experiment_dir: ${base_dir}/${project_name}/${experiment_name}-${timestamp}
 
@@ -28,32 +28,69 @@ algo:
   config:
     entropy_coef: 0.01
     use_new_actor_critic: True
-    num_steps_per_env: 64
+    num_steps_per_env: 32
     num_learning_epochs: 5
     num_mini_batches: 4
     use_padding_mask: False
     ppo_shuffle_every_epoch: True
     sync_advantage_normalization: True
+    # Later-stage snapshots remain tied to their randomized environment, so
+    # uniform PPO batches otherwise bury their signal under early-stage data.
+    # Normalize advantages per stage and cap inverse-frequency loss weights.
+    balance_staged_task_samples: True
+    staged_task_max_sample_weight: 10.0
+    # Normalize actor returns within each door-handedness variant.  Comparing
+    # a still-learning mirrored door against the already stronger side would
+    # otherwise mark its best exploration as below-average for the stage.
+    balance_staged_task_variants: True
     actor_learning_rate: 1.0e-4
     critic_learning_rate: 1.0e-4
     desired_kl: 0.005
-
+    adaptive_kl_min_learning_rate: 1.0e-5
+    # The configured actor learning rate is the ceiling. KL adaptation may
+    # reduce it and later restore it, but must not pre-arm an unseen stage with
+    # a larger step size before that stage produces its first policy gradient.
+    adaptive_kl_max_learning_rate: 1.0e-4
+    separate_actor_critic_grad_clip: True
+    # Commands are integrated deltas. A random nonzero initial mean creates a
+    # persistent drift before PPO has learned state-dependent directions.
+    # Zero only the final actor projection; exploration remains stochastic and
+    # all ten commands remain fully owned by the policy.
+    zero_initialize_action_output: True
     init_noise_std: 0.8
-    max_noise_std: 0.8
+    # Exploration follows action semantics, not task stages. Instantaneous base
+    # velocities must cross the low-level gait response threshold, while the
+    # integrated EE and gripper deltas use smaller physical increments.
+    max_noise_std: [0.20, 0.20, 0.12, 0.02, 0.01, 0.01, 0.01, 0.01, 0.01, 0.10]
+    resume_noise_std: [0.20, 0.20, 0.12, 0.02, 0.01, 0.01, 0.01, 0.01, 0.01, 0.10]
     clamp_noise_std: True
+    # The global std is exploration capacity. Observation-dependent attenuation
+    # redistributes that capacity, while a batch-level variance budget prevents
+    # global collapse without forcing every state to remain noisy.
+    state_dependent_action_noise: True
+    state_dependent_action_noise_min_scale: 0.0005
+    state_dependent_action_noise_initial_scale: 0.95
+    exploration_variance_budget_fraction: 0.8
+    exploration_variance_budget_dual_lr: 0.01
+    # A learned, observation-dependent fraction owns temporal persistence;
+    # attenuation above independently owns marginal amplitude. Only base
+    # motion and canonical ee_x have evidence that coherent exploration is
+    # physically required. The other action dimensions remain exactly iid.
+    temporal_action_noise_rho: 0.95
+    temporal_action_noise_correlated_fraction: [0.9, 0.9, 0.9, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    state_dependent_temporal_action_noise: True
+    state_dependent_temporal_action_noise_min_fraction: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    state_dependent_temporal_action_noise_max_fraction: [0.99, 0.99, 0.99, 0.99, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    state_dependent_temporal_action_noise_initial_fraction: [0.9, 0.9, 0.9, 0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
     save_interval: 500
 
     gamma: 0.9975
     lam: 0.985
-
     init_at_random_ep_len: True
 
     actor:
-      _target_: gr00t.rl.trl.modules.actor_critic_modules_recurrent.RecurrentActor
+      _target_: gr00t.rl.trl.modules.actor_critic_modules.Actor
       running_mean_std: True
-      rnn_type: "lstm"
-      rnn_hidden_dim: 256
-      rnn_num_layers: 2
       backbone:
         _target_: gr00t.rl.agents.modules.modules.BaseModule
         process_output_dim: True
@@ -65,11 +102,8 @@ algo:
             hidden_dims: [512, 256, 128]
             activation: SiLU
     critic:
-      _target_: gr00t.rl.trl.modules.actor_critic_modules_recurrent.RecurrentCritic
+      _target_: gr00t.rl.trl.modules.actor_critic_modules.Critic
       running_mean_std: True
-      rnn_type: "lstm"
-      rnn_hidden_dim: 256
-      rnn_num_layers: 2
       backbone:
         _target_: gr00t.rl.agents.modules.modules.BaseModule
         process_output_dim: True
@@ -84,17 +118,24 @@ algo:
 
 simulator:
   config:
+    # State-only training: do not create cameras, lights, viewports, or render frames.
+    physics_only: true
+    render_results: false
     use_headless_usd_ground: True
     scene:
       replicate_physics: False
       env_spacing: 20.0
     sim:
+      render_interval: 4
       physx:
         num_position_iterations: 4
         num_velocity_iterations: 0
     cameras:
-      config_path: "gr00t/rl/third_party/visual_wholebody_lowlevel/legged_gym/scripts/rgb_cameras.json"
-      primary_camera: "trunk_front"
+      enable_cameras: false
+      config_path: null
+      camera_types:
+        - rgb: false
+        - depth: false
 
 robot:
   asset:

@@ -197,6 +197,12 @@ class IsaacSim(BaseSimulator):
             self.task_config = config.task
 
         self.simulator_config = config.simulator.config
+        self.physics_only = bool(self.simulator_config.get("physics_only", False))
+        if self.physics_only and (
+            self.simulator_config.get("render_results", False)
+            or self.simulator_config.cameras.get("enable_cameras", False)
+        ):
+            raise ValueError("physics_only mode cannot enable rendering or cameras")
         self.robot_config = config.robot
         self.env_config = config
         self.terrain_config = config.terrain
@@ -234,7 +240,8 @@ class IsaacSim(BaseSimulator):
         else:
             raise RuntimeError("Simulation context already exists. Cannot create a new one.")
 
-        self.sim.set_camera_view([2.0, 0.0, 2.5], [-0.5, 0.0, 0.5])
+        if not self.physics_only:
+            self.sim.set_camera_view([2.0, 0.0, 2.5], [-0.5, 0.0, 0.5])
         # self.sim.set_camera_view([0.0, 0.0, 2.5], [-0.5, 0.0, 0.5])
 
         logger.info("IsaacSim initialized.")
@@ -246,7 +253,11 @@ class IsaacSim(BaseSimulator):
             f"\tRendering step-size   : {1./self.simulator_config.sim.fps * self.simulator_config.sim.substeps}"
         )
 
-        if self.simulator_config.sim.render_interval < self.simulator_config.sim.control_decimation:
+        if (
+            not self.physics_only
+            and self.simulator_config.sim.render_interval
+            < self.simulator_config.sim.control_decimation
+        ):
             msg = (
                 f"The render interval ({self.simulator_config.sim.render_interval}) is smaller than the decimation "
                 f"({self.simulator_config.sim.control_decimation}). Multiple render calls will happen for each environment step."
@@ -263,6 +274,12 @@ class IsaacSim(BaseSimulator):
         with Timer("[INFO]: Time taken for scene creation", "scene_creation"):
             self.scene = InteractiveScene(scene_config)
             self._setup_scene()
+        if self.physics_only:
+            if self.sim.has_rtx_sensors():
+                raise RuntimeError("physics_only scene unexpectedly contains an RTX sensor")
+            logger.info(
+                "Physics-only scene verified: cameras=0, RTX sensors=0, frame rendering disabled"
+            )
         print("[INFO]: Scene manager: ", self.scene)
 
         viewer_config: ViewerCfg = ViewerCfg()
@@ -946,6 +963,16 @@ class IsaacSim(BaseSimulator):
 
         # ImplicitID
         if b2z1_manual_leg_pd:
+            b2z1_command_cfg = self.robot_config.b2z1_command
+            arm_stiffness = float(
+                b2z1_command_cfg.get("lowlevel_arm_stiffness", 400.0)
+            )
+            arm_damping = float(
+                b2z1_command_cfg.get("lowlevel_arm_damping", 40.0)
+            )
+            arm_effort_limit = float(
+                b2z1_command_cfg.get("lowlevel_arm_effort_limit", 80.0)
+            )
             arm_gripper_names = [
                 "joint1",
                 "joint2",
@@ -975,25 +1002,13 @@ class IsaacSim(BaseSimulator):
                 ),
                 "arm": ImplicitActuatorCfg(
                     joint_names_expr=arm_gripper_names,
-                    effort_limit_sim=80.0,
+                    effort_limit_sim=arm_effort_limit,
                     velocity_limit_sim=20.0,
                     stiffness={
-                        "joint1": 400.0,
-                        "joint2": 400.0,
-                        "joint3": 400.0,
-                        "joint4": 400.0,
-                        "joint5": 400.0,
-                        "joint6": 400.0,
-                        "jointGripper": 400.0,
+                        name: arm_stiffness for name in arm_gripper_names
                     },
                     damping={
-                        "joint1": 40.0,
-                        "joint2": 40.0,
-                        "joint3": 40.0,
-                        "joint4": 40.0,
-                        "joint5": 40.0,
-                        "joint6": 40.0,
-                        "jointGripper": 40.0,
+                        name: arm_damping for name in arm_gripper_names
                     },
                     armature=0.0,
                     friction=0.0,
@@ -1194,7 +1209,9 @@ class IsaacSim(BaseSimulator):
                 self.scene.sensors["height_scanner"] = self._height_scanner
 
         # parse camera types:
-        if hasattr(self.simulator_config, "cameras") and hasattr(
+        if self.physics_only:
+            camera_types = []
+        elif hasattr(self.simulator_config, "cameras") and hasattr(
             self.simulator_config.cameras, "camera_types"
         ):
             camera_types = dict_to_true_list(self.simulator_config.cameras.camera_types)
@@ -1714,8 +1731,10 @@ class IsaacSim(BaseSimulator):
         else:
             self.table_top_pos = None
 
-        # add lights
-        if self.config.simulator.config.get("randomize_dome_light", False):
+        # Lighting has no role in state-only training and still adds USD work.
+        if self.physics_only:
+            pass
+        elif self.config.simulator.config.get("randomize_dome_light", False):
             from gr00t.rl.isaac_utils.playground.env_rand.domelight import RandomDomeLightCfg
 
             dome_light_cfg = RandomDomeLightCfg(
@@ -2603,7 +2622,9 @@ class IsaacSim(BaseSimulator):
 
     def simulate_at_each_physics_step(self):
         self._sim_step_counter += 1
-        is_rendering = self.sim.has_gui() or self.sim.has_rtx_sensors()
+        is_rendering = not self.physics_only and (
+            self.sim.has_gui() or self.sim.has_rtx_sensors()
+        )
 
         self.scene.write_data_to_sim()
         # simulate

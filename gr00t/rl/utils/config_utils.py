@@ -5,7 +5,25 @@
 import math
 
 from loguru import logger
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, open_dict
+
+
+def configure_headless_physics(config):
+    """Keep train and eval on the same rendering-free simulator contract."""
+    no_render_headless = (
+        config.headless
+        and not config.simulator.config.render_results
+        and not config.simulator.config.cameras.enable_cameras
+    )
+    if config.simulator.config.get("physics_only", False) and not no_render_headless:
+        raise ValueError(
+            "physics_only requires headless=true, render_results=false, "
+            "and cameras.enable_cameras=false"
+        )
+    with open_dict(config.simulator.config):
+        config.simulator.config.disable_visual_markers = no_render_headless
+        config.simulator.config.disable_visual_materials = no_render_headless
+    return no_render_headless
 
 
 def register_rl_resolvers():

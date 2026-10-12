@@ -4,9 +4,9 @@ defaults:
   - legged_base
 
 env:
-  _target_: gr00t.rl.envs.door.door_open_homie.DoorPregrasp
+  _target_: gr00t.rl.envs.door.door_open_homie.B2Z1DoorSixStage
   config:
-    max_episode_length_s: 20
+    max_episode_length_s: 70
 
     normalization:
       clip_actions: 100.0
@@ -42,21 +42,42 @@ env:
       target_obj_transform_sub_prim_path: "grasp_target"
       which_hand: "gripper"
 
-    pregrasp_target_vel: 0.3
     target_root_vel: 0.3
 
-    max_stage_time: [250, 100, 100, 100, 100, 200]
-    award_remaining_time_on_advance: True
+    # 50 Hz policy steps.  These are safety timeouts, not desired dwell times.
+    max_stage_time: [1000, 1000, 500, 750, 1500, 1000]
+    award_remaining_time_on_advance: False
     accumulate_stage_reward: False
     reset_on_complete: True
-    reset_on_complete_delay: 50.0
+    reset_on_complete_delay: 0
     reset_on_overtime: True
     stage_reward_scale: [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
 
     delta_action_indices: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     delta_action_scale: 0.3
+    # High-level delta actions are normalized; bound each step before it is
+    # recorded, accumulated, or used by action-rate rewards.
+    delta_action_step_clip: 1.0
     delta_action_clip: 1.0
+    no_delta_vel: True
     reset_delta_actions_with_backmap: False
+    # Canonical policy units are independent of the asymmetric deployment
+    # command parameterization.  Horizontal axes share one isotropic scale so
+    # rotating between task and body frames cannot clip a valid base vector.
+    canonical_action_scale: [1.0, 1.0, 1.0, 0.5, 0.5, 0.5, 3.1416, 3.1416, 3.1416, 1.0]
+
+    # Physical operation station used by the first-stage result criterion.
+    # This describes where the robot must end up; it does not generate actions.
+    operation_station_distance: 0.77
+    # Keep the panel-ready EE target away from both radial workspace limits.
+    # The base remains doorway-centred and only advances along the frame normal.
+    reposition_comfort_radius: 0.70
+
+    # Reject only joint base/arm reset samples whose closed gripper overlaps
+    # the closed door geometry. The margin covers contact generation tolerance;
+    # all original x/y/yaw/joint sampling ranges remain unchanged.
+    reset_collision_margin: 0.01
+    reset_sampling_max_attempts: 64
 
     warped_action:
       indices: [0, 1, 2]
@@ -64,20 +85,35 @@ env:
       s: 0.0
 
     enable_staged_reset: True
-    staged_reset_ratios: [0.5, 0.1, 0.1, 0.1, 0.1, 0.1]
+    # Bias the curriculum toward later available stages without transplanting
+    # snapshots across randomized door geometries. Each environment still
+    # resets only to physically valid states it reached itself.
+    staged_reset_ratios: [0.3, 0.2, 0.1, 0.15, 0.15, 0.1]
     staged_reset_max_samples_per_stage: 200
+    # Set to 0..5 to train one stage independently. Stages 1, 4, and 5 are
+    # generated directly inside the preceding stage's physical acceptance set;
+    # stages 2 and 3 reject independent startup until their contact-aware
+    # procedural generators are implemented.
+    staged_reset_fixed_stage: null
+    # Optional isolated deterministic evaluation stage. Null preserves the
+    # canonical full-task evaluation beginning at stage 0.
+    staged_reset_eval_stage: null
+    # Optional curriculum snapshot import. Independent procedural stages do not
+    # require it and never silently fall back to it.
+    staged_reset_initial_state_source: null
+    staged_reset_checkpoint_samples_per_env: 16
 
     target_root_pos: [2.0, 0.0, 0.5]
     randomize_door_init_state: False
 
     resting_dof_pos: [
       0.0, -0.0, 0.0, -0.0,
-      0.0,
+      -1.57,
       0.8, 0.8, 0.8, 0.8,
-      1.48,
+      1.6,
       -1.5, -1.5, -1.5, -1.5,
-      -0.63, -0.84, 0.0, 0.0,
-      -0.785,
+      -0.63, -1.1, 0.0, 0.0,
+      0.0,
     ]
     gripper_open_pos: [-0.785]
     gripper_closed_pos: [0.0]

@@ -17,7 +17,9 @@ from trl.trainer.ppo_trainer import *
 
 from gr00t.rl.agents.modules.data_utils import RolloutStorage
 from gr00t.rl.trl.callbacks.hv_callback_handler import HVCallbackHandler
+from gr00t.rl.trl.callbacks.model_save_callback import ModelSaveCallback
 from gr00t.rl.trl.utils.common import wandb_run_exists
+from gr00t.rl.trl.utils.metrics_log import append_training_metrics_jsonl
 from gr00t.rl.trl.utils.rl import compute_episode_attnmask
 from gr00t.rl.trl.utils.scheduler import update_scheduled_params
 from gr00t.rl.utils.average_meters import TensorAverageMeterDict
@@ -1850,6 +1852,11 @@ class TRLPPOTrainer(PPOTrainer):
 
         output = {**logs, **{"step": self.state.global_step}}
         self.state.log_history.append(output)
+        append_training_metrics_jsonl(
+            self.args.output_dir,
+            output,
+            is_world_process_zero=self.state.is_world_process_zero,
+        )
 
         self.control = self.callback_handler.on_log(self.args, self.state, self.control, logs)
 
@@ -2006,7 +2013,13 @@ class TRLPPOTrainer(PPOTrainer):
             self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
 
         if "env_state_dict" in checkpoint:
-            self.env.load_env_state_dict(checkpoint["env_state_dict"])
+            env_state_dict = ModelSaveCallback.select_rank_env_state_dict(
+                checkpoint["env_state_dict"],
+                self.accelerator.process_index,
+                self.accelerator.num_processes,
+            )
+            if env_state_dict is not None:
+                self.env.load_env_state_dict(env_state_dict)
 
         if "state" in checkpoint:
             for key, value in checkpoint["state"].__dict__.items():

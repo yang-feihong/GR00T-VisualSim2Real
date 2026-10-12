@@ -150,6 +150,7 @@ class B2Z1CommandBase(LeggedRobotBase):
     """
 
     COMMAND_DIM = 10
+    _ORIENTATION_COMMAND_SLICE = slice(6, 9)
 
     @property
     def ground_height(self):
@@ -402,6 +403,46 @@ class B2Z1CommandBase(LeggedRobotBase):
             self.default_dof_pos[:, self._b2z1_arm_joint_indices]
         )
         self._b2z1_ik_damping = float(cmd_cfg.get("lowlevel_ik_damping", 0.05))
+        arm_stiffness = cmd_cfg.get("lowlevel_arm_stiffness", 400.0)
+        self._b2z1_arm_stiffness = torch.as_tensor(
+            arm_stiffness, device=self.device, dtype=torch.float32
+        ).reshape(-1)
+        if self._b2z1_arm_stiffness.numel() == 1:
+            self._b2z1_arm_stiffness = self._b2z1_arm_stiffness.expand(
+                len(arm_joint_names)
+            )
+        if self._b2z1_arm_stiffness.numel() != len(arm_joint_names):
+            raise ValueError(
+                "lowlevel_arm_stiffness must be a scalar or one value per arm joint"
+            )
+        if torch.any(self._b2z1_arm_stiffness <= 0.0):
+            raise ValueError("lowlevel_arm_stiffness must be positive")
+        arm_damping = cmd_cfg.get("lowlevel_arm_damping", 40.0)
+        self._b2z1_arm_damping = torch.as_tensor(
+            arm_damping, device=self.device, dtype=torch.float32
+        ).reshape(-1)
+        if self._b2z1_arm_damping.numel() == 1:
+            self._b2z1_arm_damping = self._b2z1_arm_damping.expand(
+                len(arm_joint_names)
+            )
+        if self._b2z1_arm_damping.numel() != len(arm_joint_names):
+            raise ValueError(
+                "lowlevel_arm_damping must be a scalar or one value per arm joint"
+            )
+        if torch.any(self._b2z1_arm_damping < 0.0):
+            raise ValueError("lowlevel_arm_damping must be non-negative")
+        arm_effort_limit = cmd_cfg.get("lowlevel_arm_effort_limit", 80.0)
+        self._b2z1_arm_effort_limit = torch.as_tensor(
+            arm_effort_limit, device=self.device, dtype=torch.float32
+        ).reshape(-1)
+        if self._b2z1_arm_effort_limit.numel() == 1:
+            self._b2z1_arm_effort_limit = self._b2z1_arm_effort_limit.expand(
+                len(arm_joint_names)
+            )
+        if self._b2z1_arm_effort_limit.numel() != len(arm_joint_names):
+            raise ValueError(
+                "lowlevel_arm_effort_limit must be a scalar or one value per arm joint"
+            )
         self._b2z1_disable_arm_ik = bool(cmd_cfg.get("lowlevel_disable_arm_ik", False))
         self._b2z1_leg_control_mode = str(cmd_cfg.get("lowlevel_leg_control_mode", "effort"))
         self._b2z1_goal_center_offset = torch.tensor(
@@ -974,16 +1015,19 @@ class B2Z1CommandBase(LeggedRobotBase):
         self._b2z1_arm_pos_targets.copy_(
             self.simulator.dof_pos[:, self._b2z1_arm_joint_indices] + delta_q
         )
-
     def _compute_b2z1_ee_goal_world(self):
+        return self._compute_b2z1_ee_goal_world_from_commands(self._b2z1_commands)
+
+    def _compute_b2z1_ee_goal_world_from_commands(self, commands):
+        """Reconstruct the world EE goal represented by physical B2Z1 commands."""
         base_yaw_quat = self._get_b2z1_base_yaw_quat()
         origin = torch.zeros(self.num_envs, 3, device=self.device)
         origin[:, :2] = self.simulator.robot_root_states[:, :2]
-        ee_goal_cart = self._get_b2z1_ee_goal_cart()
+        ee_goal_cart = self._b2z1_default_ee_goal_cart + commands[:, 3:6]
         goal_local = self._b2z1_goal_center_offset + ee_goal_cart
         goal_pos = origin + quat_rotate(base_yaw_quat, goal_local)
         goal_quat = self._compute_b2z1_ee_quat_world_from_cart(
-            ee_goal_cart, self._b2z1_commands[:, 6:9], base_yaw_quat
+            ee_goal_cart, commands[:, 6:9], base_yaw_quat
         )
         return goal_pos, goal_quat
 
@@ -1013,6 +1057,71 @@ class B2Z1CommandBase(LeggedRobotBase):
         goal_yaw = sphere[:, 2] + orn_delta[:, 2]
         goal_quat_local = self._quat_from_euler_xyz_xyzw(roll, pitch, goal_yaw)
         return quat_mul(base_yaw_quat, goal_quat_local)
+
+    def _normalize_delta_action_accumulator(self):
+        """Wrap periodic B2Z1 orientation commands instead of saturating at +/-pi."""
+        orientation = self._delta_actions[:, self._ORIENTATION_COMMAND_SLICE]
+        orientation_scale = self._command_scale[:, self._ORIENTATION_COMMAND_SLICE]
+        orientation_physical = orientation * orientation_scale
+        orientation_physical = torch.atan2(
+            torch.sin(orientation_physical), torch.cos(orientation_physical)
+        )
+        orientation.copy_(orientation_physical / orientation_scale)
+
+    def _compute_b2z1_orn_delta_for_world_quat(
+        self, ee_goal_cart, goal_quat_world, base_yaw_quat=None
+    ):
+        """Invert the B2Z1 orientation command for a Cartesian EE goal."""
+        if base_yaw_quat is None:
+            base_yaw_quat = self._get_b2z1_base_yaw_quat()
+        goal_quat_local = quat_mul(quat_conjugate(base_yaw_quat), goal_quat_world)
+        roll, pitch, yaw = get_euler_xyz_in_tensor(goal_quat_local).unbind(dim=-1)
+        sphere = self._cart_to_sphere(ee_goal_cart)
+        orn_delta = torch.stack(
+            [
+                roll - torch.pi / 2.0,
+                pitch + sphere[:, 1] - self._b2z1_arm_induced_pitch,
+                yaw - sphere[:, 2],
+            ],
+            dim=-1,
+        )
+        orn_delta = torch.atan2(torch.sin(orn_delta), torch.cos(orn_delta))
+        return torch.maximum(
+            torch.minimum(orn_delta, self._command_upper[:, 6:9]),
+            self._command_lower[:, 6:9],
+        )
+
+    def _compute_b2z1_commands_for_world_ee_goal(
+        self, goal_position_world, goal_orientation_world_xyzw
+    ):
+        """Encode a world EE goal in the physical B2Z1 command convention."""
+        base_yaw_quat = self._get_b2z1_base_yaw_quat()
+        origin = torch.zeros_like(goal_position_world)
+        origin[:, :2] = self.simulator.robot_root_states[:, :2]
+        goal_local = quat_rotate(
+            quat_conjugate(base_yaw_quat), goal_position_world - origin
+        )
+        raw_goal_cart = goal_local - self._b2z1_goal_center_offset
+        goal_sphere = self._cart_to_sphere(raw_goal_cart)
+        goal_sphere = torch.maximum(
+            torch.minimum(goal_sphere, self._b2z1_ee_goal_sphere_upper),
+            self._b2z1_ee_goal_sphere_lower,
+        )
+        goal_cart = self._sphere_to_cart(goal_sphere)
+        position_command = torch.maximum(
+            torch.minimum(
+                goal_cart - self._b2z1_default_ee_goal_cart,
+                self._command_upper[:, 3:6],
+            ),
+            self._command_lower[:, 3:6],
+        )
+        orientation_command = self._compute_b2z1_orn_delta_for_world_quat(
+            goal_cart, goal_orientation_world_xyzw, base_yaw_quat
+        )
+        workspace_projection_error = torch.linalg.vector_norm(
+            goal_cart - raw_goal_cart, dim=-1
+        )
+        return position_command, orientation_command, workspace_projection_error
 
     def _get_b2z1_ee_goal_cart(self):
         return self._b2z1_default_ee_goal_cart + self._b2z1_commands[:, 3:6]

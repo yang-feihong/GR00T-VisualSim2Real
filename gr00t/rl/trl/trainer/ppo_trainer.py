@@ -2,8 +2,11 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
+import math
+import os
 from collections import deque
 from copy import deepcopy
+from pathlib import Path
 from typing import Dict, Optional
 
 import pandas as pd
@@ -18,7 +21,18 @@ from trl.trainer.ppo_trainer import *
 
 from gr00t.rl.agents.modules.data_utils import RolloutStorage
 from gr00t.rl.trl.callbacks.hv_callback_handler import HVCallbackHandler
+from gr00t.rl.trl.callbacks.model_save_callback import ModelSaveCallback
+from gr00t.rl.trl.modules.temporal_action_noise import (
+    marginal_temporal_gaussian_log_prob,
+    marginal_temporal_gaussian_parameters,
+    paired_temporal_gaussian_parameters,
+)
+from gr00t.rl.trl.modules.exploration_budget import normalized_action_variance
 from gr00t.rl.trl.utils.common import wandb_run_exists
+from gr00t.rl.trl.utils.metrics_log import (
+    append_training_metrics_jsonl,
+    take_remaining_episode_ids,
+)
 from gr00t.rl.trl.utils.rl import compute_episode_attnmask
 from gr00t.rl.trl.utils.scheduler import update_scheduled_params
 from gr00t.rl.utils.average_meters import TensorAverageMeterDict
@@ -56,24 +70,34 @@ class PolicyAndValueWrapper(nn.Module):
 
     def forward_component(self, mode, actions=None, **kwargs):
         if mode == "policy":
-            self.policy.act(**kwargs)
+            self.policy.act(**kwargs, marginalize_temporal=True)
             log_probs = self.policy.get_actions_log_prob(actions=actions)
             results = {
                 "logprobs": log_probs,
                 "action_mean": self.policy.action_mean,
+                "action_distribution_mean": self.policy.action_distribution_mean,
                 "action_std": self.policy.action_std,
+                "marginal_action_std": self.policy.marginal_action_std,
+                "global_action_std": self.policy.global_action_std,
+                "action_noise_attenuation": self.policy.action_noise_attenuation,
+                "action_temporal_fraction": self.policy.temporal_action_noise_fraction,
                 "entropy": self.policy.entropy,
             }
         elif mode == "policy_distill":
             results = self.policy.act(**kwargs)
         elif mode == "policy_distill_ppo":
-            policy_state_dict = self.policy.act(**kwargs)
+            policy_state_dict = self.policy.act(**kwargs, marginalize_temporal=True)
             log_probs = self.policy.get_actions_log_prob(actions=actions)
             results = {
                 "actions": policy_state_dict["actions"],
                 "logprobs": log_probs,
                 "action_mean": policy_state_dict["action_mean"],
+                "action_distribution_mean": self.policy.action_distribution_mean,
                 "action_std": policy_state_dict["action_sigma"],
+                "marginal_action_std": self.policy.marginal_action_std,
+                "global_action_std": self.policy.global_action_std,
+                "action_noise_attenuation": self.policy.action_noise_attenuation,
+                "action_temporal_fraction": self.policy.temporal_action_noise_fraction,
                 "entropy": self.policy.entropy,
             }
             if "normalized_actions" in policy_state_dict:
@@ -81,21 +105,28 @@ class PolicyAndValueWrapper(nn.Module):
         elif mode == "policy_w_and_wo_imgaug":
             # The first forward is without image augmentation
             self.policy.transform_eval()
-            policy_state_dict = self.policy.act(**kwargs)
+            policy_state_dict = self.policy.act(**kwargs, marginalize_temporal=True)
             # Use the distribution without image augmentation to get the log_probs
             log_probs = self.policy.get_actions_log_prob(actions=actions)
             results = {
                 "actions": policy_state_dict["actions"],
                 "logprobs": log_probs,
                 "action_mean": policy_state_dict["action_mean"],
+                "action_distribution_mean": self.policy.action_distribution_mean,
                 "action_std": policy_state_dict["action_sigma"],
+                "marginal_action_std": self.policy.marginal_action_std,
+                "global_action_std": self.policy.global_action_std,
+                "action_noise_attenuation": self.policy.action_noise_attenuation,
+                "action_temporal_fraction": self.policy.temporal_action_noise_fraction,
                 "entropy": self.policy.entropy,
             }
 
             # The second forward is with image augmentation
             self.policy.transform_train()
             # The second time doesn't need deepcopy
-            policy_state_dict_w_imgaug = self.policy.act(**kwargs)
+            policy_state_dict_w_imgaug = self.policy.act(
+                **kwargs, marginalize_temporal=True
+            )
             results["action_mean_w_imgaug"] = policy_state_dict_w_imgaug["action_mean"]
             results["actions_w_imgaug"] = policy_state_dict_w_imgaug["actions"]
             if "normalized_actions" in policy_state_dict_w_imgaug:
@@ -103,9 +134,8 @@ class PolicyAndValueWrapper(nn.Module):
                     "normalized_actions"
                 ]
         elif mode == "policy_deterministic":
-            self.policy.act(**kwargs)
             results = {
-                "action_mean": self.policy.action_mean,
+                "action_mean": self.policy.deterministic_action(**kwargs),
             }
         elif mode == "vae_policy_deterministic":
             self.policy.act(**kwargs)
@@ -155,6 +185,16 @@ class PrinterHVCallback(TrainerCallback):
                     # Add support for loss/ prefix metrics
                     new_key = k.replace("loss/", "")
                     log_string += f"""{f'{new_key}:':>{pad}} {v:.6f}\n"""
+                elif k.startswith("train/stage_count/"):
+                    log_string += f"""{f'{k}:':>{pad}} {v:.0f}\n"""
+                elif k.startswith("train/stage_weight/"):
+                    log_string += f"""{f'{k}:':>{pad}} {v:.6f}\n"""
+                elif k.startswith("train/stage_reward_mean/"):
+                    log_string += f"""{f'{k}:':>{pad}} {v:.6f}\n"""
+                elif k.startswith("train/stage_action_advantage_signal/"):
+                    log_string += f"""{f'{k}:':>{pad}} {v:.8f}\n"""
+                elif k.startswith("train/push_open_causal/"):
+                    log_string += f"""{f'{k}:':>{pad}} {v:.8f}\n"""
 
             env_log_string = ""
             ep_string = ""
@@ -542,14 +582,104 @@ class TRLPPOTrainer(PPOTrainer):
         self.empty_cache_every_n_ppo_epoch = self.config.get("empty_cache_every_n_ppo_epoch", -1)
 
         self.entropy_coef = self.config.entropy_coef
+        self.state_dependent_action_noise = bool(
+            getattr(self.policy_model, "state_dependent_action_noise", False)
+        )
+        if self.state_dependent_action_noise:
+            self.exploration_variance_budget_fraction = float(
+                self.config.exploration_variance_budget_fraction
+            )
+            self.exploration_variance_budget_dual_lr = float(
+                self.config.exploration_variance_budget_dual_lr
+            )
+            if not 0.0 <= self.exploration_variance_budget_fraction <= 1.0:
+                raise ValueError(
+                    "exploration_variance_budget_fraction must be in [0, 1]"
+                )
+            if self.exploration_variance_budget_dual_lr <= 0.0:
+                raise ValueError(
+                    "exploration_variance_budget_dual_lr must be positive"
+                )
+            if not getattr(self.policy_model, "clamp_noise_std", False):
+                raise ValueError(
+                    "A normalized exploration budget requires clamp_noise_std"
+                )
+        self._last_exploration_mean_variance = None
+        self._last_exploration_budget_shortfall = None
+        self._last_temporal_fraction_stats = None
         self.desired_kl = self.config.desired_kl
+        self.use_adaptive_kl_schedule = (
+            self.config.get("schedule", None) == "adaptive"
+            and self.desired_kl is not None
+        )
+        self.initial_learning_rate = float(self.args.learning_rate)
+        self.adaptive_learning_rate = self.initial_learning_rate
+        self.adaptive_kl_min_learning_rate = float(
+            self.config.get(
+                "adaptive_kl_min_learning_rate",
+                self.initial_learning_rate / 10.0,
+            )
+        )
+        self.adaptive_kl_max_learning_rate = float(
+            self.config.get(
+                "adaptive_kl_max_learning_rate",
+                self.initial_learning_rate,
+            )
+        )
+        if not (
+            0.0 < self.adaptive_kl_min_learning_rate
+            <= self.initial_learning_rate
+            <= self.adaptive_kl_max_learning_rate
+        ):
+            raise ValueError(
+                "Adaptive KL learning-rate bounds must satisfy "
+                "0 < min <= initial <= max"
+            )
         self.gamma = self.args.gamma
         self.lam = self.args.lam
         self.sync_advantage_normalization = self.config.get("sync_advantage_normalization", True)
+        self.balance_staged_task_samples = bool(
+            self.config.get("balance_staged_task_samples", False)
+        )
+        self.balance_staged_task_variants = bool(
+            self.config.get("balance_staged_task_variants", False)
+        )
+        self.staged_task_max_sample_weight = float(
+            self.config.get("staged_task_max_sample_weight", 10.0)
+        )
+        if self.balance_staged_task_samples:
+            if not hasattr(self.env, "stage_buf") or not hasattr(self.env, "num_stages"):
+                raise ValueError(
+                    "balance_staged_task_samples requires a staged environment"
+                )
+            if self.staged_task_max_sample_weight < 1.0:
+                raise ValueError("staged_task_max_sample_weight must be at least 1.0")
+        if self.balance_staged_task_variants and not hasattr(
+            self.env, "get_task_variant"
+        ):
+            raise ValueError(
+                "balance_staged_task_variants requires get_task_variant() on the environment"
+            )
 
         self.compute_imgaug_bc_loss = self.config.get("compute_imgaug_bc_loss", False)
         self.imgaug_bc_loss_coef = self.config.get("imgaug_bc_loss_coef", 1.0)
         self.imgaug_bc_loss_fn = torch.nn.MSELoss()
+        self.policy_action_supervision_coef = float(
+            self.config.get("policy_action_supervision_coef", 0.0)
+        )
+        self.policy_action_supervision_huber_beta = float(
+            self.config.get("policy_action_supervision_huber_beta", 1.0)
+        )
+        if self.policy_action_supervision_huber_beta <= 0.0:
+            raise ValueError("policy_action_supervision_huber_beta must be positive")
+        self.compute_policy_action_supervision = self.policy_action_supervision_coef > 0.0
+        if self.compute_policy_action_supervision and not hasattr(
+            self.env, "get_policy_action_supervision"
+        ):
+            raise ValueError(
+                "policy_action_supervision_coef requires the environment to implement "
+                "get_policy_action_supervision()"
+            )
 
     def _setup_storage(self):
         self.storage = RolloutStorage(
@@ -616,7 +746,21 @@ class TRLPPOTrainer(PPOTrainer):
         self.storage.register_key("actions_log_prob", shape=(1,), dtype=torch.float)
         self.storage.register_key("action_mean", shape=(self.num_act,), dtype=torch.float)
         self.storage.register_key("action_sigma", shape=(self.num_act,), dtype=torch.float)
-
+        if getattr(self.policy_model, "temporal_action_noise_enabled", False):
+            self.storage.register_key(
+                "action_temporal_fraction", shape=(self.num_act,), dtype=torch.float
+            )
+        if self.balance_staged_task_samples:
+            self.storage.register_key("task_stage", shape=(1,), dtype=torch.long)
+            if self.balance_staged_task_variants:
+                self.storage.register_key("task_variant", shape=(1,), dtype=torch.long)
+        if self.compute_policy_action_supervision:
+            self.storage.register_key(
+                "policy_action_target", shape=(self.num_act,), dtype=torch.float
+            )
+            self.storage.register_key(
+                "policy_action_target_mask", shape=(self.num_act,), dtype=torch.float
+            )
         if self.learn_normalized_actions:
             self.storage.register_key(
                 "normalized_actions", shape=(self.num_act,), dtype=torch.float
@@ -706,14 +850,15 @@ class TRLPPOTrainer(PPOTrainer):
         value_model = model.value_model
         policy_model.init_rollout()
         self.storage.clear()
-
         dones = torch.zeros(self.env.num_envs, device=device)
         with torch.no_grad():
             values = []
             for i in range(self.num_steps_per_env):
                 # Compute the actions and values
                 policy_state_dict = self.policy_step(policy_model, obs_dict, cur_dones=dones)
-
+                policy_diagnostics = {}
+                if hasattr(self.env, "get_policy_diagnostics"):
+                    policy_diagnostics = self.env.get_policy_diagnostics(policy_state_dict)
                 # For recurrent critics, compute values step-by-step and capture critic hidden states
                 if self.value_model is not None:
                     value_is_recurrent = (
@@ -740,6 +885,20 @@ class TRLPPOTrainer(PPOTrainer):
 
                 for key, value in policy_state_dict.items():
                     self.storage.update_key(key, value)
+                if self.balance_staged_task_samples:
+                    self.storage.update_key("task_stage", self.env.stage_buf[:, None])
+                    if self.balance_staged_task_variants:
+                        self.storage.update_key(
+                            "task_variant", self.env.get_task_variant()[:, None]
+                        )
+                if self.compute_policy_action_supervision:
+                    action_target, action_target_mask = (
+                        self.env.get_policy_action_supervision()
+                    )
+                    self.storage.update_key("policy_action_target", action_target)
+                    self.storage.update_key(
+                        "policy_action_target_mask", action_target_mask
+                    )
 
                 # Store hidden states separately for recurrent policies
                 hidden_states = (
@@ -753,10 +912,16 @@ class TRLPPOTrainer(PPOTrainer):
 
                 # Step the environment
                 actor_state = {"actions": policy_state_dict["actions"]}
+                if hasattr(self.env, "set_unsafe_force_policy_step"):
+                    self.env.set_unsafe_force_policy_step(
+                        policy_state_dict["action_mean"],
+                        policy_state_dict["actions"],
+                    )
                 # Pass gt_actions to environment if available (for distillation mode)
                 if "gt_actions" in policy_state_dict:
                     actor_state["gt_actions"] = policy_state_dict["gt_actions"]
                 obs_dict, rewards, dones, infos = self.env.step(actor_state)
+                infos["to_log"].update(policy_diagnostics)
                 for obs_key in obs_dict.keys():
                     obs_dict[obs_key] = obs_dict[obs_key].to(device)
                 rewards, dones = rewards.to(device), dones.to(device)
@@ -830,6 +995,16 @@ class TRLPPOTrainer(PPOTrainer):
                     policy_state_dict={
                         "dones": self.storage.query_key("dones"),
                         "rewards": self.storage.query_key("rewards"),
+                        "task_stages": (
+                            self.storage.query_key("task_stage")
+                            if self.balance_staged_task_samples
+                            else None
+                        ),
+                        "task_variants": (
+                            self.storage.query_key("task_variant")
+                            if self.balance_staged_task_variants
+                            else None
+                        ),
                     },
                 )
                 self.storage.batch_update_data("values", values)
@@ -862,6 +1037,8 @@ class TRLPPOTrainer(PPOTrainer):
         if self.compute_imgaug_bc_loss:
             imgaug_bc_loss_stats = torch.zeros(stats_shape, device=device)
             weighted_imgaug_bc_loss_stats = torch.zeros(stats_shape, device=device)
+        if self.compute_policy_action_supervision:
+            policy_action_supervision_stats = torch.zeros(stats_shape, device=device)
 
         self.approxkl_stats = approxkl_stats
         self.pg_clipfrac_stats = pg_clipfrac_stats
@@ -874,6 +1051,8 @@ class TRLPPOTrainer(PPOTrainer):
         if self.compute_imgaug_bc_loss:
             self.imgaug_bc_loss_stats = imgaug_bc_loss_stats
             self.weighted_imgaug_bc_loss_stats = weighted_imgaug_bc_loss_stats
+        if self.compute_policy_action_supervision:
+            self.policy_action_supervision_stats = policy_action_supervision_stats
 
     def _get_rollout_data(self, obs_keys):
         device = self.accelerator.device
@@ -889,10 +1068,313 @@ class TRLPPOTrainer(PPOTrainer):
         values = self.storage.values.transpose(0, 1).squeeze(-1).to(device)
         rewards = self.storage.rewards.transpose(0, 1).squeeze(-1).to(device)
         dones = self.storage.dones.transpose(0, 1).squeeze(-1).to(device)
-        old_mu_batch = self.storage.action_mean.transpose(0, 1).to(device)
-        old_sigma_batch = self.storage.action_sigma.transpose(0, 1).to(device)
+        temporal_fractions = None
+        if getattr(self.policy_model, "temporal_action_noise_enabled", False):
+            old_mu_batch = self.storage.action_mean.transpose(0, 1).to(device)
+            old_sigma_batch = self.storage.action_sigma.transpose(0, 1).to(device)
+            temporal_fractions = self.storage.action_temporal_fraction.transpose(
+                0, 1
+            ).to(device)
+            logprobs = marginal_temporal_gaussian_log_prob(
+                actions,
+                old_mu_batch,
+                old_sigma_batch,
+                dones,
+                self.policy_model.temporal_action_noise_rho,
+                temporal_fractions,
+            )
+            flat_fractions = temporal_fractions.reshape(-1, self.num_act)
+            local_count = torch.full(
+                (self.num_act,),
+                flat_fractions.shape[0],
+                dtype=flat_fractions.dtype,
+                device=device,
+            )
+            local_stats = torch.stack(
+                [
+                    flat_fractions.sum(dim=0),
+                    flat_fractions.square().sum(dim=0),
+                    flat_fractions.amin(dim=0),
+                    flat_fractions.amax(dim=0),
+                    local_count,
+                ]
+            )
+            gathered_stats = self.accelerator.gather(local_stats).reshape(
+                -1, 5, self.num_act
+            )
+            total_count = gathered_stats[:, 4].sum(dim=0).clamp_min(1.0)
+            fraction_mean = gathered_stats[:, 0].sum(dim=0) / total_count
+            fraction_second_moment = (
+                gathered_stats[:, 1].sum(dim=0) / total_count
+            )
+            self._last_temporal_fraction_stats = {
+                "mean": fraction_mean,
+                "std": torch.sqrt(
+                    (fraction_second_moment - fraction_mean.square()).clamp_min(0.0)
+                ),
+                "min": gathered_stats[:, 2].amin(dim=0),
+                "max": gathered_stats[:, 3].amax(dim=0),
+            }
+        else:
+            old_mu_batch = self.storage.action_mean.transpose(0, 1).to(device)
+            old_sigma_batch = self.storage.action_sigma.transpose(0, 1).to(device)
         returns = self.storage.returns.transpose(0, 1).squeeze(-1).to(device)
         advantages = self.storage.advantages.transpose(0, 1).squeeze(-1).to(device)
+        if self.state_dependent_action_noise:
+            local_mean_variance = normalized_action_variance(
+                old_sigma_batch, self.policy_model.max_noise_std
+            )
+            global_mean_variance = self.accelerator.reduce(
+                local_mean_variance.detach(), reduction="mean"
+            )
+            target = torch.full_like(
+                global_mean_variance,
+                self.exploration_variance_budget_fraction,
+            )
+            signed_violation = target - global_mean_variance
+            with torch.no_grad():
+                self.policy_model.exploration_budget_dual_weight.add_(
+                    self.exploration_variance_budget_dual_lr * signed_violation
+                ).clamp_(min=0.0)
+            self._last_exploration_mean_variance = global_mean_variance
+            self._last_exploration_budget_shortfall = torch.relu(signed_violation)
+        task_stage_weights = None
+        task_stage_supervision_weights = None
+        if self.balance_staged_task_samples:
+            task_stages = (
+                self.storage.task_stage.transpose(0, 1).squeeze(-1).to(device).long()
+            )
+            local_counts = torch.bincount(
+                task_stages.reshape(-1), minlength=int(self.env.num_stages)
+            ).to(torch.float32)
+            global_counts = self.accelerator.reduce(local_counts, reduction="sum")
+            present = global_counts > 0
+            total_count = global_counts.sum().clamp(min=1.0)
+            present_count = present.sum().clamp(min=1)
+            stage_weights = torch.zeros_like(global_counts)
+            inverse_frequency = total_count / (
+                present_count * global_counts[present]
+            )
+            # Find a common scale for inverse-frequency weights while keeping
+            # both the configured hard cap and a global sample-weight mean of 1.
+            lower = torch.zeros((), device=device)
+            upper = torch.full((), self.staged_task_max_sample_weight, device=device)
+            for _ in range(32):
+                scale = 0.5 * (lower + upper)
+                candidate = (inverse_frequency * scale).clamp(
+                    max=self.staged_task_max_sample_weight
+                )
+                candidate_mean = (
+                    candidate * global_counts[present]
+                ).sum() / total_count
+                lower = torch.where(candidate_mean < 1.0, scale, lower)
+                upper = torch.where(candidate_mean < 1.0, upper, scale)
+            stage_weights[present] = (inverse_frequency * upper).clamp(
+                max=self.staged_task_max_sample_weight
+            )
+            self._last_task_stage_counts = global_counts.detach()
+            self._last_task_stage_weights = stage_weights.detach()
+            task_stage_weights = stage_weights[task_stages]
+
+            # This covariance is proportional to the mean score only for an
+            # independent Gaussian. A sequence likelihood couples scores across
+            # time, so reporting it there as a PPO signal would be misleading.
+            temporal_noise_enabled = getattr(
+                self.policy_model, "temporal_action_noise_enabled", False
+            )
+            local_score_sums = None
+            if not temporal_noise_enabled:
+                local_score_sums = torch.zeros(
+                    int(self.env.num_stages), self.num_act, device=device
+                )
+            local_reward_sums = torch.zeros(int(self.env.num_stages), device=device)
+            action_noise = actions - old_mu_batch
+            for stage_idx in range(int(self.env.num_stages)):
+                stage_mask = task_stages == stage_idx
+                if local_score_sums is not None:
+                    local_score_sums[stage_idx] = (
+                        action_noise
+                        * advantages.unsqueeze(-1)
+                        * stage_mask.unsqueeze(-1)
+                    ).sum(dim=(0, 1))
+                local_reward_sums[stage_idx] = rewards[stage_mask].sum()
+            global_score_sums = None
+            if local_score_sums is not None:
+                global_score_sums = self.accelerator.reduce(
+                    local_score_sums, reduction="sum"
+                )
+            global_reward_sums = self.accelerator.reduce(
+                local_reward_sums, reduction="sum"
+            )
+            safe_counts = global_counts.clamp(min=1.0)
+            self._last_stage_action_advantage_signal = (
+                None
+                if global_score_sums is None
+                else (global_score_sums / safe_counts[:, None]).detach()
+            )
+            self._last_stage_reward_mean = (
+                global_reward_sums / safe_counts
+            ).detach()
+
+            # Diagnose PUSH_OPEN credit assignment without affecting the
+            # rollout or loss.  The first panel-interaction coordinate is the
+            # signed normal error from the 30 mm ready point, so its temporal
+            # delta is exactly the panel-clearance delta.  A positive ee_x
+            # action should therefore correlate with a negative delta here.
+            actor_obs_names = sorted(
+                self.env.config.obs.obs_dict.get("actor_obs", [])
+            )
+            panel_key = "b2z1_panel_interaction"
+            push_stage = getattr(self.env, "STAGE_PUSH_OPEN", 4)
+            if panel_key in actor_obs_names and actions.shape[1] > 1:
+                panel_key_index = actor_obs_names.index(panel_key)
+                panel_start = sum(
+                    int(self.env.config.obs.obs_dims[name])
+                    for name in actor_obs_names[:panel_key_index]
+                )
+                panel_normal_error = all_obs_dict["actor_obs"][..., panel_start]
+                ee_x_noise = action_noise[..., 3]
+                push_mask = task_stages == push_stage
+                raw_advantages = returns - values
+
+                # Recompute the exact reward-to-go available inside this
+                # rollout with a zero value at the truncation boundary.  The
+                # remainder of the trainer's raw advantage then isolates the
+                # critic/baseline contribution, including the final bootstrap.
+                rollout_reward_to_go = torch.zeros_like(rewards)
+                running_reward_to_go = torch.zeros_like(rewards[:, 0])
+                for step in reversed(range(rewards.shape[1])):
+                    running_reward_to_go = rewards[:, step] + (
+                        self.gamma
+                        * (~dones[:, step].bool()).float()
+                        * running_reward_to_go
+                    )
+                    rollout_reward_to_go[:, step] = running_reward_to_go
+
+                def masked_covariance(x, y, mask):
+                    mask_float = mask.float()
+                    local_stats = torch.stack(
+                        [
+                            (x * mask_float).sum(),
+                            (y * mask_float).sum(),
+                            (x * y * mask_float).sum(),
+                            mask_float.sum(),
+                        ]
+                    )
+                    global_stats = self.accelerator.reduce(
+                        local_stats, reduction="sum"
+                    )
+                    count = global_stats[3].clamp(min=1.0)
+                    return (
+                        global_stats[2] / count
+                        - (global_stats[0] / count) * (global_stats[1] / count)
+                    )
+
+                self._last_push_causal_metrics = {
+                    "immediate_reward_signal": masked_covariance(
+                        ee_x_noise, rewards, push_mask
+                    ).detach(),
+                    "critic_bootstrapped_advantage_signal": masked_covariance(
+                        ee_x_noise, raw_advantages, push_mask
+                    ).detach(),
+                    "rollout_reward_to_go_signal": masked_covariance(
+                        ee_x_noise, rollout_reward_to_go, push_mask
+                    ).detach(),
+                    "critic_remainder_signal": masked_covariance(
+                        ee_x_noise,
+                        raw_advantages - rollout_reward_to_go,
+                        push_mask,
+                    ).detach(),
+                    "current_value_baseline_signal": masked_covariance(
+                        ee_x_noise, -values, push_mask
+                    ).detach(),
+                    "final_value_bootstrap_signal": masked_covariance(
+                        ee_x_noise,
+                        raw_advantages - rollout_reward_to_go + values,
+                        push_mask,
+                    ).detach(),
+                }
+                for lag in (1, 2, 4, 8, 16, 32):
+                    if actions.shape[1] <= lag:
+                        continue
+                    valid = push_mask[:, :-lag] & push_mask[:, lag:]
+                    # Exclude intervals crossing an episode boundary.
+                    for done_offset in range(lag):
+                        valid &= ~dones[:, done_offset : done_offset + valid.shape[1]].bool()
+                    clearance_delta = (
+                        panel_normal_error[:, lag:] - panel_normal_error[:, :-lag]
+                    )
+                    discounted_rewards = torch.zeros_like(ee_x_noise[:, :-lag])
+                    for reward_offset in range(lag):
+                        discounted_rewards += (
+                            self.gamma**reward_offset
+                            * rewards[
+                                :,
+                                reward_offset : reward_offset
+                                + discounted_rewards.shape[1],
+                            ]
+                        )
+                    bootstrapped_delta = (
+                        self.gamma**lag * values[:, lag:] - values[:, :-lag]
+                    )
+                    self._last_push_causal_metrics[
+                        f"ee_x_to_clearance_delta_lag_{lag}"
+                    ] = masked_covariance(
+                        ee_x_noise[:, :-lag], clearance_delta, valid
+                    ).detach()
+                    self._last_push_causal_metrics[
+                        f"ee_x_to_reward_return_lag_{lag}"
+                    ] = masked_covariance(
+                        ee_x_noise[:, :-lag], discounted_rewards, valid
+                    ).detach()
+                    self._last_push_causal_metrics[
+                        f"ee_x_to_value_bootstrap_lag_{lag}"
+                    ] = masked_covariance(
+                        ee_x_noise[:, :-lag], bootstrapped_delta, valid
+                    ).detach()
+                    self._last_push_causal_metrics[
+                        f"ee_x_to_bootstrapped_return_lag_{lag}"
+                    ] = masked_covariance(
+                        ee_x_noise[:, :-lag],
+                        discounted_rewards + bootstrapped_delta,
+                        valid,
+                    ).detach()
+                    self._last_push_causal_metrics[f"sample_count_lag_{lag}"] = (
+                        self.accelerator.reduce(valid.float().sum(), reduction="sum")
+                        .detach()
+                    )
+            else:
+                self._last_push_causal_metrics = {}
+
+        policy_action_target = None
+        policy_action_target_mask = None
+        if self.compute_policy_action_supervision:
+            policy_action_target = self.storage.policy_action_target.transpose(0, 1).to(device)
+            policy_action_target_mask = (
+                self.storage.policy_action_target_mask.transpose(0, 1).to(device)
+            )
+            if self.balance_staged_task_samples:
+                local_active_counts = torch.zeros(
+                    int(self.env.num_stages), device=device, dtype=torch.float32
+                )
+                for stage_idx in range(int(self.env.num_stages)):
+                    local_active_counts[stage_idx] = policy_action_target_mask[
+                        task_stages == stage_idx
+                    ].sum()
+                global_active_counts = self.accelerator.reduce(
+                    local_active_counts, reduction="sum"
+                )
+                active_stages = global_active_counts > 0
+                active_stage_count = active_stages.sum().clamp(min=1)
+                total_active_count = global_active_counts.sum().clamp(min=1.0)
+                supervision_stage_weights = torch.zeros_like(global_active_counts)
+                supervision_stage_weights[active_stages] = total_active_count / (
+                    active_stage_count * global_active_counts[active_stages]
+                )
+                self._last_task_stage_supervision_weights = (
+                    supervision_stage_weights.detach()
+                )
+                task_stage_supervision_weights = supervision_stage_weights[task_stages]
 
         if self.use_padding_mask:
             padding_mask = dones.clone()
@@ -944,7 +1426,7 @@ class TRLPPOTrainer(PPOTrainer):
                 ]
             )
 
-        return dict(
+        rollout_data = dict(
             all_obs_dict=all_obs_dict,
             actions=actions,
             logprobs=logprobs,
@@ -953,15 +1435,21 @@ class TRLPPOTrainer(PPOTrainer):
             dones=dones,
             old_mu_batch=old_mu_batch,
             old_sigma_batch=old_sigma_batch,
+            temporal_fractions=temporal_fractions,
             returns=returns,
             advantages=advantages,
+            task_stage_weights=task_stage_weights,
+            task_stage_supervision_weights=task_stage_supervision_weights,
             padding_mask=padding_mask,
             padding_mask_p1=padding_mask_p1,
             padded_obs_dict=padded_obs_dict,
             trajectory_masks=trajectory_masks,
             trajectory_offsets=trajectory_offsets,
             trajectory_counts=trajectory_counts,
+            policy_action_target=policy_action_target,
+            policy_action_target_mask=policy_action_target_mask,
         )
+        return rollout_data
 
     def _get_mb_rollout_data(self, rollout_data, micro_batch_inds):
         mb_advantage = rollout_data["advantages"][micro_batch_inds]
@@ -972,8 +1460,28 @@ class TRLPPOTrainer(PPOTrainer):
         mb_actions = rollout_data["actions"][micro_batch_inds]
         mb_old_mu = rollout_data["old_mu_batch"][micro_batch_inds]
         mb_old_sigma = rollout_data["old_sigma_batch"][micro_batch_inds]
+        mb_temporal_fractions = None
+        if rollout_data["temporal_fractions"] is not None:
+            mb_temporal_fractions = rollout_data["temporal_fractions"][
+                micro_batch_inds
+            ]
         mb_padding_mask = rollout_data["padding_mask"][micro_batch_inds]
         mb_padding_mask_p1 = rollout_data["padding_mask_p1"][micro_batch_inds]
+        mb_policy_action_target = None
+        mb_policy_action_target_mask = None
+        mb_task_stage_weights = None
+        mb_task_stage_supervision_weights = None
+        if rollout_data["task_stage_weights"] is not None:
+            mb_task_stage_weights = rollout_data["task_stage_weights"][micro_batch_inds]
+        if rollout_data["task_stage_supervision_weights"] is not None:
+            mb_task_stage_supervision_weights = rollout_data[
+                "task_stage_supervision_weights"
+            ][micro_batch_inds]
+        if self.compute_policy_action_supervision:
+            mb_policy_action_target = rollout_data["policy_action_target"][micro_batch_inds]
+            mb_policy_action_target_mask = rollout_data[
+                "policy_action_target_mask"
+            ][micro_batch_inds]
 
         episode_attnmask = compute_episode_attnmask(mb_dones)
 
@@ -1066,11 +1574,16 @@ class TRLPPOTrainer(PPOTrainer):
             mb_actions=mb_actions,
             mb_old_mu=mb_old_mu,
             mb_old_sigma=mb_old_sigma,
+            mb_temporal_fractions=mb_temporal_fractions,
             mb_padding_mask=mb_padding_mask,
             mb_padding_mask_p1=mb_padding_mask_p1,
             episode_attnmask=episode_attnmask,
             mb_masks=mb_masks,
             mb_hidden_states=mb_hidden_states,
+            mb_policy_action_target=mb_policy_action_target,
+            mb_policy_action_target_mask=mb_policy_action_target_mask,
+            mb_task_stage_weights=mb_task_stage_weights,
+            mb_task_stage_supervision_weights=mb_task_stage_supervision_weights,
         )
         return mb_rollout_data
 
@@ -1151,6 +1664,34 @@ class TRLPPOTrainer(PPOTrainer):
             loss += imgaug_bc_loss_dict["imgaug_bc_loss"] * self.config.imgaug_bc_loss_coef
             ret_dict["imgaug_bc_loss_dict"] = imgaug_bc_loss_dict
 
+        if self.compute_policy_action_supervision:
+            action_mean = forward_results["policy_results"]["action_mean"]
+            action_target = mb_rollout_data["mb_policy_action_target"]
+            action_target_mask = mb_rollout_data["mb_policy_action_target_mask"]
+            if action_mean.shape != action_target.shape:
+                raise RuntimeError(
+                    "Policy action supervision currently requires matching dense rollout "
+                    f"shapes, got mean={action_mean.shape}, target={action_target.shape}"
+                )
+            supervision_error = torch.nn.functional.smooth_l1_loss(
+                action_mean,
+                action_target,
+                reduction="none",
+                beta=self.policy_action_supervision_huber_beta,
+            )
+            supervision_weight = action_target_mask
+            stage_weights = mb_rollout_data["mb_task_stage_supervision_weights"]
+            if stage_weights is not None:
+                while stage_weights.ndim < supervision_weight.ndim:
+                    stage_weights = stage_weights.unsqueeze(-1)
+                supervision_weight = supervision_weight * stage_weights
+            active_count = supervision_weight.sum().clamp(min=1.0)
+            action_supervision_loss = (
+                supervision_error * supervision_weight
+            ).sum() / active_count
+            loss += self.policy_action_supervision_coef * action_supervision_loss
+            ret_dict["policy_action_supervision_loss"] = action_supervision_loss
+
         ret_dict["loss"] = loss
 
         return ret_dict
@@ -1168,25 +1709,79 @@ class TRLPPOTrainer(PPOTrainer):
         mb_return = mb_rollout_data["mb_return"]
         mb_logprobs = mb_rollout_data["mb_logprobs"]
         mb_advantage = mb_rollout_data["mb_advantage"]
+        mb_task_stage_weights = mb_rollout_data["mb_task_stage_weights"]
         padding_mask = mb_rollout_data["mb_padding_mask"]
         padding_mask_p1 = mb_rollout_data["mb_padding_mask_p1"]
         micro_batch_inds = mb_rollout_data["micro_batch_inds"]
 
-        new_logprobs = policy_results["logprobs"]
-        sigma_batch = policy_results["action_std"]
-        mu_batch = policy_results["action_mean"]
-        entropy_batch = policy_results["entropy"]
+        temporal_noise_enabled = getattr(
+            self.policy_model, "temporal_action_noise_enabled", False
+        )
+        if temporal_noise_enabled:
+            mu_batch = policy_results["action_mean"]
+            sigma_batch = policy_results["marginal_action_std"]
+            global_sigma_batch = policy_results["global_action_std"]
+            new_temporal_fractions = policy_results["action_temporal_fraction"]
+            (
+                old_conditional_mean,
+                old_conditional_std,
+                new_conditional_mean,
+                new_conditional_std,
+            ) = paired_temporal_gaussian_parameters(
+                mb_rollout_data["mb_actions"],
+                mb_old_mu,
+                mb_old_sigma,
+                mb_rollout_data["mb_temporal_fractions"],
+                mu_batch,
+                sigma_batch,
+                new_temporal_fractions,
+                mb_rollout_data["mb_dones"],
+                self.policy_model.temporal_action_noise_rho,
+            )
+            new_logprobs = torch.distributions.Normal(
+                new_conditional_mean, new_conditional_std
+            ).log_prob(mb_rollout_data["mb_actions"]).sum(dim=-1)
+            _, global_conditional_std = marginal_temporal_gaussian_parameters(
+                mb_rollout_data["mb_actions"],
+                mu_batch,
+                global_sigma_batch,
+                mb_rollout_data["mb_dones"],
+                self.policy_model.temporal_action_noise_rho,
+                new_temporal_fractions.detach(),
+            )
+            entropy_batch = torch.distributions.Normal(
+                torch.zeros_like(global_conditional_std), global_conditional_std
+            ).entropy().sum(dim=-1)
+            old_conditional_mean = old_conditional_mean.detach()
+            old_conditional_std = old_conditional_std.detach()
+        else:
+            new_logprobs = policy_results["logprobs"]
+            sigma_batch = policy_results["action_std"]
+            mu_batch = policy_results["action_distribution_mean"]
+            if self.state_dependent_action_noise:
+                global_sigma_batch = policy_results["global_action_std"]
+                entropy_batch = torch.distributions.Normal(
+                    torch.zeros_like(global_sigma_batch), global_sigma_batch
+                ).entropy().sum(dim=-1)
+            else:
+                entropy_batch = policy_results["entropy"]
+            old_conditional_mean = mb_old_mu
+            old_conditional_std = mb_old_sigma
+            new_conditional_mean = mu_batch
+            new_conditional_std = sigma_batch
         with torch.no_grad():
             kl = torch.sum(
-                torch.log(sigma_batch / mb_old_sigma + 1.0e-5)
-                + (torch.square(mb_old_sigma) + torch.square(mb_old_mu - mu_batch))
-                / (2.0 * torch.square(sigma_batch))
+                torch.log(new_conditional_std / old_conditional_std + 1.0e-5)
+                + (
+                    torch.square(old_conditional_std)
+                    + torch.square(old_conditional_mean - new_conditional_mean)
+                )
+                / (2.0 * torch.square(new_conditional_std))
                 - 0.5,
                 axis=-1,
             )
             local_kl_mean = torch.mean(kl)
             kl_mean = self.accelerator.gather(local_kl_mean).mean()
-            self._adjust_learning_rate_based_on_kl(kl_mean, optimizer)
 
         # Forward a DDP model twice will cause the error: "one of the variables needed for gradient computation has been modified by an inplace operation"
         vpred = value_results.squeeze(-1)
@@ -1198,18 +1793,53 @@ class TRLPPOTrainer(PPOTrainer):
         vf_losses1 = torch.square(vpred - mb_return)
         vf_losses2 = torch.square(vpredclipped - mb_return)
         vf_loss_max = torch.max(vf_losses1, vf_losses2)
-        vf_loss = masked_mean(vf_loss_max, ~padding_mask_p1)
+        if mb_task_stage_weights is None:
+            vf_loss = masked_mean(vf_loss_max, ~padding_mask_p1)
+        else:
+            vf_weights = mb_task_stage_weights * (~padding_mask_p1).float()
+            vf_loss = (vf_loss_max * vf_weights).sum() / vf_weights.sum().clamp(
+                min=1.0
+            )
         vf_clipfrac = masked_mean((vf_losses2 > vf_losses1).float(), ~padding_mask_p1)
         logprobs_diff = new_logprobs - mb_logprobs
         ratio = torch.exp(logprobs_diff)
         pg_losses = -mb_advantage * ratio
         pg_losses2 = -mb_advantage * torch.clamp(ratio, 1.0 - args.cliprange, 1.0 + args.cliprange)
         pg_loss_max = torch.max(pg_losses, pg_losses2)
-        pg_loss = masked_mean(pg_loss_max, ~padding_mask)
+        if mb_task_stage_weights is None:
+            pg_loss = masked_mean(pg_loss_max, ~padding_mask)
+        else:
+            pg_weights = mb_task_stage_weights * (~padding_mask).float()
+            pg_loss = (pg_loss_max * pg_weights).sum() / pg_weights.sum().clamp(
+                min=1.0
+            )
 
         entropy_loss = -masked_mean(entropy_batch, ~padding_mask)
 
-        loss = pg_loss + args.vf_coef * vf_loss + self.entropy_coef * entropy_loss
+        exploration_budget_loss = torch.zeros((), device=pg_loss.device)
+        exploration_mean_variance = None
+        if self.state_dependent_action_noise:
+            exploration_mean_variance = normalized_action_variance(
+                sigma_batch, self.policy_model.max_noise_std
+            )
+            target = torch.full_like(
+                exploration_mean_variance,
+                self.exploration_variance_budget_fraction,
+            )
+            active = (
+                self._last_exploration_budget_shortfall > 0.0
+            ).to(exploration_mean_variance.dtype)
+            dual_weight = self.policy_model.exploration_budget_dual_weight.detach()
+            exploration_budget_loss = (
+                dual_weight * active * (target - exploration_mean_variance)
+            ).sum()
+
+        loss = (
+            pg_loss
+            + args.vf_coef * vf_loss
+            + self.entropy_coef * entropy_loss
+            + exploration_budget_loss
+        )
 
         return dict(
             ppo_loss=loss,
@@ -1220,6 +1850,8 @@ class TRLPPOTrainer(PPOTrainer):
             pg_loss=pg_loss,
             vf_loss=vf_loss,
             entropy_loss=entropy_loss,
+            exploration_budget_loss=exploration_budget_loss,
+            exploration_mean_variance=exploration_mean_variance,
             ratio=ratio,
             vf_clipfrac=vf_clipfrac,
         )
@@ -1270,6 +1902,10 @@ class TRLPPOTrainer(PPOTrainer):
             self.weighted_imgaug_bc_loss_stats[ppo_epoch_idx, minibatch_idx, microbatch_idx] = (
                 self.config.imgaug_bc_loss_coef * imgaug_bc_loss
             )
+        if self.compute_policy_action_supervision:
+            self.policy_action_supervision_stats[
+                ppo_epoch_idx, minibatch_idx, microbatch_idx
+            ] = loss_dict["policy_action_supervision_loss"]
         self.entropy_stats[ppo_epoch_idx, minibatch_idx, microbatch_idx] = -entropy_loss
         self.weighted_ppo_loss_stats[ppo_epoch_idx, minibatch_idx, microbatch_idx] = (
             weighted_ppo_loss
@@ -1280,6 +1916,38 @@ class TRLPPOTrainer(PPOTrainer):
     def _get_train_metrics(self):
         metrics = {}
 
+        if self.balance_staged_task_samples:
+            stage_names = getattr(self.env, "_STAGE_NAMES", ())
+            for stage_idx in range(int(self.env.num_stages)):
+                stage_name = (
+                    stage_names[stage_idx]
+                    if stage_idx < len(stage_names)
+                    else str(stage_idx)
+                )
+                metrics[f"train/stage_count/{stage_name}"] = (
+                    self._last_task_stage_counts[stage_idx].item()
+                )
+                metrics[f"train/stage_weight/{stage_name}"] = (
+                    self._last_task_stage_weights[stage_idx].item()
+                )
+                if self.compute_policy_action_supervision:
+                    metrics[f"train/stage_supervision_weight/{stage_name}"] = (
+                        self._last_task_stage_supervision_weights[stage_idx].item()
+                    )
+                metrics[f"train/stage_reward_mean/{stage_name}"] = (
+                    self._last_stage_reward_mean[stage_idx].item()
+                )
+                if self._last_stage_action_advantage_signal is not None:
+                    for action_idx in range(self.num_act):
+                        metrics[
+                            f"train/stage_action_advantage_signal/{stage_name}/{action_idx}"
+                        ] = self._last_stage_action_advantage_signal[
+                            stage_idx, action_idx
+                        ].item()
+            for name, value in getattr(
+                self, "_last_push_causal_metrics", {}
+            ).items():
+                metrics[f"train/push_open_causal/{name}"] = value.item()
         approxkl_avg = self.accelerator.gather_for_metrics(self.approxkl_stats).mean().item()
 
         metrics["policy/approxkl_avg"] = approxkl_avg
@@ -1295,6 +1963,14 @@ class TRLPPOTrainer(PPOTrainer):
             )
             metrics["loss/weighted_imgaug_bc_avg"] = (
                 self.accelerator.gather_for_metrics(self.weighted_imgaug_bc_loss_stats)
+                .mean()
+                .item()
+            )
+        if self.compute_policy_action_supervision:
+            metrics["loss/policy_action_supervision_avg"] = (
+                self.accelerator.gather_for_metrics(
+                    self.policy_action_supervision_stats
+                )
                 .mean()
                 .item()
             )
@@ -1510,7 +2186,7 @@ class TRLPPOTrainer(PPOTrainer):
                 # else:
                 #     metrics["objective/goal_reached_rate"] = 0.0
 
-                metrics["lr"] = self.lr_scheduler.get_last_lr()[0]
+                metrics["lr"] = optimizer.param_groups[0]["lr"]
                 metrics["episode"] = self.state.episode
                 env_log_dict_local = self.episode_env_tensors.mean_and_clear()
                 # Synchronize environment metrics across all GPUs to properly aggregate
@@ -1560,10 +2236,33 @@ class TRLPPOTrainer(PPOTrainer):
                 for param_name, param_value in self.scheduled_params_dict.items():
                     log_dict[f"scheduled_params/{param_name}"] = param_value
 
-                if hasattr(self.policy_model, "std"):
-                    metrics["Policy/mean_noise_std"] = self.policy_model.std.mean().item()
+                if hasattr(self.storage, "action_sigma"):
+                    metrics["Policy/mean_noise_std"] = (
+                        self.storage.action_sigma.mean().item()
+                    )
                 else:
                     metrics["Policy/mean_noise_std"] = 0.0
+                if (
+                    self.state_dependent_action_noise
+                    and self._last_exploration_mean_variance is not None
+                ):
+                    metrics["Policy/exploration_variance_mean"] = float(
+                        self._last_exploration_mean_variance.mean()
+                    )
+                    metrics["Policy/exploration_budget_shortfall_max"] = float(
+                        self._last_exploration_budget_shortfall.max()
+                    )
+                    metrics["Policy/exploration_budget_dual_mean"] = float(
+                        self.policy_model.exploration_budget_dual_weight.mean()
+                    )
+                if self._last_temporal_fraction_stats is not None:
+                    for action_idx in range(self.num_act):
+                        for statistic, values in (
+                            self._last_temporal_fraction_stats.items()
+                        ):
+                            metrics[
+                                f"Policy/temporal_fraction/{action_idx}/{statistic}"
+                            ] = float(values[action_idx])
 
                 metrics.update({f"Env/{k}": v for k, v in env_log_dict.items()})
                 metrics.update(log_dict)
@@ -1574,7 +2273,15 @@ class TRLPPOTrainer(PPOTrainer):
                 self.log(metrics)
                 self.ep_infos.clear()
 
-            self.lr_scheduler.step()
+            if self.use_adaptive_kl_schedule:
+                self._adjust_learning_rate_based_on_kl(
+                    self.accelerator.gather_for_metrics(self.approxkl_stats)
+                    .mean()
+                    .item(),
+                    optimizer,
+                )
+            else:
+                self.lr_scheduler.step()
 
             self.control = self.callback_handler.on_step_end(args, self.state, self.control)
 
@@ -1648,6 +2355,11 @@ class TRLPPOTrainer(PPOTrainer):
 
         output = {**logs, **{"step": self.state.global_step}}
         self.state.log_history.append(output)
+        append_training_metrics_jsonl(
+            self.args.output_dir,
+            output,
+            is_world_process_zero=self.state.is_world_process_zero,
+        )
 
         self.control = self.callback_handler.on_log(self.args, self.state, self.control, logs)
 
@@ -1666,6 +2378,35 @@ class TRLPPOTrainer(PPOTrainer):
                     amp.master_params(self.optimizer),
                     args.max_grad_norm,
                 )
+            elif self.config.get("separate_actor_critic_grad_clip", False):
+                actor_parameters = [
+                    parameter
+                    for parameter in self.policy_model.parameters()
+                    if parameter.grad is not None
+                ]
+                critic_parameters = (
+                    [
+                        parameter
+                        for parameter in self.value_model.parameters()
+                        if parameter.grad is not None
+                    ]
+                    if self.value_model is not None
+                    else []
+                )
+                clipped_norms = []
+                if actor_parameters:
+                    clipped_norms.append(
+                        self.accelerator.clip_grad_norm_(
+                            actor_parameters, args.max_grad_norm
+                        )
+                    )
+                if critic_parameters:
+                    clipped_norms.append(
+                        self.accelerator.clip_grad_norm_(
+                            critic_parameters, args.max_grad_norm
+                        )
+                    )
+                _grad_norm = max(clipped_norms) if clipped_norms else 0.0
             else:
                 _grad_norm = self.accelerator.clip_grad_norm_(
                     model.parameters(),
@@ -1725,9 +2466,53 @@ class TRLPPOTrainer(PPOTrainer):
             advantage = delta + next_is_not_terminal * self.gamma * self.lam * advantage
             returns[step] = advantage + values[step]
 
-        # Compute and normalize the advantages
         advantages = returns - values
-        if self.sync_advantage_normalization:
+        task_stages = policy_state_dict.get("task_stages")
+        if self.balance_staged_task_samples:
+            if task_stages is None:
+                raise RuntimeError(
+                    "Stage-balanced PPO requires task_stages in rollout state"
+                )
+            task_stages = task_stages.to(device=device, dtype=torch.long)
+            task_variants = policy_state_dict.get("task_variants")
+            if self.balance_staged_task_variants:
+                if task_variants is None:
+                    raise RuntimeError(
+                        "Variant-balanced PPO requires task_variants in rollout state"
+                    )
+                task_variants = task_variants.to(device=device, dtype=torch.long)
+            if self.sync_advantage_normalization:
+                advantages = self.accelerator.gather(advantages)
+                task_stages = self.accelerator.gather(task_stages)
+                if self.balance_staged_task_variants:
+                    task_variants = self.accelerator.gather(task_variants)
+
+            normalized = torch.zeros_like(advantages)
+            for stage_idx in range(int(self.env.num_stages)):
+                stage_mask = task_stages == stage_idx
+                variants = (
+                    torch.unique(task_variants[stage_mask])
+                    if self.balance_staged_task_variants
+                    else torch.zeros(1, dtype=torch.long, device=device)
+                )
+                for variant in variants:
+                    group_mask = stage_mask
+                    if self.balance_staged_task_variants:
+                        group_mask = group_mask & (task_variants == variant)
+                    group_values = advantages[group_mask]
+                    if group_values.numel() == 0:
+                        continue
+                    group_mean = group_values.mean()
+                    group_std = group_values.std(unbiased=False)
+                    normalized[group_mask] = (group_values - group_mean) / (
+                        group_std + 1.0e-8
+                    )
+            advantages = normalized
+            if self.sync_advantage_normalization:
+                advantages = advantages.reshape(
+                    self.accelerator.num_processes, -1, *advantages.shape[1:]
+                )[self.accelerator.process_index].to(device)
+        elif self.sync_advantage_normalization:
             # gather advantages from all processes before normalization
             advantages = self.accelerator.gather(advantages)
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
@@ -1742,8 +2527,8 @@ class TRLPPOTrainer(PPOTrainer):
     def _adjust_learning_rate_based_on_kl(self, kl_mean, optimizer):
         """Adjust the learning rate based on the KL divergence.
 
-        This function implements a learning rate schedule that adjusts the learning rate
-        based on the KL divergence between the current policy and the old policy.
+        This function adjusts the learning rate once per PPO update from the aggregate
+        KL divergence between the current policy and the rollout policy.
         If the KL divergence is too high, the learning rate is decreased.
         If the KL divergence is too low, the learning rate is increased.
 
@@ -1751,15 +2536,22 @@ class TRLPPOTrainer(PPOTrainer):
             kl_mean (float): The mean KL divergence across all processes.
             optimizer (torch.optim.Optimizer): The optimizer to update.
         """
-        if self.desired_kl is None:
+        if not self.use_adaptive_kl_schedule:
             return
 
         if kl_mean > self.desired_kl * 2.0:
-            new_lr = max(1e-5, self.args.learning_rate / 1.5)
+            new_lr = max(
+                self.adaptive_kl_min_learning_rate,
+                self.adaptive_learning_rate / 1.5,
+            )
         elif kl_mean < self.desired_kl / 2.0 and kl_mean > 0.0:
-            new_lr = min(1e-2, self.args.learning_rate * 1.5)
+            new_lr = min(
+                self.adaptive_kl_max_learning_rate,
+                self.adaptive_learning_rate * 1.5,
+            )
         else:
-            new_lr = self.args.learning_rate
+            new_lr = self.adaptive_learning_rate
+        self.adaptive_learning_rate = new_lr
         self.args.learning_rate = new_lr
 
         for param_group in optimizer.param_groups:
@@ -1791,9 +2583,37 @@ class TRLPPOTrainer(PPOTrainer):
 
             # Update learning rate if available
             if "args" in checkpoint and hasattr(checkpoint["args"], "learning_rate"):
-                self.args.learning_rate = checkpoint["args"].learning_rate
+                loaded_learning_rate = float(checkpoint["args"].learning_rate)
+                if self.use_adaptive_kl_schedule:
+                    loaded_learning_rate = min(
+                        self.adaptive_kl_max_learning_rate,
+                        max(
+                            self.adaptive_kl_min_learning_rate,
+                            loaded_learning_rate,
+                        ),
+                    )
+                    self.adaptive_learning_rate = loaded_learning_rate
+                self.args.learning_rate = loaded_learning_rate
                 for param_group in self.optimizer.param_groups:
                     param_group["lr"] = self.args.learning_rate
+
+        resume_noise_std = self.config.get("resume_noise_std", None)
+        if resume_noise_std is not None:
+            policy = model.policy
+            target_std = torch.as_tensor(
+                resume_noise_std,
+                dtype=policy.std.dtype,
+                device=policy.std.device,
+            )
+            if target_std.numel() not in (1, policy.std.numel()):
+                raise ValueError(
+                    "resume_noise_std must be a scalar or contain one value per action; "
+                    f"got {target_std.numel()} values for {policy.std.numel()} actions"
+                )
+            with torch.no_grad():
+                policy.std.copy_(target_std.expand_as(policy.std))
+            self.optimizer.state.pop(policy.std, None)
+            print(f"Reset resumed action noise std to {policy.std.detach().cpu().tolist()}")
 
         # Load learning rate scheduler state
         if (
@@ -1803,12 +2623,21 @@ class TRLPPOTrainer(PPOTrainer):
             self.lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
 
         if "env_state_dict" in checkpoint:
-            self.env.load_env_state_dict(checkpoint["env_state_dict"])
+            env_state_dict = ModelSaveCallback.select_rank_env_state_dict(
+                checkpoint["env_state_dict"],
+                self.accelerator.process_index,
+                self.accelerator.num_processes,
+            )
+            if env_state_dict is not None:
+                self.env.load_env_state_dict(env_state_dict)
 
         if "state" in checkpoint:
             for key, value in checkpoint["state"].__dict__.items():
+                # These buffers are sized for the rollout environment count.
+                # Keep the freshly initialized tensors when resuming with a
+                # different number of environments.
                 if key in ["cur_reward_sum", "cur_episode_length"]:
-                    setattr(self, key, value)
+                    continue
                 if key not in [
                     "stateful_callbacks",
                     "is_local_process_zero",
@@ -1868,6 +2697,8 @@ class TRLPPOTrainer(PPOTrainer):
         # Determine maximum number of episodes to collect
         if eval_num_envs_episodes:
             max_episodes = self.env.num_envs  # One episode per environment
+        elif self.config.eval.save_trajectories:
+            max_episodes = self.config.eval.num_save_episodes
         else:
             max_episodes = self.config.eval.get(
                 "num_eval_episodes", self.env.num_envs
@@ -1897,9 +2728,8 @@ class TRLPPOTrainer(PPOTrainer):
             else:
                 # Original behavior: stop when we have collected max_episodes episodes total
                 if self.config.eval.save_trajectories:
-                    return self.saved_episode_cnt >= self.config.eval.num_save_episodes
-                else:
-                    return len(self.eval_goal_reached_buffer) >= self.config.eval.num_eval_episodes
+                    return self.saved_episode_cnt >= max_episodes
+                return len(self.eval_goal_reached_buffer) >= max_episodes
 
         start_time = time.time()
         expected_total_len = max_episodes
@@ -1951,8 +2781,14 @@ class TRLPPOTrainer(PPOTrainer):
                             # Only collect data from environments that haven't completed their first episode yet
                             valid_new_ids = new_ids[~self.env_episode_completed[new_ids][:, 0]]
                         else:
-                            # Original behavior: collect data from all completed episodes
-                            valid_new_ids = new_ids
+                            collected_count = (
+                                self.saved_episode_cnt
+                                if self.config.eval.save_trajectories
+                                else len(self.eval_goal_reached_buffer)
+                            )
+                            valid_new_ids = take_remaining_episode_ids(
+                                new_ids, collected_count, max_episodes
+                            )
 
                         if len(valid_new_ids) > 0:
                             if self.config.eval.save_videos:

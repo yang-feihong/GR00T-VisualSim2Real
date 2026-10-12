@@ -26,6 +26,7 @@ Usage:
     python groot/rl/eval_agent_trl.py +checkpoint=<path_to_checkpoint.pt> [+num_envs=1]
 """
 
+import json
 import logging
 import os
 import shutil
@@ -39,9 +40,21 @@ from hydra.utils import instantiate
 from loguru import logger
 from omegaconf import OmegaConf
 
-from gr00t.rl.utils.config_utils import register_rl_resolvers
+from gr00t.rl.utils.config_utils import configure_headless_physics, register_rl_resolvers
 
 register_rl_resolvers()
+
+
+def make_json_serializable(value):
+    if isinstance(value, dict):
+        return {key: make_json_serializable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [make_json_serializable(item) for item in value]
+    if hasattr(value, "detach") and hasattr(value, "cpu"):
+        return value.detach().cpu().tolist()
+    if hasattr(value, "item"):
+        return value.item()
+    return value
 
 
 def process_output_dim_in_config(config):
@@ -222,6 +235,7 @@ def main(override_config: OmegaConf):
     unresolved_conf = OmegaConf.to_container(config, resolve=False)
     os.chdir(hydra.utils.get_original_cwd())
     pre_process_config(config)
+    configure_headless_physics(config)
 
     # Set rendering output directory
     ckpt_num = config.checkpoint.split("/")[-1].split("_")[-1].split(".")[0]
@@ -412,7 +426,32 @@ def main(override_config: OmegaConf):
         exit()
 
     # --- Run evaluation ---
-    trainer.eval()
+    eval_dict = make_json_serializable(trainer.eval())
+    eval_dict["evaluation_protocol"] = {
+        "checkpoint": str(checkpoint),
+        "checkpoint_global_step": int(trainer.state.global_step),
+        "seed": int(config.seed),
+        "num_envs": int(config.num_envs),
+        "staged_reset_eval_stage": config.env.config.get(
+            "staged_reset_eval_stage", None
+        ),
+        "one_episode_per_environment": bool(
+            config.algo.config.eval.get("eval_num_envs_episodes", False)
+        ),
+        "policy_action": "action_mean",
+        "exploration_enabled": False,
+        "headless": bool(config.headless),
+        "cameras_enabled": bool(config.simulator.config.cameras.enable_cameras),
+        "render_results": bool(config.simulator.config.get("render_results", False)),
+    }
+    eval_output_dir = Path(
+        config.get("eval_output_dir", checkpoint.parent / "evaluation" / f"ckpt_{ckpt_num}")
+    )
+    eval_output_dir.mkdir(parents=True, exist_ok=True)
+    metrics_path = eval_output_dir / "metrics_eval.json"
+    with metrics_path.open("w", encoding="utf-8") as file:
+        json.dump(eval_dict, file, indent=2)
+    logger.info(f"Saved evaluation metrics to {metrics_path}")
     logger.info("Finished evaluation")
     os._exit(0)
 

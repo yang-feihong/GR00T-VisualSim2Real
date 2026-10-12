@@ -25,18 +25,20 @@ robot:
   gripper_body_name: "gripper_link"
   root_body_name: "base_link"
   manipulator_body_names: ["gripper_link"]
-  task_contact_body_names: ["gripper_link"]
-  # Keep the IK/pose frame above, but sense contact on the movable gripper mesh.
-  task_contact_prim_names: ["gripperMover"]
+  # Use one filtered handle-contact channel per jaw.  The fixed jaw is welded
+  # into link06; gripperMover is the moving jaw.  gripper_link remains the EE
+  # pose proxy for the moving-jaw channel.
+  task_contact_body_names: ["link06", "gripper_link"]
+  task_contact_prim_names: ["link06", "gripperMover"]
   # B2Z1 gripper morphology used by manipulation rewards.  The gripper_link +X
   # axis is the approach/palm direction and aligns with the door grasp target.
-  task_palm_side_directions: ["+x"]
+  task_palm_side_directions: ["+x", "+x"]
   task_grasp_orientation_mode: "target_frame_with_source_offset"
   # Desired gripper_link orientation in the door grasp-target frame.  Rx(-pi/2)
   # is lab30's zero orientation-command convention and aligns the jaw with the
   # horizontal handle while preserving target-frame hinge/handle rotations.
   task_grasp_source_quat_target_wxyz: [0.70710678, -0.70710678, 0.0, 0.0]
-  task_grasp_reward_mode: "single_gripper_contact"
+  task_grasp_reward_mode: "directional_fingers"
   task_face_target_yaw_only: True
   # Only joints attributable to the high-level manipulation command belong in
   # task joint-limit rewards; leg limits are owned by the low-level controller.
@@ -218,11 +220,14 @@ robot:
     clip_torques: True
 
   b2z1_command:
-    command_scale: [0.8, 0.8, 1.0, 0.5, 0.7, 0.6, 0.5, 0.5, 0.5, 1.0]
-    command_clip: [0.8, 0.8, 1.0, 0.5, 0.7, 0.6, 0.5, 0.5, 0.5, 1.0]
+    # Map normalized high-level actions onto the complete physical command
+    # range.  In particular, the grasp frame needs roughly +/-pi/2 wrist
+    # rotations, so a 0.5-rad orientation scale makes valid goals unreachable.
+    command_scale: [0.8, 0.8, 1.0, 0.5, 0.7, 0.6, 3.1416, 3.1416, 3.1416, 1.0]
+    command_clip: [0.8, 0.8, 1.0, 0.5, 0.7, 0.6, 3.1416, 3.1416, 3.1416, 1.0]
     # Locomotion bounds come from the checkpoint's command training range.
-    command_lower: [-0.5, -0.5, -0.7854, -0.5, -0.7, -0.6, -0.5, -0.5, -0.5, -1.0]
-    command_upper: [0.8, 0.5, 0.7854, 0.5, 0.7, 0.6, 0.5, 0.5, 0.5, 1.0]
+    command_lower: [-0.5, -0.5, -0.7854, -0.5, -0.7, -0.6, -3.1416, -3.1416, -3.1416, -1.0]
+    command_upper: [0.8, 0.5, 0.7854, 0.5, 0.7, 0.6, 3.1416, 3.1416, 3.1416, 1.0]
     gripper_joint_name: "jointGripper"
     gripper_open_pos: -0.785
     gripper_closed_pos: 0.0
@@ -274,6 +279,10 @@ robot:
     lowlevel_obs_clip: 100.0
     lowlevel_action_clip: 100.0
     lowlevel_ik_damping: 0.05
+    # Keep the Cartesian steady-state inverse tied to the actual implicit arm drive.
+    lowlevel_arm_stiffness: 10000.0
+    lowlevel_arm_damping: 200.0
+    lowlevel_arm_effort_limit: 80.0
     lowlevel_arm_induced_pitch: 0.38
     lowlevel_goal_center_offset: [0.2, 0.0, 0.7]
     lowlevel_default_ee_goal_cart: [0.4619397663, 0.0, 0.1913417162]

@@ -47,9 +47,9 @@ import yaml
 from hydra.core.hydra_config import HydraConfig
 from hydra.utils import instantiate
 from loguru import logger
-from omegaconf import OmegaConf, open_dict
+from omegaconf import OmegaConf
 
-from gr00t.rl.utils.config_utils import register_rl_resolvers
+from gr00t.rl.utils.config_utils import configure_headless_physics, register_rl_resolvers
 
 register_rl_resolvers()
 
@@ -190,6 +190,7 @@ def main(config: OmegaConf):
     from datetime import timedelta
 
     from accelerate import Accelerator, DistributedDataParallelKwargs, InitProcessGroupKwargs
+    import torch
 
     # --- Distributed training setup ---
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
@@ -202,6 +203,16 @@ def main(config: OmegaConf):
     device = str(accelerator.device)
     if device == "cuda":
         device = "cuda:0"
+    if accelerator.device.type == "cuda":
+        torch.cuda.set_device(device)
+        print(
+            "[CUDA BINDING] "
+            f"rank={accelerator.process_index} "
+            f"local_rank={accelerator.local_process_index} "
+            f"accelerator_device={accelerator.device} "
+            f"current_device={torch.cuda.current_device()} "
+            f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}"
+        )
     config.multi_gpu = accelerator.num_processes > 1
     if config.multi_gpu:
         config.global_rank = accelerator.process_index
@@ -269,6 +280,21 @@ def main(config: OmegaConf):
 
         app_launcher = AppLauncher(args_cli)
         simulation_app = app_launcher.app
+        if accelerator.device.type == "cuda":
+            # Kit may change PyTorch's process-local current device while starting.
+            # Restore the rank device before any simulator or policy tensors are created.
+            torch.cuda.set_device(device)
+            current_device = torch.cuda.current_device()
+            expected_device = torch.device(device).index
+            if current_device != expected_device:
+                raise RuntimeError(
+                    f"CUDA binding mismatch after AppLauncher: expected {expected_device}, "
+                    f"got {current_device}"
+                )
+            print(
+                "[CUDA BINDING] "
+                f"rank={accelerator.process_index} post_launcher_device={current_device}"
+            )
 
     # --- Imports that must come after Isaac Sim initialization ---
     import wandb
@@ -322,14 +348,7 @@ def main(config: OmegaConf):
     pre_process_config(config)
 
     # --- Initialize environment ---
-    no_render_headless = (
-        config.headless
-        and not config.simulator.config.render_results
-        and not config.simulator.config.cameras.enable_cameras
-    )
-    with open_dict(config.simulator.config):
-        config.simulator.config.disable_visual_markers = no_render_headless
-        config.simulator.config.disable_visual_materials = no_render_headless
+    configure_headless_physics(config)
     config.env.config.save_rendering_dir = str(Path(config.experiment_dir) / "renderings_training")
     config.env.config.experiment_dir = str(Path(config.experiment_dir))
     env = custom_instantiate(config.env, device=device, _resolve=False)

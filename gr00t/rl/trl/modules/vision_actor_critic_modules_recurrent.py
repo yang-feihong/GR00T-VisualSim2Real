@@ -198,20 +198,14 @@ class VisionRecurrentActor(VisionActor):
 
     def act(self, obs_dict, episode_attnmask=None, masks=None, hidden_states=None, **kwargs):
         """Forward pass for sampling actions during training."""
-        try:
-            self.update_distribution(
-                obs_dict,
-                episode_attnmask=episode_attnmask,
-                last_step_only=False,
-                masks=masks,
-                hidden_states=hidden_states,
-                **kwargs,
-            )
-        except Exception as e:
-            import ipdb
-
-            ipdb.set_trace()
-            raise e
+        self.update_distribution(
+            obs_dict,
+            episode_attnmask=episode_attnmask,
+            last_step_only=False,
+            masks=masks,
+            hidden_states=hidden_states,
+            **kwargs,
+        )
         actions = self.distribution.sample()
         return {
             "actions": actions,

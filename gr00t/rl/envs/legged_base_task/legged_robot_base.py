@@ -679,6 +679,7 @@ class LeggedRobotBase(BaseTask):
         self._refresh_sim_tensors()
 
         self._pre_compute_observations_callback()
+        self._prepare_next_observations_callback()
         self._compute_observations()
         self._post_compute_observations_callback()
 
@@ -745,6 +746,7 @@ class LeggedRobotBase(BaseTask):
 
         if len(env_ids) > 0:
             self._pre_compute_observations_callback(env_ids=env_ids)
+        self._prepare_next_observations_callback()
         self._compute_observations()  # in some cases a simulation step might be required to refresh some obs (for example body positions)
 
         if self.config.get("use_z", False):
@@ -862,6 +864,10 @@ class LeggedRobotBase(BaseTask):
         clip_obs = self.config.normalization.clip_observations
         for obs_key, obs_val in self.obs_buf_dict.items():
             self.obs_buf_dict[obs_key] = torch.clip(obs_val, -clip_obs, clip_obs)
+
+    def _prepare_next_observations_callback(self):
+        """Commit task state needed to construct the next policy observation."""
+        pass
 
     def _check_termination(self):
         """Check if environments need to be reset"""
@@ -1211,7 +1217,17 @@ class LeggedRobotBase(BaseTask):
 
     def get_env_state_dict(self):
         state_dict = super().get_env_state_dict()
-        state_dict.update({k: v for k, v in self.log_dict.items()})
+        # log_dict primarily contains transient metrics.  Only entries backed
+        # by an environment attribute are restorable state; serializing every
+        # metric produced checkpoints full of keys that load_env_state_dict
+        # could never consume.
+        state_dict.update(
+            {
+                key: value.detach().cpu() if isinstance(value, torch.Tensor) else value
+                for key, value in self.log_dict.items()
+                if key in self.__dict__
+            }
+        )
         return state_dict
 
     def _post_config_observation_callback(self):

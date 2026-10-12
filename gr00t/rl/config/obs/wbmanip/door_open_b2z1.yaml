@@ -8,11 +8,18 @@ obs:
       dof_vel,
       projected_gravity,
       door_dof_pos,
+      door_latch_pos,
+      door_dof_vel,
       base_lin_vel,
       base_ang_vel,
       hand_force,
+      handle_contact_force,
+      b2z1_task_geometry,
+      b2z1_panel_interaction,
       stage,
       privileged_door_info,
+      privileged_door_geometry,
+      privileged_door_dynamics,
       delta_actions,
       hand_handle_transform,
       b2z1_commands,
@@ -24,11 +31,18 @@ obs:
       dof_vel,
       projected_gravity,
       door_dof_pos,
+      door_latch_pos,
+      door_dof_vel,
       base_lin_vel,
       base_ang_vel,
       hand_force,
+      handle_contact_force,
+      b2z1_task_geometry,
+      b2z1_panel_interaction,
       stage,
       privileged_door_info,
+      privileged_door_geometry,
+      privileged_door_dynamics,
       delta_actions,
       hand_handle_transform,
       transition,
@@ -47,11 +61,18 @@ obs:
     dof_vel: 0.05,
     projected_gravity: 1.0,
     door_dof_pos: 1.0,
+    door_latch_pos: 1.0,
+    door_dof_vel: 1.0,
     base_lin_vel: 1.0,
     base_ang_vel: 0.5,
     hand_force: 0.01,
+    handle_contact_force: 0.01,
+    b2z1_task_geometry: 1.0,
+    b2z1_panel_interaction: 1.0,
     stage: 1.0,
     privileged_door_info: 1.0,
+    privileged_door_geometry: 1.0,
+    privileged_door_dynamics: 1.0,
     delta_actions: 1.0,
     hand_handle_transform: 1.0,
     transition: 1.0,
@@ -68,11 +89,18 @@ obs:
     dof_vel: 0.2,
     projected_gravity: 0.0,
     door_dof_pos: 0.0,
+    door_latch_pos: 0.0,
+    door_dof_vel: 0.0,
     base_lin_vel: 0.0,
     base_ang_vel: 0.0,
     hand_force: 0.0,
+    handle_contact_force: 0.0,
+    b2z1_task_geometry: 0.0,
+    b2z1_panel_interaction: 0.0,
     stage: 0.0,
     privileged_door_info: 0.0,
+    privileged_door_geometry: 0.0,
+    privileged_door_dynamics: 0.0,
     delta_actions: 0.0,
     hand_handle_transform: 0.0,
     transition: 0.0,
@@ -93,15 +121,22 @@ obs:
 
   obs_dims:
     - dof_pos: ${robot.dof_obs_size}
-    - hand_force: 3
+    - hand_force: 6
     - relative_to_door: 9
     - dof_vel: ${robot.dof_obs_size}
     - projected_gravity: 3
     - door_dof_pos: 2
+    - door_latch_pos: 1
+    - door_dof_vel: 3
     - base_lin_vel: 3
     - base_ang_vel: 3
+    - handle_contact_force: 3
+    - b2z1_task_geometry: 26
+    - b2z1_panel_interaction: 12
     - stage: ${eval:'len(${env.config.max_stage_time})'}
     - privileged_door_info: 8
+    - privileged_door_geometry: 5
+    - privileged_door_dynamics: 5
     - hand_handle_transform: 9
     - b2z1_commands: 10
     - transition: 1
