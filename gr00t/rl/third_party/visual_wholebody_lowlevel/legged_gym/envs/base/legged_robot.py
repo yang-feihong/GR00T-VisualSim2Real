@@ -15,6 +15,7 @@ from legged_gym.utils.door_diagnostic_camera import (
     closed_leaf_pose,
     infer_push_side_leaf,
 )
+from legged_gym.utils.episode_rng import episode_uniform_rows
 from .legged_robot_config import LeggedRobotIsaacLabCfg
 import numpy as np
 
@@ -2892,9 +2893,15 @@ class LeggedRobotIsaacLab(DirectRLEnv):
                         raise RuntimeError(
                             "DoorMan arm reset range is empty after applying joint limits"
                         )
-                    joint_pos[:, self.arm_joint_ids] = lower + (upper - lower) * torch.rand(
-                        len(env_ids), self.arm_joint_ids.numel(), device=self.device
+                    arm_uniform = episode_uniform_rows(
+                        int(getattr(self.cfg, "seed", 0) or 0),
+                        env_ids,
+                        self.arm_joint_ids.numel(),
+                        "robot_arm_init",
+                        device=self.device,
+                        dtype=joint_pos.dtype,
                     )
+                    joint_pos[:, self.arm_joint_ids] = lower + (upper - lower) * arm_uniform
         if self.cfg.enable_doorman_scene and self.cfg.doorman_gripper_joint_init is not None:
             joint_pos[:, self.gripper_joint_ids] = float(self.cfg.doorman_gripper_joint_init)
         self.robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
@@ -2923,18 +2930,21 @@ class LeggedRobotIsaacLab(DirectRLEnv):
                 self.scene.env_origins[env_ids, 2]
                 + float(self.cfg.doorman_robot_init_height)
             )
-            camera_x = (
-                self.scene.env_origins[env_ids, 0:1]
-                + side_sign
-                * torch_rand_float(x_min, x_max, (len(env_ids), 1), self.device)
+            camera_uniform = episode_uniform_rows(
+                int(getattr(self.cfg, "seed", 0) or 0),
+                env_ids,
+                3,
+                "robot_camera_init",
+                device=self.device,
+                dtype=root_state.dtype,
             )
-            camera_y = (
-                self.scene.env_origins[env_ids, 1:2]
-                + torch_rand_float(y_min, y_max, (len(env_ids), 1), self.device)
+            camera_x = self.scene.env_origins[env_ids, 0:1] + side_sign * (
+                x_min + (x_max - x_min) * camera_uniform[:, 0:1]
             )
-            camera_yaw = torch_rand_float(
-                yaw_min, yaw_max, (len(env_ids), 1), self.device
-            ).squeeze(-1)
+            camera_y = self.scene.env_origins[env_ids, 1:2] + (
+                y_min + (y_max - y_min) * camera_uniform[:, 1:2]
+            )
+            camera_yaw = yaw_min + (yaw_max - yaw_min) * camera_uniform[:, 2]
             if side_sign > 0:
                 camera_yaw = torch.pi + camera_yaw
 

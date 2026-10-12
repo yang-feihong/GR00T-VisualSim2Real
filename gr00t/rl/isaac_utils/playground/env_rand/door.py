@@ -59,8 +59,20 @@ def _call_with_numpy_random_stream(rng, function, *args, **kwargs):
         return function(*args, **kwargs)
 
 
+def _episode_seeded_spawn(function):
+    def wrapped(prim_path, cfg, *args, **kwargs):
+        if cfg.random_seed is None:
+            return function(prim_path, cfg, *args, **kwargs)
+        rng = np.random.RandomState(int(cfg.random_seed) % (2**32))
+        with _numpy_random_stream(rng):
+            return function(prim_path, cfg, *args, **kwargs)
+
+    return wrapped
+
+
 @configclass
 class DoorSpawnerCfg(sim_utils.RigidObjectSpawnerCfg):
+    random_seed: Optional[int] = None
     articulation_props: sim_utils.ArticulationRootPropertiesCfg = None
     articulation_root_name: str = "root"
     door_width: tuple[float, float] = (0.8, 1.1)
@@ -202,6 +214,7 @@ def _update_joint_transform(stage, joint_path, prim0_path, prim1_path):
 
 
 @clone
+@_episode_seeded_spawn
 def spawn_door(
     prim_path: str,
     cfg: DoorSpawnerCfg,

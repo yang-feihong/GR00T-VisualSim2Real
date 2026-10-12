@@ -55,3 +55,23 @@ def test_batched_constrained_dls_matches_scalar_active_set():
         0.05,
     )
     np.testing.assert_allclose(actual.numpy(), expected, rtol=1.0e-10, atol=1.0e-10)
+
+
+def test_batch_size_one_uses_identical_tensor_semantics():
+    rng = np.random.default_rng(1701)
+    jacobian = torch.as_tensor(rng.normal(size=(1, 6, 6)), dtype=torch.float64)
+    pose_error = torch.as_tensor(rng.normal(size=(1, 6)), dtype=torch.float64)
+    positions = torch.as_tensor(rng.uniform(-0.9, 0.9, size=(1, 6)), dtype=torch.float64)
+    limits = torch.tensor([[-1.0, 1.0]] * 6, dtype=torch.float64)
+
+    single = batched_constrained_dls_delta(
+        jacobian, pose_error, positions, limits, 0.05
+    )
+    repeated = batched_constrained_dls_delta(
+        jacobian.repeat(7, 1, 1),
+        pose_error.repeat(7, 1),
+        positions.repeat(7, 1),
+        limits,
+        0.05,
+    )
+    torch.testing.assert_close(single[0], repeated[0], rtol=0.0, atol=0.0)

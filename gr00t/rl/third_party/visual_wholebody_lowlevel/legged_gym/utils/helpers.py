@@ -300,7 +300,6 @@ def _apply_cli_scene_args(cfg, args):
     if args.enable_doorman_scene:
         from legged_gym.envs.manip_loco.training_doorman_scene import (
             build_grouped_training_doorman_door_cfgs,
-            build_training_doorman_door_cfg,
         )
 
         cfg.enable_doorman_scene = True
@@ -318,20 +317,13 @@ def _apply_cli_scene_args(cfg, args):
             ]
         cfg.doorman_gripper_joint_init = args.doorman_gripper_joint_init
         cfg.doorman_randomize_door_init_state = bool(args.doorman_randomize_door_init_state)
-        if args.doorman_door_open_lr is None and int(args.num_envs) > 1:
-            cfg.doorman_door = None
-            cfg.doorman_door_groups = build_grouped_training_doorman_door_cfgs(
-                int(args.num_envs),
-                int(args.seed if args.seed is not None else 0),
-                physics_only=bool(getattr(args, "disable_rgb_cameras", False)),
-            )
-        else:
-            cfg.doorman_door_groups = None
-            cfg.doorman_door = build_training_doorman_door_cfg(
-                args.num_envs,
-                args.doorman_door_open_lr,
-                physics_only=bool(getattr(args, "disable_rgb_cameras", False)),
-            )
+        cfg.doorman_door = None
+        cfg.doorman_door_groups = build_grouped_training_doorman_door_cfgs(
+            int(args.num_envs),
+            int(args.seed if args.seed is not None else 0),
+            physics_only=bool(getattr(args, "disable_rgb_cameras", False)),
+            door_open_lr=args.doorman_door_open_lr,
+        )
         print("[doorman] using the high-level training DoorSpawner configuration")
 
 
@@ -405,43 +397,6 @@ def _apply_cli_rgb_camera_args(cfg, args):
         cfg.rgb_camera_update_period_s = float(sensor_update_period_s)
 
 
-def _enable_standard_self_collision_audit(cfg):
-    """Enable self-contact while filtering four intentional trunk overlaps."""
-    original_spawn = cfg.robot.spawn.func
-
-    def spawn_with_standard_filters(
-        prim_path, spawn_cfg, translation=None, orientation=None, **kwargs
-    ):
-        prim = original_spawn(
-            prim_path,
-            spawn_cfg,
-            translation=translation,
-            orientation=orientation,
-            **kwargs,
-        )
-        from pxr import Sdf, UsdPhysics
-
-        stage = prim.GetStage()
-        robot_root = str(prim.GetPath())
-        base_path = f"{robot_root}/base_link"
-        base_prim = stage.GetPrimAtPath(base_path)
-        if not base_prim.IsValid():
-            raise RuntimeError(f"standard-data collision body not found: {base_path}")
-        relation = UsdPhysics.FilteredPairsAPI.Apply(
-            base_prim
-        ).CreateFilteredPairsRel()
-        for leg in ("FR", "FL", "RR", "RL"):
-            thigh_path = f"{robot_root}/{leg}_thigh"
-            if not stage.GetPrimAtPath(thigh_path).IsValid():
-                raise RuntimeError(
-                    f"standard-data collision body not found: {thigh_path}"
-                )
-            relation.AddTarget(Sdf.Path(thigh_path))
-        return prim
-
-    cfg.robot.spawn.func = spawn_with_standard_filters
-
-
 def _apply_cli_play_args(cfg, args):
     cfg.enable_height_scan = False
     # DoorMan uses measured finger contact as the gate before handle
@@ -452,10 +407,11 @@ def _apply_cli_play_args(cfg, args):
     cfg.profile_env_step = bool(args.print_timing_breakdown)
     cfg.check_terminations = False
     cfg.robot.spawn.activate_contact_sensors = bool(cfg.enable_contact_sensor)
-    standard_dataset = bool(getattr(args, "standard_dataset_dir", None))
-    cfg.robot.spawn.articulation_props.enabled_self_collisions = standard_dataset
-    if standard_dataset:
-        _enable_standard_self_collision_audit(cfg)
+    # Playback and data collection share the validated AutoOpen dynamics.
+    # The imported B2Z1 geometry contains intentional adjacent-link overlap,
+    # so enabling articulation self-collision creates nonphysical link06/link04
+    # impulses and changes task capability.
+    cfg.robot.spawn.articulation_props.enabled_self_collisions = False
     cfg.env.teleop_debug = False
     cfg.commands.curriculum_playback_counter = (
         float(args.curriculum_iter)

@@ -56,6 +56,17 @@ def _phase_for_stage(stage_name: str) -> str:
     return "traversal"
 
 
+def _door_edge_gap_m(hinge_angle, hinge_to_free_edge, panel_half_thickness):
+    """Conservative free-edge distance from the closed door plane."""
+    angle = abs(float(hinge_angle))
+    reach = float(hinge_to_free_edge)
+    thickness = 2.0 * float(panel_half_thickness)
+    return max(
+        reach * np.sin(angle) - thickness * (1.0 - np.cos(angle)),
+        0.0,
+    )
+
+
 class AutoOpenStandardEpisodeCollector:
     """Record one environment without participating in AutoOpen decisions."""
 
@@ -186,8 +197,14 @@ class AutoOpenStandardEpisodeCollector:
         pending = self._pending
         post_state = result["state"]
         arm_target = _numpy(post_state["arm_position_target"])[0].astype(np.float32)
+        arm_raw_target = _numpy(post_state["arm_raw_position_target"])[0].astype(
+            np.float32
+        )
         base_dispatched = _numpy(post_state["base_command"])[0].astype(np.float32)
         gripper_dispatched = float(_numpy(post_state["gripper_command"])[0, 0])
+        gripper_actuator_target = float(
+            _numpy(post_state["gripper_actuator_target"])[0, 0]
+        )
         inactive, reset = self._mode_flags(pending["stage_name"], arm_target)
         target_pose = self._target_height_invariant_pose(
             pending["snapshot"], arm_target
@@ -213,11 +230,12 @@ class AutoOpenStandardEpisodeCollector:
         self.audit["ccd_triggered"].append(False)
         self.audit["base_command_pre"].append(pending["high"][:3])
         self.audit["base_command_dispatched"].append(base_dispatched)
-        self.audit["arm_joint_target_pre"].append(arm_target)
+        self.audit["arm_joint_target_pre"].append(arm_raw_target)
         self.audit["arm_joint_target_dispatched"].append(arm_target)
         self.audit["arm_joint_position_target"].append(arm_target)
         self.audit["gripper_target_pre"].append(float(pending["high"][9]))
         self.audit["gripper_target_dispatched"].append(gripper_dispatched)
+        self.audit["gripper_actuator_target"].append(gripper_actuator_target)
         self.audit["arm_teleop_inactive_pre"].append(inactive)
         self.audit["arm_teleop_inactive_dispatched"].append(inactive)
         self.audit["arm_reset_pre"].append(reset)
@@ -327,12 +345,14 @@ class AutoOpenStandardEpisodeCollector:
         )
         self.audit["door_hinge_position"].append(value["door_q"][controller.hinge_idx])
         self.audit["door_hinge_velocity"].append(value["door_qd"][controller.hinge_idx])
-        hinge_angle = abs(float(value["door_q"][controller.hinge_idx]))
-        door_edge_gap = (
-            float(controller.panel_hinge_to_free_edge) * (1.0 - np.cos(hinge_angle))
-            - 2.0 * float(controller.panel_half_thickness) * np.sin(hinge_angle)
+        hinge_angle = float(value["door_q"][controller.hinge_idx])
+        self.audit["door_edge_gap_m"].append(
+            _door_edge_gap_m(
+                hinge_angle,
+                controller.panel_hinge_to_free_edge,
+                controller.panel_half_thickness,
+            )
         )
-        self.audit["door_edge_gap_m"].append(max(door_edge_gap, 0.0))
         self.audit["handle_position"].append(value["door_q"][controller.handle_joint_idx])
         self.audit["handle_velocity"].append(value["door_qd"][controller.handle_joint_idx])
         latch = float(value["door_q"][controller.latch_joint_idx])

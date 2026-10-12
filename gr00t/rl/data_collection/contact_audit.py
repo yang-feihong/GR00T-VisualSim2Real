@@ -21,6 +21,8 @@ class ContactPairMaximum:
     max_normal_impulse: float
     max_contact_force: float
     max_penetration_depth: float
+    contact_point_world: tuple[float, float, float]
+    contact_normal_world: tuple[float, float, float]
     ccd_triggered: bool = False
 
 
@@ -54,6 +56,23 @@ def discover_contact_filter_paths(stage, env_id: int) -> tuple[str, ...]:
     return tuple(sorted(paths))
 
 
+def discover_contact_sensor_paths(stage, env_id: int) -> tuple[str, ...]:
+    """Find rigid actors with contact reporting already enabled by the scene."""
+    from pxr import PhysxSchema, UsdPhysics
+
+    env_prefix = f"/World/envs/env_{int(env_id)}/"
+    paths = set()
+    for prim in stage.Traverse():
+        path = prim.GetPath().pathString
+        if not path.startswith(env_prefix) or not prim.HasAPI(UsdPhysics.CollisionAPI):
+            continue
+        actor_path = _nearest_actor_path(prim)
+        actor = stage.GetPrimAtPath(actor_path)
+        if actor and actor.HasAPI(PhysxSchema.PhysxContactReportAPI):
+            paths.add(actor_path)
+    return tuple(sorted(paths))
+
+
 class SubstepContactAudit:
     """Collect per-pair maxima across every physics substep in one control tick."""
 
@@ -62,23 +81,25 @@ class SubstepContactAudit:
         source_view = getattr(sensor, "contact_physx_view", None)
         if source_view is None:
             raise RuntimeError("the robot contact sensor must be initialized before contact audit")
-        sensor_paths = tuple(str(path) for path in source_view.sensor_paths)
-        if not sensor_paths:
-            raise RuntimeError("the robot contact sensor resolved no sensor paths")
-
         stage = env.sim.stage
         env_ids = tuple(range(int(env.num_envs)))
+        source_sensor_paths = tuple(str(path) for path in source_view.sensor_paths)
         filters_by_env = {
             env_id: discover_contact_filter_paths(stage, env_id) for env_id in env_ids
         }
-        robot_paths_by_env = {
-            env_id: tuple(
+        sensors_by_env = {
+            env_id: tuple(sorted(set(discover_contact_sensor_paths(stage, env_id)) | {
                 path
-                for path in sensor_paths
+                for path in source_sensor_paths
                 if path.startswith(f"/World/envs/env_{env_id}/")
-            )
+            }))
             for env_id in env_ids
         }
+        sensor_paths = tuple(
+            path for env_id in env_ids for path in sensors_by_env[env_id]
+        )
+        if not sensor_paths:
+            raise RuntimeError("the scene resolved no contact-reporting rigid actors")
         patterns = []
         filter_patterns = []
         for sensor_path in sensor_paths:
@@ -87,7 +108,7 @@ class SubstepContactAudit:
             filters = tuple(
                 path
                 for path in sorted(
-                    set(filters_by_env[env_id]) | set(robot_paths_by_env[env_id])
+                    set(filters_by_env[env_id]) | set(sensors_by_env[env_id])
                 )
                 if path != sensor_path
             )
@@ -114,7 +135,15 @@ class SubstepContactAudit:
         self.filter_paths_by_sensor = tuple(tuple(paths) for paths in filter_patterns)
         self.expected_substeps = int(env.cfg.decimation)
         self._substeps = 0
-        self._maxima = defaultdict(lambda: [0.0, 0.0, 0.0])
+        self._maxima = defaultdict(
+            lambda: [
+                0.0,
+                0.0,
+                0.0,
+                (float("nan"),) * 3,
+                (float("nan"),) * 3,
+            ]
+        )
         self._scene = None
         self._original_scene_update = None
 
@@ -134,11 +163,18 @@ class SubstepContactAudit:
         self._maxima.clear()
 
     def capture_substep(self):
-        forces, _, _, separations, counts, starts = self.view.get_contact_data(
-            dt=self.physics_dt
+        impulses, points, normals, separations, counts, starts = (
+            self.view.get_contact_data(dt=1.0)
         )
-        forces = forces.reshape(-1)
-        separations = separations.reshape(-1)
+        impulses = impulses.reshape(-1).clone()
+        points = points.reshape(-1, 3).clone()
+        normals = normals.reshape(-1, 3).clone()
+        separations = separations.reshape(-1).clone()
+        counts = counts.clone()
+        starts = starts.clone()
+        pair_forces = self.view.get_contact_force_matrix(
+            dt=self.physics_dt
+        ).reshape(int(self.view.sensor_count), int(self.view.filter_count), 3)
         counts = counts.reshape(int(self.view.sensor_count), int(self.view.filter_count))
         starts = starts.reshape_as(counts)
         active = torch.nonzero(counts > 0, as_tuple=False)
@@ -146,12 +182,20 @@ class SubstepContactAudit:
             count = int(counts[sensor_index, filter_index].item())
             start = int(starts[sensor_index, filter_index].item())
             stop = start + count
-            pair_force = float(torch.max(forces[start:stop]).item())
+            patch_impulses = torch.abs(impulses[start:stop])
+            strongest = start + int(torch.argmax(patch_impulses).item())
+            normal_impulse = float(patch_impulses.max().item())
+            pair_force = float(
+                torch.linalg.vector_norm(pair_forces[sensor_index, filter_index]).item()
+            )
             penetration = float(torch.clamp(-separations[start:stop], min=0).max().item())
             body_a = self.sensor_paths[sensor_index]
             body_b = self.filter_paths_by_sensor[sensor_index][filter_index]
             values = self._maxima[(body_a, body_b)]
-            values[0] = max(values[0], pair_force * self.physics_dt)
+            if normal_impulse >= values[0]:
+                values[0] = normal_impulse
+                values[3] = tuple(float(value) for value in points[strongest].tolist())
+                values[4] = tuple(float(value) for value in normals[strongest].tolist())
             values[1] = max(values[1], pair_force)
             values[2] = max(values[2], penetration)
         self._substeps += 1

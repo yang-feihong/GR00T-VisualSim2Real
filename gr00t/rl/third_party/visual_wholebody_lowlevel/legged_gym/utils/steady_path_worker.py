@@ -90,6 +90,14 @@ def solve_steady_path_request(request):
             "pitch_deg": float(selected["pitch_deg"]),
             "orientation": end_orientation.astype(np.float32),
             "end_position": end.astype(np.float32),
+            "nominal_orientation": np.asarray(
+                selected.get("nominal_orientation", selected["orientation"]),
+                dtype=np.float32,
+            ),
+            "nominal_end_position": np.asarray(
+                selected.get("nominal_end_position", selected["end_position"]),
+                dtype=np.float32,
+            ),
             "exact": exact,
             "diagnostics": diagnostics,
         }

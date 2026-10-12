@@ -1,4 +1,5 @@
 import math
+import json
 
 import numpy as np
 import pytest
@@ -15,7 +16,9 @@ from gr00t.rl.data_collection.auto_open_standard import (
 from gr00t.rl.data_collection.auto_open_writer import (
     AutoOpenEpisodeData,
     _physical_acceptance_reasons,
+    aggregate_standard_shards,
 )
+from gr00t.rl.data_collection.auto_open_collector import _door_edge_gap_m
 
 
 def _yaw_quaternion(yaw):
@@ -141,6 +144,34 @@ def test_three_stage_boundaries_are_half_open_and_terminal_hold_is_retained():
     assert result.physical_phase[95:] == ("terminal_hold",) * 50
 
 
+def test_terminal_boundary_requires_actual_stability_not_only_zero_command():
+    frames = 146
+    base = np.zeros((frames, 3), dtype=np.float32)
+    base[10:40, 0] = 0.2
+    base[90:95, 0] = 0.2
+    inactive = np.ones(frames, dtype=bool)
+    inactive[65:90] = False
+    stable = np.ones(frames, dtype=bool)
+    stable[:96] = False
+    result = derive_stage_boundaries(
+        base_commands=base,
+        arm_teleop_inactive=inactive,
+        arm_reset=np.zeros(frames, dtype=bool),
+        gripper_targets=np.zeros(frames),
+        terminal_robot_clear=np.arange(frames) >= 90,
+        terminal_actual_stable=stable,
+    )
+    assert result.quarantine_reasons == ()
+    assert result.boundaries["traversal"].stop_frame == frames
+    assert result.physical_phase[-50:] == ("terminal_hold",) * 50
+
+
+def test_door_edge_gap_is_free_edge_distance_from_closed_plane():
+    assert _door_edge_gap_m(0.0, 1.0, 0.02) == 0.0
+    assert _door_edge_gap_m(0.03, 1.0, 0.02) > 0.02
+    assert _door_edge_gap_m(0.20, 1.0, 0.02) > _door_edge_gap_m(0.10, 1.0, 0.02)
+
+
 def test_boundary_validator_quarantines_missing_approach_stop():
     frames = 100
     base = np.zeros((frames, 3), dtype=np.float32)
@@ -166,7 +197,7 @@ def test_physical_validator_requires_standard_full_open_target():
     inactive[65:90] = False
     gripper = np.zeros(frames, dtype=np.float32)
     gripper[68:72] = -math.pi / 3
-    gripper[72:78] = -0.2
+    gripper[72:78] = 0.0
     gripper[78:84] = -math.pi / 3
     robot_clear = np.zeros(frames, dtype=bool)
     robot_clear[90:] = True
@@ -188,8 +219,40 @@ def test_physical_validator_requires_standard_full_open_target():
         "handle_position": np.full(frames, math.radians(25.0)),
         "door_edge_gap_m": np.full(frames, 0.03),
         "arm_joint_position": np.zeros((frames, 6), dtype=np.float32),
+        "arm_joint_velocity": np.zeros((frames, 6), dtype=np.float32),
+        "root_linear_velocity_world": np.zeros((frames, 3), dtype=np.float32),
+        "root_angular_velocity_world": np.zeros((frames, 3), dtype=np.float32),
+        "door_hinge_velocity": np.zeros(frames, dtype=np.float32),
+        "gripper_feedback": np.zeros(frames, dtype=np.float32),
+        "gripper_target_dispatched": gripper.copy(),
+        "gripper_actuator_target": gripper.copy(),
+        "arm_joint_target_dispatched": np.zeros((frames, 6), dtype=np.float32),
         "robot_clear_of_door": robot_clear,
     }
+    stages = np.full(frames, "THROUGH", dtype=object)
+    stages[:65] = "APPROACH"
+    stages[65:68] = "PREGRASP"
+    stages[68:72] = "OPEN_GRIPPER"
+    stages[72:78] = "GRASP_HANDLE"
+    stages[78:84] = "OPEN_AND_CLEAR"
+    stages[84:90] = "RESTORE_GRIPPER"
+    audit["autoopen_stage"] = stages
+    raw_contacts = (
+        {
+            "frame_index": 74,
+            "body_a_path": "/World/envs/env_0/Robot/link06",
+            "body_b_path": "/World/envs/env_0/door/door_handle",
+            "max_contact_force": 4.0,
+            "max_normal_impulse": 0.08,
+        },
+        {
+            "frame_index": 74,
+            "body_a_path": "/World/envs/env_0/Robot/gripperMover",
+            "body_b_path": "/World/envs/env_0/door/door_handle",
+            "max_contact_force": 3.0,
+            "max_normal_impulse": 0.06,
+        },
+    )
     episode = AutoOpenEpisodeData(
         episode_index=0,
         seed=1700,
@@ -197,11 +260,79 @@ def test_physical_validator_requires_standard_full_open_target():
         action=action,
         images={},
         raw_audit=audit,
+        raw_contacts=raw_contacts,
         event_frames={"handle_unlocked": 70, "door_gap_20mm": 77, "robot_clear": 90},
     )
     assert _physical_acceptance_reasons(episode, boundary) == []
+
+    zero_contact_episode = AutoOpenEpisodeData(
+        **{
+            **episode.__dict__,
+            "raw_contacts": tuple(
+                {**row, "max_contact_force": 0.0, "max_normal_impulse": 0.0}
+                for row in raw_contacts
+            ),
+        }
+    )
+    assert any(
+        reason.startswith("missing_nonzero_handle_contact_evidence")
+        for reason in _physical_acceptance_reasons(zero_contact_episode, boundary)
+    )
+
+    moving_audit = dict(audit)
+    moving_audit["root_linear_velocity_world"] = np.zeros(
+        (frames, 3), dtype=np.float32
+    )
+    moving_audit["root_linear_velocity_world"][-50:, 0] = 0.08
+    moving_episode = AutoOpenEpisodeData(
+        **{**episode.__dict__, "raw_audit": moving_audit}
+    )
+    assert "terminal_base_linear_velocity_not_stable" in _physical_acceptance_reasons(
+        moving_episode, boundary
+    )
 
     episode.action[68:72, 14] = -0.785
     assert "invalid_gripper_closed_open_grasp_open_closed_sequence" in (
         _physical_acceptance_reasons(episode, boundary)
     )
+
+
+def test_standard_shard_aggregation_writes_machine_and_chinese_reports(tmp_path):
+    root = tmp_path / "dataset"
+    report = {
+        "schema_version": "b2_z1_sim_door_v1",
+        "total_episodes": 1,
+        "accepted_episodes": 1,
+        "quarantined_episodes": 0,
+        "quarantine": [],
+        "exceptions": [],
+        "episodes": [
+            {
+                "seed": 1700,
+                "accepted": True,
+                "frames": 100,
+                "stage_duration_s": {"approach": 1.0},
+                "control": {"stage2_entry_q5_target_step_rad": 0.02},
+                "contacts": {"nonzero_handle_rows": 20},
+                "terminal_actual": {"window_frames": 50},
+                "reasons": [],
+            }
+        ],
+    }
+    path = root / "shards/episode-seed1700/meta/acceptance_report.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(report))
+
+    aggregate = aggregate_standard_shards(
+        root,
+        [1700],
+        camera_mount_position_noise_m=0.02,
+        camera_mount_rotation_noise_deg=15.0,
+        collection_wall_time_s=123,
+    )
+
+    assert aggregate["accepted_episodes"] == 1
+    manifest = json.loads((root / "manifest.json").read_text())
+    assert manifest["collection_wall_time_s"] == 123
+    assert manifest["acceptance_report"] == "acceptance_report.json"
+    assert (root / "DATASET_ACCEPTANCE_SUMMARY_ZH.md").is_file()

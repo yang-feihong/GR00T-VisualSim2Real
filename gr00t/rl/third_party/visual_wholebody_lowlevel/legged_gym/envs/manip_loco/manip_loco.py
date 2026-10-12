@@ -2,6 +2,9 @@ from __future__ import annotations
 import numpy as np
 import time
 import torch
+
+from .arm_control import advance_cartesian_joint_transition
+from .gripper_control import advance_gripper_actuator_targets
 from typing import Tuple
 from legged_gym.utils.math import orientation_error
 from legged_gym.utils.constrained_ik import batched_constrained_dls_delta
@@ -357,7 +360,17 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         self.teleop_arm_joint_limited_targets = (
             self.teleop_arm_joint_pos_targets.clone()
         )
+        self.teleop_cartesian_transition_targets = (
+            self.teleop_arm_joint_pos_targets.clone()
+        )
+        self.teleop_cartesian_transition_active = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
         self.gripper_pos_targets = self.default_dof_pos[:, self.gripper_joint_ids].clone()
+        self.gripper_actuator_targets = self.gripper_pos_targets.clone()
+        self.gripper_contact_hold_active = torch.zeros(
+            self.num_envs, dtype=torch.bool, device=self.device
+        )
         self.teleop_debug = bool(self.cfg.env.teleop_debug)
         self._teleop_ee_synced_once = False
         self._teleop_inputs_dirty = True
@@ -402,7 +415,9 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         self._profile_record("base_pre", max(base_pre_elapsed - rgb_pose_elapsed, 0.0))
 
         section_start = time.perf_counter()
+        self._update_gripper_actuator_targets()
         self._arm_pos_targets_for_step = None
+        self._arm_raw_pos_targets_for_step = None
         if self.ee_pos is not None and self.ee_j_eef is not None:
             self._arm_pos_targets_for_step = self._get_arm_pos_targets()
         if self.teleop_mode and torch.any(self.teleop_arm_joint_control_mask):
@@ -418,13 +433,12 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
             joint_mask = self.teleop_arm_joint_control_mask
             ee_mask = ~joint_mask
             if torch.any(ee_mask):
-                # Cartesian control already rate-limits the EE pose.  Applying
-                # another component-wise limiter to each freshly recomputed IK
-                # target changes the Cartesian path and can sweep the gripper
-                # into obstacles.  Keep only the mode-transition state synced.
                 self.teleop_arm_joint_limited_targets[ee_mask] = self.dof_pos[
                     ee_mask
                 ][:, self.arm_joint_ids]
+            self._arm_raw_pos_targets_for_step = (
+                self._arm_pos_targets_for_step.clone()
+            )
             if torch.any(joint_mask):
                 max_step = self.teleop_arm_joint_speed_limits.unsqueeze(0) * float(
                     self.dt
@@ -444,6 +458,18 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
                     self.teleop_arm_joint_limited_targets,
                     self._arm_pos_targets_for_step,
                 )
+            transition_mask = self.teleop_cartesian_transition_active & ee_mask
+            if torch.any(transition_mask):
+                (
+                    self._arm_pos_targets_for_step,
+                    self.teleop_cartesian_transition_targets,
+                    self.teleop_cartesian_transition_active,
+                ) = advance_cartesian_joint_transition(
+                    self._arm_pos_targets_for_step,
+                    self.teleop_cartesian_transition_targets,
+                    transition_mask,
+                    self.teleop_arm_joint_speed_limits * float(self.dt),
+                )
         self._profile_record("arm_target", time.perf_counter() - section_start)
         self._profile_record("pre_total", max(time.perf_counter() - profile_start - rgb_pose_elapsed, 0.0))
 
@@ -462,8 +488,8 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
             ).unsqueeze(1)
             self.commands[:] *= active_mask
 
-        # When joint-controlling the arm, keep EE target synced
-        # to actual pose so switching back to EE mode does not jump.
+        # When joint-controlling the arm, keep EE target synced to actual pose
+        # so switching back to EE mode does not jump.
         joint_ids = torch.nonzero(
             self.teleop_arm_joint_control_mask, as_tuple=False
         ).squeeze(-1)
@@ -648,6 +674,30 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         self._clip_teleop_targets()
         self._update_effective_teleop_inputs(force=True)
 
+    def _update_gripper_actuator_targets(self):
+        """Execute semantic open/close commands with contact-aware holding."""
+        finger_forces = torch.zeros(
+            self.num_envs, 2, dtype=self.dof_pos.dtype, device=self.device
+        )
+        handle_sensors = list(getattr(self, "handle_contact_sensors", []))
+        if len(handle_sensors) == 2:
+            for finger_idx, sensor in enumerate(handle_sensors):
+                force_matrix = getattr(sensor.data, "force_matrix_w", None)
+                if force_matrix is None or force_matrix.shape[1:3] != (1, 1):
+                    break
+                finger_forces[:, finger_idx] = torch.linalg.vector_norm(
+                    force_matrix[:, 0, 0], dim=-1
+                )
+        self.gripper_actuator_targets, self.gripper_contact_hold_active = (
+            advance_gripper_actuator_targets(
+                self.gripper_pos_targets,
+                self.dof_pos[:, self.gripper_joint_ids],
+                self.gripper_actuator_targets,
+                self.gripper_contact_hold_active,
+                finger_forces,
+            )
+        )
+
     def get_control_state(self) -> dict:
         """Return a device-local snapshot of state needed by scripted controllers."""
         if self.ee_pos is None:
@@ -741,12 +791,20 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
                 if self._arm_pos_targets_for_step is None
                 else self._arm_pos_targets_for_step
             ).detach().clone(),
+            "arm_raw_position_target": (
+                self.target_pos[:, self.arm_joint_ids]
+                if self._arm_raw_pos_targets_for_step is None
+                else self._arm_raw_pos_targets_for_step
+            ).detach().clone(),
             "applied_torque": self.torques.detach().clone(),
             "ee_jacobian_arm": None if self.ee_j_eef is None else self.ee_j_eef.detach().clone(),
             "gripper_position": self.dof_pos[:, self.gripper_joint_ids].mean(
                 dim=1, keepdim=True
             ).detach().clone(),
             "gripper_command": self.gripper_pos_targets.mean(dim=1, keepdim=True).detach().clone(),
+            "gripper_actuator_target": self.gripper_actuator_targets.mean(
+                dim=1, keepdim=True
+            ).detach().clone(),
             # Net contact force on the robot bodies.  The scripted DoorMan
             # controller uses this as physical evidence before turning the
             # handle; a closed command alone is not a grasp.
@@ -968,6 +1026,32 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         if self.num_envs == 1:
             print(f"[teleop] arm control mode: {mode}")
 
+    def begin_cartesian_transition(self, env_ids=None):
+        """Enter Cartesian control continuously from measured arm joints."""
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device)
+        else:
+            env_ids = torch.as_tensor(
+                env_ids, device=self.device, dtype=torch.long
+            ).reshape(-1)
+        if env_ids.numel() == 0:
+            return
+        actual = self.dof_pos[env_ids][:, self.arm_joint_ids]
+        self.teleop_cartesian_transition_targets[env_ids] = actual
+        self.teleop_cartesian_transition_active[env_ids] = True
+
+    def cartesian_transition_is_active(self, env_ids=None):
+        if env_ids is None:
+            active = self.teleop_cartesian_transition_active
+        else:
+            env_ids = torch.as_tensor(
+                env_ids, device=self.device, dtype=torch.long
+            ).reshape(-1)
+            active = self.teleop_cartesian_transition_active[env_ids]
+        if active.numel() == 1:
+            return bool(active.item())
+        return active.clone()
+
     def _reset_teleop_ee_goal_to_default(self):
         self.curr_ee_goal_sphere[:] = self.reset_init_ee_sphere[:]
         self.teleop_raw_ee_goal_cart[:] = sphere2cart(self.curr_ee_goal_sphere)
@@ -984,6 +1068,14 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         self.teleop_arm_joint_limited_targets[env_ids] = self.dof_pos[env_ids][
             :, self.arm_joint_ids
         ]
+        self.teleop_cartesian_transition_targets[env_ids] = self.dof_pos[env_ids][
+            :, self.arm_joint_ids
+        ]
+        self.teleop_cartesian_transition_active[env_ids] = False
+        reset_gripper = self.dof_pos[env_ids][:, self.gripper_joint_ids]
+        self.gripper_pos_targets[env_ids] = reset_gripper
+        self.gripper_actuator_targets[env_ids] = reset_gripper
+        self.gripper_contact_hold_active[env_ids] = False
 
     def _get_omnidirectional_goal_sampling_bounds(self, goal_yaw):
         rear_weight = self._get_omnidirectional_rear_weight(goal_yaw)
@@ -1409,92 +1501,6 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         u = torch.bmm(j_eef_T, torch.linalg.solve(A, dpose))#.view(self.num_envs, 6)
         return u.squeeze(-1)
 
-    @staticmethod
-    def _quat_mul_np_wxyz(q, r):
-        w1, x1, y1, z1 = q
-        w2, x2, y2, z2 = r
-        return np.asarray(
-            (
-                w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
-                w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
-                w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
-                w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
-            ),
-            dtype=np.float32,
-        )
-
-    def _get_arm_pos_targets_single_env_cpu(self) -> torch.Tensor:
-        ee_pos = self.ee_pos[0].detach().cpu().numpy().astype(np.float32, copy=False)
-        ee_orn = self.ee_orn[0].detach().cpu().numpy().astype(np.float32, copy=False)
-        goal_pos = self.curr_ee_goal_cart_world[0].detach().cpu().numpy().astype(np.float32, copy=False)
-        goal_orn = self.ee_goal_orn_quat[0].detach().cpu().numpy().astype(np.float32, copy=False)
-        jac = self.ee_j_eef[0].detach().cpu().numpy().astype(np.float32, copy=False)
-        arm_q = self.dof_pos[0, self.arm_joint_ids].detach().cpu().numpy().astype(np.float32, copy=False)
-
-        ee_orn_norm = ee_orn / max(float(np.linalg.norm(ee_orn)), 1.0e-8)
-        current_conj = ee_orn_norm.copy()
-        current_conj[1:] *= -1.0
-        q_r = self._quat_mul_np_wxyz(goal_orn, current_conj)
-        sign = 1.0 if q_r[0] >= 0.0 else -1.0
-
-        dpose = np.empty((6, 1), dtype=np.float32)
-        dpose[:3, 0] = goal_pos - ee_pos
-        dpose[3:, 0] = q_r[1:4] * sign
-        if self.teleop_mode:
-            orientation_gain = float(
-                getattr(self.cfg.goal_ee, "teleop_ik_orientation_gain", 1.0)
-            )
-            dpose[3:, 0] *= orientation_gain
-
-        damping_sq = np.float32(float(self.cfg.goal_ee.ik_damping) ** 2)
-        # Solve the damped least-squares step inside the articulation limits.
-        # The unconstrained pseudoinverse can request several radians beyond a
-        # wrist limit.  Once the actuator saturates, repeatedly solving around
-        # that impossible target prevents the remaining joints from taking up
-        # the Cartesian error and traps IK on the wrong branch.
-        limits = self.dof_pos_limits[self.arm_joint_ids].detach().cpu().numpy()
-        margin = np.float32(1.0e-3)
-        lower_delta = limits[:, 0] + margin - arm_q
-        upper_delta = limits[:, 1] - margin - arm_q
-        delta_q = np.zeros_like(arm_q)
-        free = np.ones(arm_q.shape[0], dtype=bool)
-        rhs = dpose[:, 0]
-        for _ in range(arm_q.shape[0] + 1):
-            if not np.any(free):
-                break
-            active = ~free
-            residual = rhs - jac[:, active] @ delta_q[active]
-            j_free = jac[:, free]
-            normal = j_free.T @ j_free
-            normal.flat[:: normal.shape[0] + 1] += damping_sq
-            candidate = np.linalg.solve(normal, j_free.T @ residual)
-            free_indices = np.flatnonzero(free)
-            below = candidate < lower_delta[free]
-            above = candidate > upper_delta[free]
-            if not np.any(below | above):
-                delta_q[free] = candidate
-                break
-            violating_indices = free_indices[below | above]
-            violating_values = candidate[below | above]
-            delta_q[violating_indices] = np.where(
-                violating_values < lower_delta[violating_indices],
-                lower_delta[violating_indices],
-                upper_delta[violating_indices],
-            )
-            free[violating_indices] = False
-        target_np = np.clip(arm_q + delta_q, limits[:, 0] + margin, limits[:, 1] - margin).reshape(1, -1)
-
-        target_buf = getattr(self, "_arm_pos_target_cpu_fast_buf", None)
-        if (
-            target_buf is None
-            or target_buf.shape != (1, self.arm_joint_ids.numel())
-            or target_buf.device != self.device
-            or target_buf.dtype != self.dof_pos.dtype
-        ):
-            target_buf = torch.empty(1, self.arm_joint_ids.numel(), device=self.device, dtype=self.dof_pos.dtype)
-            self._arm_pos_target_cpu_fast_buf = target_buf
-        target_buf.copy_(torch.from_numpy(target_np).to(device=self.device, dtype=self.dof_pos.dtype))
-        return target_buf
 
     def _get_arm_pos_targets(self) -> torch.Tensor:
         """Arm target generation.
@@ -1507,9 +1513,6 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         """
         if self.ee_pos is None or self.ee_orn is None or self.ee_j_eef is None:
             return self.target_pos[:, self.arm_joint_ids]
-
-        if self.teleop_mode and self.num_envs == 1:
-            return self._get_arm_pos_targets_single_env_cpu()
 
         dpos = self.curr_ee_goal_cart_world - self.ee_pos
         ee_orn_norm = self.ee_orn / torch.norm(self.ee_orn, dim=-1, keepdim=True).clamp_min(1e-8)
@@ -1642,7 +1645,7 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         section_start = time.perf_counter()
         pos_targets = self._joint_position_target_buf
         pos_targets.copy_(self.dof_pos)
-        pos_targets[:, self.gripper_joint_ids] = self.gripper_pos_targets
+        pos_targets[:, self.gripper_joint_ids] = self.gripper_actuator_targets
 
         if self._arm_pos_targets_for_step is not None:
             pos_targets[:, self.arm_joint_ids] = self._arm_pos_targets_for_step

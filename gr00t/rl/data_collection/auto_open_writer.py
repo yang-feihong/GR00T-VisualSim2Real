@@ -17,6 +17,12 @@ from .auto_open_standard import (
     OBSERVATION_STATE_NAMES,
     SCHEMA_VERSION,
     TASK_PLACEHOLDER,
+    TERMINAL_ARM_JOINT_SPEED_RAD_S,
+    TERMINAL_BASE_ANGULAR_SPEED_RAD_S,
+    TERMINAL_BASE_LINEAR_SPEED_M_S,
+    TERMINAL_DOOR_SPEED_RAD_S,
+    TERMINAL_GRIPPER_SPEED_RAD_S,
+    TERMINAL_STABILITY_FRAMES,
     derive_stage_boundaries,
 )
 
@@ -155,6 +161,8 @@ def _write_raw_contacts(path: Path, rows: Sequence[Mapping[str, Any]]):
             ("max_normal_impulse", pa.float32()),
             ("max_contact_force", pa.float32()),
             ("max_penetration_depth", pa.float32()),
+            ("contact_point_world", pa.list_(pa.float32(), 3)),
+            ("contact_normal_world", pa.list_(pa.float32(), 3)),
             ("ccd_triggered", pa.bool_()),
         ]
     )
@@ -272,6 +280,15 @@ def _physical_acceptance_reasons(episode, boundary):
         "handle_position",
         "door_edge_gap_m",
         "arm_joint_position",
+        "arm_joint_velocity",
+        "root_linear_velocity_world",
+        "root_angular_velocity_world",
+        "door_hinge_velocity",
+        "gripper_feedback",
+        "gripper_target_dispatched",
+        "gripper_actuator_target",
+        "arm_joint_target_dispatched",
+        "autoopen_stage",
         "robot_clear_of_door",
     )
     missing = [name for name in required if name not in audit]
@@ -294,6 +311,26 @@ def _physical_acceptance_reasons(episode, boundary):
         reasons.append("camera_timestamps_outside_10ms_tolerance")
 
     action = np.asarray(episode.action, dtype=np.float32)
+    stages = np.asarray(audit["autoopen_stage"], dtype=str)
+    arm_targets = np.asarray(audit["arm_joint_target_dispatched"], dtype=np.float64)
+    gripper_dispatched = np.asarray(
+        audit["gripper_target_dispatched"], dtype=np.float64
+    )
+    stage2_entries = np.flatnonzero(
+        (stages[1:] == "PREGRASP") & (stages[:-1] == "APPROACH")
+    ) + 1
+    if len(stage2_entries) != 1:
+        reasons.append(f"stage2_entry_count:{len(stage2_entries)}")
+    else:
+        stage2_entry = int(stage2_entries[0])
+        q5_step = abs(
+            float(arm_targets[stage2_entry, 4] - arm_targets[stage2_entry - 1, 4])
+        )
+        if q5_step > 0.021:
+            reasons.append(f"stage2_q5_target_discontinuity:{q5_step:.6f}")
+    grasp_hold = np.isin(stages, ("GRASP_HANDLE", "TURN_HANDLE"))
+    if np.any(np.abs(gripper_dispatched[grasp_hold]) > 1.0e-6):
+        reasons.append("grasp_hold_high_level_target_not_zero")
     if action.shape == (frames, 25):
         inactive = action[:, 3] > 0.5
         reset = action[:, 4] > 0.5
@@ -346,7 +383,156 @@ def _physical_acceptance_reasons(episode, boundary):
             reasons.append("q6_outside_0p2rad_before_traversal")
     if episode.event_frames.get("robot_clear") is None:
         reasons.append("robot_never_cleared_door_plane")
+
+    handle_boundary = boundary.boundaries.get("handle_press")
+    if handle_boundary is not None:
+        physical_fingers = {"link06": False, "gripperMover": False}
+        for row in episode.raw_contacts:
+            frame = int(row.get("frame_index", -1))
+            if not (handle_boundary.start_frame <= frame < handle_boundary.stop_frame):
+                continue
+            pair = (
+                str(row.get("body_a_path", "")),
+                str(row.get("body_b_path", "")),
+            )
+            if not any("door_handle" in path for path in pair):
+                continue
+            nonzero = (
+                float(row.get("max_contact_force", 0.0)) > 1.0e-6
+                or float(row.get("max_normal_impulse", 0.0)) > 1.0e-9
+            )
+            if not nonzero:
+                continue
+            for finger in physical_fingers:
+                if any(finger in path for path in pair):
+                    physical_fingers[finger] = True
+        missing_fingers = [name for name, seen in physical_fingers.items() if not seen]
+        if missing_fingers:
+            reasons.append(
+                "missing_nonzero_handle_contact_evidence:" + ",".join(missing_fingers)
+            )
+
+    if frames < TERMINAL_STABILITY_FRAMES:
+        reasons.append("terminal_actual_stability_window_missing")
+    else:
+        terminal = slice(frames - TERMINAL_STABILITY_FRAMES, frames)
+        root_linear = np.asarray(audit["root_linear_velocity_world"], dtype=np.float64)[terminal]
+        root_angular = np.asarray(audit["root_angular_velocity_world"], dtype=np.float64)[terminal]
+        arm_velocity = np.asarray(audit["arm_joint_velocity"], dtype=np.float64)[terminal]
+        hinge_velocity = np.asarray(audit["door_hinge_velocity"], dtype=np.float64)[terminal]
+        gripper_feedback = np.asarray(audit["gripper_feedback"], dtype=np.float64)[terminal]
+        gripper_velocity = np.abs(np.diff(gripper_feedback, prepend=gripper_feedback[0])) * CONTROL_HZ
+        if np.max(np.linalg.norm(root_linear, axis=1)) >= TERMINAL_BASE_LINEAR_SPEED_M_S:
+            reasons.append("terminal_base_linear_velocity_not_stable")
+        if np.max(np.linalg.norm(root_angular, axis=1)) >= TERMINAL_BASE_ANGULAR_SPEED_RAD_S:
+            reasons.append("terminal_base_angular_velocity_not_stable")
+        if np.max(np.abs(arm_velocity)) >= TERMINAL_ARM_JOINT_SPEED_RAD_S:
+            reasons.append("terminal_arm_velocity_not_stable")
+        if np.max(np.abs(hinge_velocity)) >= TERMINAL_DOOR_SPEED_RAD_S:
+            reasons.append("terminal_door_velocity_not_stable")
+        if np.max(gripper_velocity) >= TERMINAL_GRIPPER_SPEED_RAD_S:
+            reasons.append("terminal_gripper_velocity_not_stable")
     return reasons
+
+
+def _episode_acceptance_metrics(episode, boundary, reasons):
+    audit = episode.raw_audit
+    frames = len(episode.observation_state)
+
+    def array(name, width=None):
+        default = np.zeros((frames, width), dtype=np.float64) if width else np.zeros(frames)
+        return np.asarray(audit.get(name, default), dtype=np.float64)
+
+    sim_ns = array("sim_time_ns")
+    base_ns = array("base_image_capture_time_ns")
+    wrist_ns = array("wrist_image_capture_time_ns")
+    arm_targets = array("arm_joint_target_dispatched", 6)
+    arm_velocity = array("arm_joint_velocity", 6)
+    base_command = array("base_command_dispatched", 3)
+    root_linear = array("root_linear_velocity_world", 3)
+    root_angular = array("root_angular_velocity_world", 3)
+    contacts = list(episode.raw_contacts)
+    handle_contacts = [
+        row for row in contacts
+        if "door_handle" in str(row.get("body_a_path", ""))
+        or "door_handle" in str(row.get("body_b_path", ""))
+    ]
+    nonzero_handle_contacts = [
+        row for row in handle_contacts
+        if float(row.get("max_contact_force", 0.0)) > 1.0e-6
+        or float(row.get("max_normal_impulse", 0.0)) > 1.0e-9
+    ]
+    stage_durations = {
+        name: (item.stop_frame - item.start_frame) / CONTROL_HZ
+        for name, item in (boundary.boundaries.items() if boundary is not None else ())
+    }
+    target_steps = np.abs(np.diff(arm_targets, axis=0)) if frames > 1 else np.zeros((0, 6))
+    stages = np.asarray(audit.get("autoopen_stage", [""] * frames), dtype=str)
+    stage2_entries = np.flatnonzero(
+        (stages[1:] == "PREGRASP") & (stages[:-1] == "APPROACH")
+    ) + 1
+    stage2_entry = int(stage2_entries[0]) if len(stage2_entries) == 1 else None
+    terminal_slice = slice(max(0, frames - CONTROL_HZ), frames)
+    return {
+        "episode_index": int(episode.episode_index),
+        "seed": int(episode.seed),
+        "accepted": not bool(reasons),
+        "frames": int(frames),
+        "duration_s": frames / CONTROL_HZ,
+        "stage_duration_s": stage_durations,
+        "timing": {
+            "nominal_hz": CONTROL_HZ,
+            "max_sim_tick_jitter_ns": int(
+                np.max(np.abs(np.diff(sim_ns) - 20_000_000)) if frames > 1 else 0
+            ),
+            "max_camera_skew_ns": int(
+                np.max(np.abs(base_ns - wrist_ns)) if frames else 0
+            ),
+        },
+        "control": {
+            "max_arm_target_step_rad": (
+                np.max(target_steps, axis=0).tolist() if len(target_steps) else [0.0] * 6
+            ),
+            "max_q5_target_step_rad": float(
+                np.max(target_steps[:, 4]) if len(target_steps) else 0.0
+            ),
+            "stage2_entry_q5_target_step_rad": (
+                float(abs(arm_targets[stage2_entry, 4] - arm_targets[stage2_entry - 1, 4]))
+                if stage2_entry is not None
+                else None
+            ),
+            "stage2_entry_q5_actual_speed_rad_s": (
+                float(abs(arm_velocity[stage2_entry, 4]))
+                if stage2_entry is not None
+                else None
+            ),
+            "max_arm_actual_speed_rad_s": float(np.max(np.abs(arm_velocity))) if frames else 0.0,
+            "max_base_command_abs": np.max(np.abs(base_command), axis=0).tolist() if frames else [0.0] * 3,
+        },
+        "physical_result": {
+            "max_handle_angle_deg": float(np.rad2deg(np.max(np.abs(array("handle_position"))))) if frames else 0.0,
+            "max_door_gap_m": float(np.max(array("door_edge_gap_m"))) if frames else 0.0,
+            "final_door_angle_deg": float(np.rad2deg(array("door_hinge_position")[-1])) if frames else 0.0,
+            "robot_clear_frame": episode.event_frames.get("robot_clear"),
+        },
+        "contacts": {
+            "rows": len(contacts),
+            "handle_rows": len(handle_contacts),
+            "nonzero_handle_rows": len(nonzero_handle_contacts),
+            "max_force_n": max((float(row.get("max_contact_force", 0.0)) for row in contacts), default=0.0),
+            "max_normal_impulse_ns": max((float(row.get("max_normal_impulse", 0.0)) for row in contacts), default=0.0),
+            "max_penetration_m": max((float(row.get("max_penetration_depth", 0.0)) for row in contacts), default=0.0),
+        },
+        "terminal_actual": {
+            "window_frames": min(frames, CONTROL_HZ),
+            "max_base_linear_speed_m_s": float(np.max(np.linalg.norm(root_linear[terminal_slice], axis=1))) if frames else 0.0,
+            "max_base_angular_speed_rad_s": float(np.max(np.linalg.norm(root_angular[terminal_slice], axis=1))) if frames else 0.0,
+            "max_arm_speed_rad_s": float(np.max(np.abs(arm_velocity[terminal_slice]))) if frames else 0.0,
+        },
+        "events": dict(episode.event_frames),
+        "reasons": list(reasons),
+        "exceptions": [],
+    }
 
 
 class AutoOpenDatasetWriter:
@@ -362,6 +548,7 @@ class AutoOpenDatasetWriter:
         self._states = []
         self._actions = []
         self._global_frames = 0
+        self._episode_reports = []
 
     def write_episode(self, episode: AutoOpenEpisodeData):
         state = np.asarray(episode.observation_state, dtype=np.float32)
@@ -397,6 +584,24 @@ class AutoOpenDatasetWriter:
 
         boundary = None
         if state.shape == (frames, 58) and action.shape == (frames, 25):
+            root_linear = np.asarray(
+                episode.raw_audit.get("root_linear_velocity_world", np.zeros((frames, 3)))
+            )
+            root_angular = np.asarray(
+                episode.raw_audit.get("root_angular_velocity_world", np.zeros((frames, 3)))
+            )
+            arm_velocity = np.asarray(
+                episode.raw_audit.get("arm_joint_velocity", np.zeros((frames, 6)))
+            )
+            hinge_velocity = np.asarray(
+                episode.raw_audit.get("door_hinge_velocity", np.zeros(frames))
+            )
+            actual_stable = (
+                (np.linalg.norm(root_linear, axis=1) < TERMINAL_BASE_LINEAR_SPEED_M_S)
+                & (np.linalg.norm(root_angular, axis=1) < TERMINAL_BASE_ANGULAR_SPEED_RAD_S)
+                & (np.max(np.abs(arm_velocity), axis=1) < TERMINAL_ARM_JOINT_SPEED_RAD_S)
+                & (np.abs(hinge_velocity) < TERMINAL_DOOR_SPEED_RAD_S)
+            )
             boundary = derive_stage_boundaries(
                 base_commands=action[:, :3],
                 arm_teleop_inactive=action[:, 3].astype(bool),
@@ -405,13 +610,16 @@ class AutoOpenDatasetWriter:
                 terminal_robot_clear=np.asarray(
                     episode.raw_audit.get("robot_clear_of_door", np.zeros(frames)), dtype=bool
                 ),
+                terminal_actual_stable=actual_stable,
             )
             reasons.extend(boundary.quarantine_reasons)
             if boundary.boundaries:
                 reasons.extend(_physical_acceptance_reasons(episode, boundary))
-        if self.simulation_provenance.get("self_collisions_enabled") is not True:
-            reasons.append("self_collision_diagnostics_disabled")
+        if self.simulation_provenance.get("self_collisions_enabled") is True:
+            reasons.append("self_collision_dynamics_changed")
         reasons = sorted(set(reasons))
+        episode_report = _episode_acceptance_metrics(episode, boundary, reasons)
+        self._episode_reports.append(episode_report)
         chunk = episode.episode_index // 1000
         chunk_name = f"chunk-{chunk:03d}"
         episode_name = f"episode_{episode.episode_index:06d}"
@@ -509,6 +717,7 @@ class AutoOpenDatasetWriter:
                 "quarantined_episodes": len(self.quarantined),
                 "quarantine": self.quarantined,
                 "exceptions": [],
+                "episodes": self._episode_reports,
             },
         )
         features = {
@@ -549,6 +758,32 @@ class AutoOpenDatasetWriter:
         for item in self.quarantined:
             for reason in item["reasons"]:
                 reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        stage_values = {}
+        for report in self._episode_reports:
+            for name, value in report["stage_duration_s"].items():
+                stage_values.setdefault(name, []).append(float(value))
+        stage_summary = {
+            name: {
+                "episodes": len(values),
+                "min_s": min(values),
+                "median_s": float(np.median(values)),
+                "max_s": max(values),
+            }
+            for name, values in stage_values.items()
+        }
+        rows = [
+            "| seed | 结果 | 帧数 | Stage2 入口 q5 目标步进(rad) | 把手最大角(deg) | 门缝最大值(m) | 把手非零接触行 | 原因 |",
+            "|---:|---|---:|---:|---:|---:|---:|---|",
+        ]
+        for report in self._episode_reports:
+            rows.append(
+                f"| {report['seed']} | {'通过' if report['accepted'] else '隔离'} | "
+                f"{report['frames']} | {report['control']['stage2_entry_q5_target_step_rad'] or 0.0:.6f} | "
+                f"{report['physical_result']['max_handle_angle_deg']:.3f} | "
+                f"{report['physical_result']['max_door_gap_m']:.4f} | "
+                f"{report['contacts']['nonzero_handle_rows']} | "
+                f"{'; '.join(report['reasons']) or '无'} |"
+            )
         summary.write_text(
             "# AutoOpen 数据验收摘要\n\n"
             f"- 标准版本：`{SCHEMA_VERSION}`\n"
@@ -556,7 +791,14 @@ class AutoOpenDatasetWriter:
             f"- 通过：`{len(self.accepted)}`\n"
             f"- 隔离：`{len(self.quarantined)}`\n"
             f"- 总训练帧：`{self._global_frames}`\n"
-            f"- 隔离原因：`{json.dumps(reason_counts, ensure_ascii=False)}`\n",
+            f"- 三阶段时长统计：`{json.dumps(stage_summary, ensure_ascii=False)}`\n"
+            f"- 隔离原因：`{json.dumps(reason_counts, ensure_ascii=False)}`\n"
+            "- 频率：状态、动作及两路相机均为 50 Hz；逐 episode 抖动和跨相机偏差见机器报告。\n"
+            "- 接触：逐 episode 报告包含总接触、把手接触、非零力/冲量接触及最大穿透。\n"
+            "- 例外：`exceptions: []`\n\n"
+            "## Episode 明细\n\n"
+            + "\n".join(rows)
+            + "\n",
             encoding="utf-8",
         )
 
@@ -567,3 +809,163 @@ def file_sha256(path: Path):
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def aggregate_standard_shards(
+    root: Path,
+    seeds: Sequence[int],
+    *,
+    camera_mount_position_noise_m: float,
+    camera_mount_rotation_noise_deg: float,
+    collection_wall_time_s: int,
+):
+    """Write dataset-level delivery reports for independently collected shards."""
+    root = Path(root)
+    shard_rows = []
+    episode_rows = []
+    quarantine = []
+    exceptions = []
+    for seed in seeds:
+        name = f"episode-seed{int(seed)}"
+        report_path = root / "shards" / name / "meta" / "acceptance_report.json"
+        if not report_path.is_file():
+            raise FileNotFoundError(f"missing shard acceptance report: {report_path}")
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        if report.get("schema_version") != SCHEMA_VERSION:
+            raise ValueError(f"unexpected schema version in {report_path}")
+        episodes = report.get("episodes", [])
+        if len(episodes) != 1 or int(episodes[0].get("seed", -1)) != int(seed):
+            raise ValueError(f"shard report does not uniquely describe seed {seed}")
+        shard_rows.append(
+            {"name": name, "path": f"shards/{name}", "acceptance": report}
+        )
+        episode_rows.extend(episodes)
+        quarantine.extend(report.get("quarantine", []))
+        exceptions.extend(report.get("exceptions", []))
+        exceptions.extend(episodes[0].get("exceptions", []))
+
+    reason_counts = {}
+    for row in episode_rows:
+        for reason in row.get("reasons", []):
+            reason_counts[reason] = reason_counts.get(reason, 0) + 1
+    stage_values = {}
+    for row in episode_rows:
+        for stage, value in row.get("stage_duration_s", {}).items():
+            stage_values.setdefault(stage, []).append(float(value))
+    stage_summary = {
+        stage: {
+            "episodes": len(values),
+            "min_s": min(values),
+            "median_s": float(np.median(values)),
+            "max_s": max(values),
+        }
+        for stage, values in stage_values.items()
+    }
+    accepted = sum(bool(row.get("accepted")) for row in episode_rows)
+    total_frames = sum(int(row.get("frames", 0)) for row in episode_rows)
+    delivery_metrics = {
+        "total_frames": total_frames,
+        "nominal_hz": CONTROL_HZ,
+        "max_sim_tick_jitter_ns": max(
+            (int(row.get("timing", {}).get("max_sim_tick_jitter_ns", 0)) for row in episode_rows),
+            default=0,
+        ),
+        "max_camera_skew_ns": max(
+            (int(row.get("timing", {}).get("max_camera_skew_ns", 0)) for row in episode_rows),
+            default=0,
+        ),
+        "max_stage2_entry_q5_target_step_rad": max(
+            (
+                float(row.get("control", {}).get("stage2_entry_q5_target_step_rad") or 0.0)
+                for row in episode_rows
+            ),
+            default=0.0,
+        ),
+        "min_handle_angle_deg": min(
+            (float(row.get("physical_result", {}).get("max_handle_angle_deg", 0.0)) for row in episode_rows),
+            default=0.0,
+        ),
+        "min_door_gap_m": min(
+            (float(row.get("physical_result", {}).get("max_door_gap_m", 0.0)) for row in episode_rows),
+            default=0.0,
+        ),
+        "min_final_door_angle_deg": min(
+            (float(row.get("physical_result", {}).get("final_door_angle_deg", 0.0)) for row in episode_rows),
+            default=0.0,
+        ),
+        "nonzero_handle_contact_rows": sum(
+            int(row.get("contacts", {}).get("nonzero_handle_rows", 0))
+            for row in episode_rows
+        ),
+        "max_penetration_m": max(
+            (float(row.get("contacts", {}).get("max_penetration_m", 0.0)) for row in episode_rows),
+            default=0.0,
+        ),
+    }
+    machine_report = {
+        "schema_version": SCHEMA_VERSION,
+        "requested_seeds": [int(seed) for seed in seeds],
+        "total_episodes": len(episode_rows),
+        "accepted_episodes": accepted,
+        "quarantined_episodes": len(episode_rows) - accepted,
+        "collection_wall_time_s": int(collection_wall_time_s),
+        "delivery_metrics": delivery_metrics,
+        "stage_duration_s": stage_summary,
+        "reason_distribution": reason_counts,
+        "quarantine": quarantine,
+        "exceptions": exceptions,
+        "episodes": episode_rows,
+    }
+    _json_dump(root / "acceptance_report.json", machine_report)
+    _json_dump(
+        root / "manifest.json",
+        {
+            "schema_version": SCHEMA_VERSION,
+            "requested_seeds": [int(seed) for seed in seeds],
+            "requested_episodes": len(seeds),
+            "collection_wall_time_s": int(collection_wall_time_s),
+            "camera_mount_randomization": {
+                "position_radius_m": float(camera_mount_position_noise_m),
+                "rotation_angle_deg": float(camera_mount_rotation_noise_deg),
+                "episode_constant": True,
+                "independent_per_camera": True,
+            },
+            "acceptance_report": "acceptance_report.json",
+            "human_report": "DATASET_ACCEPTANCE_SUMMARY_ZH.md",
+            "shards": shard_rows,
+        },
+    )
+    rows = [
+        "| seed | 结果 | 帧数 | Stage2入口q5步进(rad) | 把手非零接触 | 终态稳定帧 | 原因 |",
+        "|---:|---|---:|---:|---:|---:|---|",
+    ]
+    for row in episode_rows:
+        rows.append(
+            f"| {row['seed']} | {'通过' if row.get('accepted') else '隔离'} | "
+            f"{row.get('frames', 0)} | "
+            f"{float(row.get('control', {}).get('stage2_entry_q5_target_step_rad') or 0.0):.6f} | "
+            f"{int(row.get('contacts', {}).get('nonzero_handle_rows', 0))} | "
+            f"{int(row.get('terminal_actual', {}).get('window_frames', 0))} | "
+            f"{'; '.join(row.get('reasons', [])) or '无'} |"
+        )
+    (root / "DATASET_ACCEPTANCE_SUMMARY_ZH.md").write_text(
+        "# AutoOpen 标准数据整批验收摘要\n\n"
+        f"- 标准版本：`{SCHEMA_VERSION}`\n"
+        f"- 请求/完成 episode：`{len(seeds)}/{len(episode_rows)}`\n"
+        f"- 通过：`{accepted}`\n"
+        f"- 隔离：`{len(episode_rows) - accepted}`\n"
+        f"- 四卡整批墙钟耗时：`{int(collection_wall_time_s)} s`\n"
+        f"- 总训练帧：`{total_frames}`；状态、动作及两路相机：`{CONTROL_HZ} Hz`\n"
+        f"- 最大仿真时钟抖动：`{delivery_metrics['max_sim_tick_jitter_ns']} ns`；最大跨相机偏差：`{delivery_metrics['max_camera_skew_ns']} ns`\n"
+        f"- Stage2入口最大q5目标步进：`{delivery_metrics['max_stage2_entry_q5_target_step_rad']:.6f} rad`\n"
+        f"- 把手最小最大按压角：`{delivery_metrics['min_handle_angle_deg']:.3f} deg`；最小门缝：`{delivery_metrics['min_door_gap_m']:.4f} m`；最小最终门角：`{delivery_metrics['min_final_door_angle_deg']:.3f} deg`\n"
+        f"- 把手非零接触总行数：`{delivery_metrics['nonzero_handle_contact_rows']}`；最大穿透：`{delivery_metrics['max_penetration_m']:.6f} m`\n"
+        f"- 三阶段时长统计：`{json.dumps(stage_summary, ensure_ascii=False)}`\n"
+        f"- 隔离原因：`{json.dumps(reason_counts, ensure_ascii=False)}`\n"
+        f"- 例外：`{json.dumps(exceptions, ensure_ascii=False)}`\n\n"
+        "## Episode 明细\n\n"
+        + "\n".join(rows)
+        + "\n",
+        encoding="utf-8",
+    )
+    return machine_report

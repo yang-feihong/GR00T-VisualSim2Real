@@ -14,6 +14,12 @@ PHYSICS_HZ = 200
 PHYSICS_SUBSTEPS = 4
 CONTROL_DT = 1.0 / CONTROL_HZ
 TASK_PLACEHOLDER = "__unannotated_physical_episode__"
+TERMINAL_STABILITY_FRAMES = CONTROL_HZ
+TERMINAL_BASE_LINEAR_SPEED_M_S = 0.05
+TERMINAL_BASE_ANGULAR_SPEED_RAD_S = 0.05
+TERMINAL_ARM_JOINT_SPEED_RAD_S = 0.08
+TERMINAL_GRIPPER_SPEED_RAD_S = 0.05
+TERMINAL_DOOR_SPEED_RAD_S = np.deg2rad(2.0)
 
 ARM_JOINT_NAMES = tuple(f"joint{i}" for i in range(1, 7))
 B2_JOINT_NAMES = tuple(
@@ -268,6 +274,7 @@ def derive_stage_boundaries(
     arm_reset,
     gripper_targets,
     terminal_robot_clear,
+    terminal_actual_stable=None,
 ):
     """Derive the three physical half-open stages from dispatched controls."""
     base_commands = np.asarray(base_commands, dtype=np.float64)
@@ -278,7 +285,15 @@ def derive_stage_boundaries(
     reset = np.asarray(arm_reset, dtype=bool)
     gripper = np.asarray(gripper_targets, dtype=np.float64)
     robot_clear = np.asarray(terminal_robot_clear, dtype=bool)
-    if any(array.shape != (frames,) for array in (inactive, reset, gripper, robot_clear)):
+    actual_stable = (
+        np.ones(frames, dtype=bool)
+        if terminal_actual_stable is None
+        else np.asarray(terminal_actual_stable, dtype=bool)
+    )
+    if any(
+        array.shape != (frames,)
+        for array in (inactive, reset, gripper, robot_clear, actual_stable)
+    ):
         raise ValueError("all boundary signals must have the same frame count")
 
     moving = np.max(np.abs(base_commands), axis=1) > 0.03
@@ -312,9 +327,7 @@ def derive_stage_boundaries(
     if abs(float(gripper[stage3_start - 1])) > 1.0e-6:
         reasons.append("gripper_not_commanded_closed_before_traversal")
 
-    terminal_hold = (
-        ~moving & inactive & ~reset & robot_clear
-    )
+    terminal_hold = ~moving & inactive & ~reset & robot_clear & actual_stable
     terminal_start = _first_sustained(terminal_hold, 50, start=stage3_start)
     if terminal_start is None:
         reasons.append("missing_50_frame_terminal_hold")
