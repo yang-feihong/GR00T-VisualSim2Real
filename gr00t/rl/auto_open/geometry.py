@@ -413,10 +413,10 @@ def _make_batched_geometry_cache(controllers, device):
 
 def _batched_panel_finger_clearance_gpu(state, cache, env_ids):
     """Compute panel-to-finger clearance for selected rows on the GPU."""
-    if not env_ids:
-        return None
     device = state["robot_body_state_w"].device
     rows = torch.as_tensor(env_ids, dtype=torch.long, device=device)
+    if rows.numel() == 0:
+        return None
     bodies = state["robot_body_state_w"][rows]
     door_bodies = state["door_body_state_w"][rows]
 
@@ -465,12 +465,12 @@ def _batched_handle_centers_gpu(state, cache):
     )[:, 0]
     return (handle_state[:, :3] + rotated).detach().cpu().numpy()
 
-def _batched_geometry_metrics_gpu(state, cache, env_ids):
+def _batched_geometry_metrics_gpu(state, cache, env_ids, *, as_numpy=True):
     """GPU shadow of DoorController._geometry_metrics for selected env rows."""
-    if not env_ids:
-        return None
     device = state["robot_body_state_w"].device
     rows = torch.as_tensor(env_ids, dtype=torch.long, device=device)
+    if rows.numel() == 0:
+        return None
     bodies = state["robot_body_state_w"][rows]
     door_bodies = state["door_body_state_w"][rows]
 
@@ -612,10 +612,12 @@ def _batched_geometry_metrics_gpu(state, cache, env_ids):
         )
         & (torch.sum(handle_to_moving * separation, dim=-1) > radius),
     }
-    return {
-        name: value.detach().cpu().numpy()
-        for name, value in result.items()
-    }
+    if as_numpy:
+        return {
+            name: value.detach().cpu().numpy()
+            for name, value in result.items()
+        }
+    return result
 
 def _quat_rotate_points_batch_np(quaternion_wxyz, points):
     """Rotate a shared point cloud with one float32 quaternion per row."""
