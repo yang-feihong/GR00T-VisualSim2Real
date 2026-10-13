@@ -17,6 +17,11 @@ workflow with `AUTO_OPEN_WORKFLOW`:
 | `video_regression` | `RUN_NAME` | Four-seed visual regression |
 | `standard_collection` | `DATASET_ROOT` | Two-camera `DATA_STANARD.md` shards |
 
+The reviewed full-episode budget is 4000 control steps and is the launcher
+default. `MAX_STEPS` is reserved for bounded diagnostics such as one-frame
+consistency probes; capability and collection results are only compared at the
+same step budget.
+
 `standard_collection` accepts a comma-separated `SEEDS` list selected from a
 completed capability regression. If omitted, it uses `SEED_START` and
 `NUM_EPISODES`. Control, physics, camera, and acceptance options remain fixed.
@@ -38,3 +43,9 @@ docker exec doorman_train bash -lc '
 The launcher owns the Python options, GPU sharding, seed mapping, camera mode,
 and output validation. Environment variables expose only reviewed run-scale and
 destination choices; arbitrary Python argument forwarding is not supported.
+
+AutoOpen maps every episode seed to a unique point on an unbounded deterministic
+lattice, so changing the worker's seed range, physical GPU, camera mode, or
+batch size does not move an episode in world coordinates. DoorMan policy
+inference groups seeds into deterministic 256-row compute blocks and pads only
+missing rows. Total physics environment count is not limited by either scheme.

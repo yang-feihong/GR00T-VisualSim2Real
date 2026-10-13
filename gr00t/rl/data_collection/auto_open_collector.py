@@ -15,6 +15,7 @@ from gr00t.rl.envs.door.b2z1_reset_geometry import (
 
 from .auto_open_standard import (
     B2_JOINT_NAMES,
+    TERMINAL_ARM_JOINT_SPEED_RAD_S,
     pack_action,
     pack_observation_state,
     quaternion_wxyz_to_matrix,
@@ -39,6 +40,8 @@ HANDLE_PRESS_STAGES = {
     "RETREAT_ARM",
     "RESTORE_GRIPPER",
 }
+
+MIDDLE_PRESET_POSITION_TOLERANCE_RAD = 0.05
 
 
 def _numpy(value):
@@ -206,7 +209,7 @@ class AutoOpenStandardEpisodeCollector:
         gripper_actuator_target = float(
             _numpy(post_state["gripper_actuator_target"])[0, 0]
         )
-        inactive, reset = self._mode_flags(pending["stage_name"], arm_target)
+        inactive, reset = self._mode_flags(pending["snapshot"], arm_raw_target)
         target_pose = self._target_height_invariant_pose(
             pending["snapshot"], arm_target
         )
@@ -374,13 +377,34 @@ class AutoOpenStandardEpisodeCollector:
     def _pending_state_view(snapshot):
         return {"root_states": snapshot["root"][None, :]}
 
-    def _mode_flags(self, stage_name, arm_target):
+    def _mode_flags(self, snapshot, arm_raw_target):
         joint_mode = bool(_numpy(self.env.teleop_arm_joint_control_mask)[0])
         if not joint_mode:
             return False, False
-        # AutoOpen uses explicit joint targets for holding and returning to the
-        # middle preset; it does not invoke the low-level reset mode.  Encode
-        # what was actually dispatched rather than inferring reset from stage.
+
+        middle_target = np.asarray(
+            self.controller.middle_arm_joint_target, dtype=np.float32
+        )
+        returning_to_middle = np.allclose(
+            np.asarray(arm_raw_target, dtype=np.float32),
+            middle_target,
+            rtol=0.0,
+            atol=1.0e-6,
+        )
+        if returning_to_middle:
+            arm_position = np.asarray(snapshot["dof_pos"])[self.arm_indices]
+            arm_velocity = np.asarray(snapshot["dof_vel"])[self.arm_indices]
+            middle_reached = bool(
+                np.max(np.abs(arm_position - middle_target))
+                < MIDDLE_PRESET_POSITION_TOLERANCE_RAD
+                and np.max(np.abs(arm_velocity))
+                < TERMINAL_ARM_JOINT_SPEED_RAD_S
+            )
+            if not middle_reached:
+                return False, True
+
+        # Joint control that holds the current pose, including a settled
+        # middle preset, is inactive rather than reset.
         return True, False
 
     def _target_height_invariant_pose(self, snapshot, arm_target):

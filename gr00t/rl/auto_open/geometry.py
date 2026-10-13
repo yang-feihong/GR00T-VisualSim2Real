@@ -7,7 +7,40 @@ import torch
 
 from gr00t.rl.auto_open.utils import as_numpy as _as_np
 
-CENTER_HANDLE_MIN_AXIAL_OVERLAP = 0.010
+HANDLE_AXLE_MARGIN_MIN_M = 0.020
+HANDLE_FREE_MARGIN_MIN_M = 0.010
+HANDLE_AXLE_TARGET_MARGIN_M = 0.025
+HANDLE_FREE_TARGET_MARGIN_M = 0.015
+
+
+def _axial_end_margins(axial_min, axial_max, outer_half_length):
+    """Return jaw clearance from the axle-side and free-end handle tips."""
+    return (
+        float(outer_half_length) + float(axial_min),
+        float(outer_half_length) - float(axial_max),
+    )
+
+
+def _axial_target_correction(
+    axial_min,
+    axial_max,
+    outer_half_length,
+    axle_margin,
+    free_margin,
+):
+    """Translate an axial jaw interval into the requested asymmetric margins."""
+    minimum_shift = (
+        -float(outer_half_length) + float(axle_margin) - float(axial_min)
+    )
+    maximum_shift = (
+        float(outer_half_length) - float(free_margin) - float(axial_max)
+    )
+    if minimum_shift > maximum_shift:
+        raise ValueError(
+            "gripper axial span cannot fit requested handle margins: "
+            f"minimum_shift={minimum_shift:.6f}, maximum_shift={maximum_shift:.6f}"
+        )
+    return float(np.clip(0.0, minimum_shift, maximum_shift))
 
 
 def _resolved_door_prim_path(env, env_id):
@@ -309,6 +342,10 @@ def _make_batched_geometry_cache(controllers, device):
         "handle_axis_local_np": np.stack(
             [controller.handle_axis_local for controller in controllers]
         ).astype(np.float32),
+        "handle_free_axis_local": stacked("handle_free_axis_local"),
+        "handle_free_axis_local_np": np.stack(
+            [controller.handle_free_axis_local for controller in controllers]
+        ).astype(np.float32),
         "door_normal": stacked("door_normal"),
         "door_normal_np": np.stack(
             [controller.door_normal for controller in controllers]
@@ -518,6 +555,18 @@ def _batched_geometry_metrics_gpu(state, cache, env_ids):
     handle_axis = handle_axis / torch.linalg.vector_norm(
         handle_axis, dim=-1, keepdim=True
     ).clamp_min(1.0e-8)
+    handle_free_axis = _quat_rotate_points_torch(
+        handle_pose[:, 3:7], select("handle_free_axis_local")[:, None, :]
+    )[:, 0]
+    handle_free_axis = handle_free_axis / torch.linalg.vector_norm(
+        handle_free_axis, dim=-1, keepdim=True
+    ).clamp_min(1.0e-8)
+    jaw_axial = torch.einsum(
+        "npi,ni->np", jaw_points - grasp_center[:, None, :], handle_free_axis
+    )
+    outer_half_length = select("handle_half_length") + radius
+    axle_margin = outer_half_length + jaw_axial.amin(dim=1)
+    free_margin = outer_half_length - jaw_axial.amax(dim=1)
 
     def capsule_clearance(cloud):
         delta = cloud - grasp_center[:, None, :]
@@ -556,6 +605,8 @@ def _batched_geometry_metrics_gpu(state, cache, env_ids):
         "fixed_axial_offset": torch.sum(
             (fixed_center - grasp_center) * handle_axis, dim=-1
         ),
+        "handle_axle_margin": axle_margin,
+        "handle_free_margin": free_margin,
         "handle_between_jaws": (
             torch.sum(fixed_to_handle * separation, dim=-1) > radius
         )
@@ -673,7 +724,22 @@ def _batched_geometry_metrics_numpy(state, cache, env_ids, grasp_centers):
     handle_axis /= np.maximum(
         np.linalg.norm(handle_axis, axis=1, keepdims=True), 1.0e-8
     )
+    handle_free_axis_local = cache["handle_free_axis_local_np"][rows]
+    first_cross = np.cross(handle_q_vector, handle_free_axis_local)
+    handle_free_axis = handle_free_axis_local + 2.0 * (
+        handle_pose[:, 3:4] * first_cross
+        + np.cross(handle_q_vector, first_cross)
+    )
+    handle_free_axis /= np.maximum(
+        np.linalg.norm(handle_free_axis, axis=1, keepdims=True), 1.0e-8
+    )
     half_length = cache["handle_half_length_np"][rows]
+    jaw_axial = np.einsum(
+        "npi,ni->np", np.concatenate((fixed, moving), axis=1) - grasp_center[:, None, :], handle_free_axis
+    )
+    outer_half_length = half_length + radius
+    axle_margin = outer_half_length + jaw_axial.min(axis=1)
+    free_margin = outer_half_length - jaw_axial.max(axis=1)
 
     def capsule_clearance(cloud):
         delta = cloud - grasp_center[:, None, :]
@@ -712,6 +778,8 @@ def _batched_geometry_metrics_numpy(state, cache, env_ids, grasp_centers):
         "fixed_axial_offset": np.einsum(
             "ni,ni->n", fixed_center - grasp_center, handle_axis
         ),
+        "handle_axle_margin": axle_margin,
+        "handle_free_margin": free_margin,
         "handle_between_jaws": (
             np.einsum("ni,ni->n", fixed_to_handle, separation) > radius
         )
@@ -813,6 +881,12 @@ def _measure_handle_geometry(self, handle_state, grasp_state):
         axis_w /= max(measured_half_length, 1.0e-8)
         center_local = _quat_rotate_inverse_np(handle_state[3:7], center_w - handle_state[:3])
         self.handle_axis_local = _quat_rotate_inverse_np(handle_state[3:7], axis_w)
+        free_sign = float(np.sign(np.dot(center_local, self.handle_axis_local)))
+        if free_sign == 0.0:
+            raise RuntimeError("handle collider center does not identify its free end")
+        self.handle_free_axis_local = (
+            free_sign * self.handle_axis_local
+        ).astype(np.float32)
         self.handle_half_length = measured_half_length
         if radius <= 0.0 or height <= 0.0:
             raise RuntimeError(f"invalid capsule dimensions radius={radius}, height={height}")
@@ -985,6 +1059,16 @@ def _geometry_metrics(self, state, grasp_center):
     handle_state = _as_np(state["door_body_state_w"])[0, self.handle_body_idx, :7]
     handle_axis = _quat_rotate_np(handle_state[3:7], self.handle_axis_local)
     handle_axis /= max(float(np.linalg.norm(handle_axis)), 1.0e-8)
+    handle_free_axis = _quat_rotate_np(
+        handle_state[3:7], self.handle_free_axis_local
+    )
+    handle_free_axis /= max(float(np.linalg.norm(handle_free_axis)), 1.0e-8)
+    jaw_axial = np.concatenate((fixed, moving), axis=0) - grasp_center
+    jaw_axial = jaw_axial @ handle_free_axis
+    outer_half_length = self.handle_half_length + handle_radius
+    axle_margin, free_margin = _axial_end_margins(
+        jaw_axial.min(), jaw_axial.max(), outer_half_length
+    )
     fixed_to_handle = grasp_center - fixed_c
     handle_to_moving = moving_c - grasp_center
     fixed_axial_offset = float(np.dot(fixed_c - grasp_center, handle_axis))
@@ -1023,6 +1107,8 @@ def _geometry_metrics(self, state, grasp_center):
         "moving_center": moving_c,
         "channel_center": channel_center,
         "fixed_axial_offset": fixed_axial_offset,
+        "handle_axle_margin": axle_margin,
+        "handle_free_margin": free_margin,
         "handle_between_jaws": handle_between_jaws,
     }
 
@@ -1113,7 +1199,7 @@ def _contact_is_on_handle_capsule(self, point, handle_state):
     return radial_distance <= 0.018 and abs(float(np.dot(delta, axis))) <= self.handle_half_length + 0.008
 
 def _contacts_form_opposed_grasp(self, points, handle_state):
-    """Validate that two contacts oppose each other in one handle section."""
+    """Validate that two contacts lie on opposite closing sides of the handle."""
     points = np.asarray(points, dtype=np.float32).reshape(2, 3)
     if not np.isfinite(points).all():
         return False, {}
@@ -1133,8 +1219,7 @@ def _contacts_form_opposed_grasp(self, points, handle_state):
         "closing_coordinates": closing_coordinates.copy(),
     }
     valid = bool(
-        metrics["axial_delta"] <= 0.020
-        and np.all(np.abs(axial) <= max(self.handle_half_length - 0.005, 0.0))
+        np.all(np.abs(axial) <= max(self.handle_half_length - 0.005, 0.0))
         and float(closing_coordinates[0] * closing_coordinates[1]) < 0.0
         and np.all(np.abs(closing_coordinates) >= 0.25 * radius)
     )

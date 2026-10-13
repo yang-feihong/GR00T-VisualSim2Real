@@ -36,6 +36,22 @@ CAMERA_SHAPES = {
     CAMERA_KEYS[1]: (480, 640, 3),
 }
 
+ROUND_TRIP_WINDOW_FRAMES = 5
+BASE_ROUND_TRIP_JUMP = 0.15
+BASE_ROUND_TRIP_RETURN_TOLERANCE = 0.03
+ARM_ROUND_TRIP_JUMP = 0.05
+ARM_ROUND_TRIP_RETURN_TOLERANCE = 0.015
+CONTACT_PENETRATION_LIMITS_M = {
+    "foot_ground": 0.005,
+    "gripper_handle": 0.0035,
+    "gripper_panel": 0.003,
+    "door_internal": 0.001,
+}
+HANDLE_CONTACT_STAGES = frozenset(
+    {"GRASP_HANDLE", "TURN_HANDLE", "RETURN_HANDLE", "OPEN_AND_CLEAR"}
+)
+PANEL_CONTACT_STAGES = frozenset({"PUSH_OPEN", "PUSH_ARM_RETRACT"})
+
 
 @dataclass
 class AutoOpenEpisodeData:
@@ -268,6 +284,145 @@ def _first_index(mask, start=0):
     return None if len(indices) == 0 else int(start) + int(indices[0])
 
 
+def _short_round_trips(
+    values, *, jump_threshold, return_tolerance, require_sign_reversal=False
+):
+    """Find a large dispatched-target jump that returns within 100 ms."""
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim == 1:
+        values = values[:, None]
+    events = []
+    for frame in range(1, len(values)):
+        jump = values[frame] - values[frame - 1]
+        for component in np.flatnonzero(np.abs(jump) >= jump_threshold):
+            if require_sign_reversal and not (
+                values[frame - 1, component] * values[frame, component] < 0.0
+            ):
+                continue
+            stop = min(frame + ROUND_TRIP_WINDOW_FRAMES + 1, len(values))
+            returned = np.flatnonzero(
+                np.abs(values[frame + 1 : stop, component] - values[frame - 1, component])
+                <= return_tolerance
+            )
+            if len(returned) == 0:
+                continue
+            return_frame = frame + 1 + int(returned[0])
+            events.append(
+                {
+                    "frame": int(frame),
+                    "return_frame": int(return_frame),
+                    "component": int(component),
+                    "jump": float(jump[component]),
+                }
+            )
+    return events
+
+
+def _contact_acceptance_summary(episode, stages):
+    abnormal = []
+    penetration_violations = []
+    class_maxima = {
+        name: {"rows": 0, "max_penetration_m": 0.0}
+        for name in CONTACT_PENETRATION_LIMITS_M
+    }
+    for row in episode.raw_contacts:
+        force = float(row.get("max_contact_force", 0.0))
+        impulse = float(row.get("max_normal_impulse", 0.0))
+        if force <= 1.0e-6 and impulse <= 1.0e-9:
+            continue
+        frame = int(row.get("frame_index", -1))
+        stage = str(stages[frame]) if 0 <= frame < len(stages) else "UNKNOWN"
+        path_a = str(row.get("body_a_path", ""))
+        path_b = str(row.get("body_b_path", ""))
+        leaf_a = path_a.rsplit("/", 1)[-1]
+        leaf_b = path_b.rsplit("/", 1)[-1]
+        leaves = {leaf_a, leaf_b}
+        joined = path_a + "|" + path_b
+        contact_class = None
+        if "ground" in joined.lower():
+            robot_leaf = leaf_b if "ground" in path_a.lower() else leaf_a
+            if robot_leaf.endswith("_foot"):
+                contact_class = "foot_ground"
+            else:
+                abnormal.append(
+                    {
+                        "frame": frame,
+                        "stage": stage,
+                        "pair": [leaf_a, leaf_b],
+                        "force_n": force,
+                        "impulse_ns": impulse,
+                        "reason": "non_foot_robot_ground_contact",
+                    }
+                )
+        elif "door_handle" in leaves and leaves & {"link06", "gripperMover"}:
+            if stage in HANDLE_CONTACT_STAGES:
+                contact_class = "gripper_handle"
+            else:
+                abnormal.append(
+                    {
+                        "frame": frame,
+                        "stage": stage,
+                        "pair": [leaf_a, leaf_b],
+                        "force_n": force,
+                        "impulse_ns": impulse,
+                        "reason": "handle_contact_outside_allowed_stage",
+                    }
+                )
+        elif "door_panel" in leaves and leaves & {"link06", "gripperMover"}:
+            if stage in PANEL_CONTACT_STAGES:
+                contact_class = "gripper_panel"
+            else:
+                abnormal.append(
+                    {
+                        "frame": frame,
+                        "stage": stage,
+                        "pair": [leaf_a, leaf_b],
+                        "force_n": force,
+                        "impulse_ns": impulse,
+                        "reason": "panel_contact_outside_push_open",
+                    }
+                )
+        elif "/Robot/" not in joined and "ground" not in joined.lower():
+            contact_class = "door_internal"
+        else:
+            abnormal.append(
+                {
+                    "frame": frame,
+                    "stage": stage,
+                    "pair": [leaf_a, leaf_b],
+                    "force_n": force,
+                    "impulse_ns": impulse,
+                    "reason": "unclassified_robot_environment_contact",
+                }
+            )
+        if contact_class is None:
+            continue
+        penetration = float(row.get("max_penetration_depth", 0.0))
+        metrics = class_maxima[contact_class]
+        metrics["rows"] += 1
+        metrics["max_penetration_m"] = max(
+            float(metrics["max_penetration_m"]), penetration
+        )
+        limit = CONTACT_PENETRATION_LIMITS_M[contact_class]
+        if penetration > limit:
+            penetration_violations.append(
+                {
+                    "frame": frame,
+                    "stage": stage,
+                    "pair": [leaf_a, leaf_b],
+                    "class": contact_class,
+                    "penetration_m": penetration,
+                    "limit_m": limit,
+                }
+            )
+    return {
+        "abnormal": abnormal,
+        "penetration_violations": penetration_violations,
+        "class_maxima": class_maxima,
+        "penetration_limits_m": dict(CONTACT_PENETRATION_LIMITS_M),
+    }
+
+
 def _physical_acceptance_reasons(episode, boundary):
     """Validate physical requirements that are not boundary-only checks."""
     audit = episode.raw_audit
@@ -328,6 +483,31 @@ def _physical_acceptance_reasons(episode, boundary):
         )
         if q5_step > 0.021:
             reasons.append(f"stage2_q5_target_discontinuity:{q5_step:.6f}")
+    base_round_trips = _short_round_trips(
+        action[:, :3],
+        jump_threshold=BASE_ROUND_TRIP_JUMP,
+        return_tolerance=BASE_ROUND_TRIP_RETURN_TOLERANCE,
+        require_sign_reversal=True,
+    )
+    arm_round_trips = _short_round_trips(
+        arm_targets,
+        jump_threshold=ARM_ROUND_TRIP_JUMP,
+        return_tolerance=ARM_ROUND_TRIP_RETURN_TOLERANCE,
+    )
+    if base_round_trips:
+        first = base_round_trips[0]
+        reasons.append(
+            "base_command_short_round_trip:"
+            f"count={len(base_round_trips)},frame={first['frame']},"
+            f"component={first['component']},jump={first['jump']:.6f}"
+        )
+    if arm_round_trips:
+        first = arm_round_trips[0]
+        reasons.append(
+            "arm_target_short_round_trip:"
+            f"count={len(arm_round_trips)},frame={first['frame']},"
+            f"joint={first['component'] + 1},jump={first['jump']:.6f}"
+        )
     grasp_hold = np.isin(stages, ("GRASP_HANDLE", "TURN_HANDLE"))
     if np.any(np.abs(gripper_dispatched[grasp_hold]) > 1.0e-6):
         reasons.append("grasp_hold_high_level_target_not_zero")
@@ -383,6 +563,23 @@ def _physical_acceptance_reasons(episode, boundary):
             reasons.append("q6_outside_0p2rad_before_traversal")
     if episode.event_frames.get("robot_clear") is None:
         reasons.append("robot_never_cleared_door_plane")
+
+    contact_summary = _contact_acceptance_summary(episode, stages)
+    if contact_summary["abnormal"]:
+        first = contact_summary["abnormal"][0]
+        reasons.append(
+            "abnormal_environment_contact:"
+            f"count={len(contact_summary['abnormal'])},frame={first['frame']},"
+            f"pair={'|'.join(first['pair'])},reason={first['reason']}"
+        )
+    if contact_summary["penetration_violations"]:
+        first = contact_summary["penetration_violations"][0]
+        reasons.append(
+            "contact_penetration_limit_exceeded:"
+            f"count={len(contact_summary['penetration_violations'])},"
+            f"frame={first['frame']},class={first['class']},"
+            f"depth={first['penetration_m']:.6f},limit={first['limit_m']:.6f}"
+        )
 
     handle_boundary = boundary.boundaries.get("handle_press")
     if handle_boundary is not None:
@@ -451,7 +648,20 @@ def _episode_acceptance_metrics(episode, boundary, reasons):
     base_command = array("base_command_dispatched", 3)
     root_linear = array("root_linear_velocity_world", 3)
     root_angular = array("root_angular_velocity_world", 3)
+    stages = np.asarray(audit.get("autoopen_stage", [""] * frames), dtype=str)
     contacts = list(episode.raw_contacts)
+    base_round_trips = _short_round_trips(
+        base_command,
+        jump_threshold=BASE_ROUND_TRIP_JUMP,
+        return_tolerance=BASE_ROUND_TRIP_RETURN_TOLERANCE,
+        require_sign_reversal=True,
+    )
+    arm_round_trips = _short_round_trips(
+        arm_targets,
+        jump_threshold=ARM_ROUND_TRIP_JUMP,
+        return_tolerance=ARM_ROUND_TRIP_RETURN_TOLERANCE,
+    )
+    contact_summary = _contact_acceptance_summary(episode, stages)
     handle_contacts = [
         row for row in contacts
         if "door_handle" in str(row.get("body_a_path", ""))
@@ -467,7 +677,6 @@ def _episode_acceptance_metrics(episode, boundary, reasons):
         for name, item in (boundary.boundaries.items() if boundary is not None else ())
     }
     target_steps = np.abs(np.diff(arm_targets, axis=0)) if frames > 1 else np.zeros((0, 6))
-    stages = np.asarray(audit.get("autoopen_stage", [""] * frames), dtype=str)
     stage2_entries = np.flatnonzero(
         (stages[1:] == "PREGRASP") & (stages[:-1] == "APPROACH")
     ) + 1
@@ -508,6 +717,10 @@ def _episode_acceptance_metrics(episode, boundary, reasons):
             ),
             "max_arm_actual_speed_rad_s": float(np.max(np.abs(arm_velocity))) if frames else 0.0,
             "max_base_command_abs": np.max(np.abs(base_command), axis=0).tolist() if frames else [0.0] * 3,
+            "base_short_round_trip_count": len(base_round_trips),
+            "base_short_round_trips": base_round_trips,
+            "arm_short_round_trip_count": len(arm_round_trips),
+            "arm_short_round_trips": arm_round_trips,
         },
         "physical_result": {
             "max_handle_angle_deg": float(np.rad2deg(np.max(np.abs(array("handle_position"))))) if frames else 0.0,
@@ -522,6 +735,16 @@ def _episode_acceptance_metrics(episode, boundary, reasons):
             "max_force_n": max((float(row.get("max_contact_force", 0.0)) for row in contacts), default=0.0),
             "max_normal_impulse_ns": max((float(row.get("max_normal_impulse", 0.0)) for row in contacts), default=0.0),
             "max_penetration_m": max((float(row.get("max_penetration_depth", 0.0)) for row in contacts), default=0.0),
+            "allowed_class_maxima": contact_summary["class_maxima"],
+            "penetration_limits_m": contact_summary["penetration_limits_m"],
+            "abnormal_contact_count": len(contact_summary["abnormal"]),
+            "abnormal_contacts": contact_summary["abnormal"],
+            "penetration_violation_count": len(
+                contact_summary["penetration_violations"]
+            ),
+            "penetration_violations": contact_summary[
+                "penetration_violations"
+            ],
         },
         "terminal_actual": {
             "window_frames": min(frames, CONTROL_HZ),
@@ -818,6 +1041,9 @@ def aggregate_standard_shards(
     camera_mount_position_noise_m: float,
     camera_mount_rotation_noise_deg: float,
     collection_wall_time_s: int,
+    camera_focal_scale_noise_fraction: float = 0.0,
+    camera_principal_point_noise_px: float = 0.0,
+    camera_distortion_noise_fraction: float = 0.0,
 ):
     """Write dataset-level delivery reports for independently collected shards."""
     root = Path(root)
@@ -927,6 +1153,9 @@ def aggregate_standard_shards(
             "camera_mount_randomization": {
                 "position_radius_m": float(camera_mount_position_noise_m),
                 "rotation_angle_deg": float(camera_mount_rotation_noise_deg),
+                "focal_scale_fraction": float(camera_focal_scale_noise_fraction),
+                "principal_point_radius_px": float(camera_principal_point_noise_px),
+                "distortion_relative_fraction": float(camera_distortion_noise_fraction),
                 "episode_constant": True,
                 "independent_per_camera": True,
             },

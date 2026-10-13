@@ -256,7 +256,22 @@ def test_one_vectorized_episode_runner_handles_batch_size_one_and_many():
 def test_every_fixed_workflow_supplies_vectorized_environment_count():
     launcher = (SCRIPTS / "run_auto_open.sh").read_text(encoding="utf-8")
     python_invocations = [
-        block for block in launcher.split('python "${ENTRY}"')[1:]
+        block for block in launcher.split("run_auto_open_python")[2:]
     ]
     assert python_invocations
     assert all("--batched_envs" in block.split(">", 1)[0] for block in python_invocations)
+
+
+def test_fixed_launcher_has_one_python_invocation_and_one_common_contract():
+    launcher = (SCRIPTS / "run_auto_open.sh").read_text(encoding="utf-8")
+    assert launcher.count('python "${ENTRY}"') == 1
+    assert launcher.count("COMMON_RUNTIME_ARGS=(") == 1
+    for option in (
+        "--headless",
+        "--device cuda:0",
+        "--batch_contact_ik_backend exact_workers",
+        "--batch_path_backend exact_workers",
+        "--batch_panel_clearance_backend gpu",
+        "--batch_geometry_fallback_backend numpy_batch",
+    ):
+        assert launcher.count(option) == 1

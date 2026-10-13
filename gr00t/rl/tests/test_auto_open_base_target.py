@@ -1,11 +1,19 @@
+import inspect
+
 import numpy as np
 
 from gr00t.rl.scripts.doorman_auto_open import (
+    DoorController,
     _approach_stop_latch,
     _base_pose_accepted,
     _through_stop_latch,
 )
-from gr00t.rl.auto_open.control import _base_commands_exact
+from gr00t.rl.auto_open.control import (
+    _base_commands_exact,
+    _base_velocity_damping,
+    _stabilize_base_command,
+    _zero_cross_base_reversal,
+)
 from gr00t.rl.auto_open.geometry import _resolved_door_prim_path
 
 
@@ -22,6 +30,7 @@ def test_base_target_keeps_closed_loop_active_until_stage_owns_settling():
         _state([0.05], [0.20]),
         np.asarray([[0.0, 0.0]], dtype=np.float32),
         np.asarray([0.0], dtype=np.float64),
+        minimum_speed_toward_target_only=True,
     )
     assert distance[0] < 0.12
     assert yaw_error[0] == 0.0
@@ -38,6 +47,94 @@ def test_base_target_resumes_closed_loop_after_drifting_outside_tolerance():
     assert np.linalg.norm(command[0, :2]) > 0.0
 
 
+def test_minimum_base_speed_does_not_amplify_a_braking_command():
+    command, _, _ = _base_commands_exact(
+        _state([0.20], [-0.25]),
+        np.asarray([[0.0, 0.0]], dtype=np.float32),
+        np.asarray([0.0], dtype=np.float64),
+        minimum_speed_toward_target_only=True,
+    )
+    assert np.isclose(command[0, 0], 0.01)
+
+
+def test_minimum_yaw_rate_does_not_amplify_a_braking_command():
+    roots = _state([0.0], [0.0])["root_states"]
+    roots[0, 12] = -0.5
+    command, _, _ = _base_commands_exact(
+        {"root_states": roots},
+        np.asarray([[0.0, 0.0]], dtype=np.float32),
+        np.asarray([-0.1], dtype=np.float64),
+        minimum_speed_toward_target_only=True,
+    )
+    assert np.isclose(command[0, 2], 0.025)
+
+
+def test_dispatched_base_command_rejects_short_reversal():
+    controller = type(
+        "Controller",
+        (),
+        {
+            "base_command_previous": np.asarray([-0.2, 0.1, 0.0], dtype=np.float32),
+            "base_reversal_pending_sign": np.zeros(3, dtype=np.int8),
+            "base_reversal_pending_steps": np.zeros(3, dtype=np.int32),
+            "base_reversal_lock_steps": np.zeros(3, dtype=np.int32),
+        },
+    )()
+    first = _stabilize_base_command(
+        controller, np.asarray([0.2, 0.08, 0.1], dtype=np.float32)
+    )
+    second = _stabilize_base_command(
+        controller, np.asarray([-0.2, 0.06, 0.0], dtype=np.float32)
+    )
+    assert np.allclose(first, [-0.2, 0.08, 0.1])
+    assert np.allclose(second, [-0.2, 0.06, 0.0])
+
+
+def test_dispatched_base_command_allows_sustained_reversal():
+    controller = type(
+        "Controller",
+        (),
+        {
+            "base_command_previous": np.asarray([-0.2, 0.0, 0.0], dtype=np.float32),
+            "base_reversal_pending_sign": np.zeros(3, dtype=np.int8),
+            "base_reversal_pending_steps": np.zeros(3, dtype=np.int32),
+            "base_reversal_lock_steps": np.zeros(3, dtype=np.int32),
+        },
+    )()
+    outputs = [
+        _stabilize_base_command(
+            controller, np.asarray([0.2, 0.0, 0.0], dtype=np.float32)
+        )
+        for _ in range(3)
+    ]
+    assert np.allclose([output[0] for output in outputs], (-0.2, -0.2, 0.2))
+    assert np.isclose(outputs[-1][0], 0.2)
+
+
+def test_approach_large_reversal_crosses_zero_for_one_frame():
+    controller = type(
+        "Controller",
+        (),
+        {"base_command_previous": np.asarray([0.2, -0.15, 0.2], dtype=np.float32)},
+    )()
+    first = _zero_cross_base_reversal(
+        controller, np.asarray([-0.014, 0.04, -0.02], dtype=np.float32)
+    )
+    second = _zero_cross_base_reversal(
+        controller, np.asarray([-0.014, 0.04, -0.02], dtype=np.float32)
+    )
+    assert np.allclose(first, [0.0, 0.0, 0.0])
+    assert np.allclose(second, [-0.014, 0.04, -0.02])
+
+
+def test_base_stabilizer_runs_once_at_the_final_dispatch_boundary():
+    approach_source = inspect.getsource(DoorController._command_approach)
+    command_source = inspect.getsource(DoorController.command)
+    assert approach_source.count("_zero_cross_base_reversal(") == 1
+    assert command_source.count("_stabilize_base_command(") == 1
+    assert "return self._command_approach(state)" in command_source
+
+
 def test_base_target_remains_a_stateless_feedback_controller():
     command, distance, yaw_error = _base_commands_exact(
         _state([0.05], [0.01]),
@@ -47,6 +144,14 @@ def test_base_target_remains_a_stateless_feedback_controller():
     assert distance[0] < 0.12
     assert yaw_error[0] == 0.0
     assert np.linalg.norm(command[0, :2]) > 0.0
+
+
+def test_terminal_base_damping_opposes_measured_body_velocity_without_minimum():
+    roots = _state([0.0], [0.04])["root_states"]
+    roots[0, 8] = -0.03
+    roots[0, 12] = 0.08
+    command = _base_velocity_damping({"root_states": roots})[0]
+    assert np.allclose(command, [-0.04, 0.03, -0.028], atol=1.0e-6)
 
 
 def test_approach_owns_stop_latch_until_pose_leaves_acceptance():

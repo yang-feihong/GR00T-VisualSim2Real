@@ -8,7 +8,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 ENTRY="${REPO_ROOT}/gr00t/rl/scripts/doorman_auto_open.py"
 WORKFLOW="${AUTO_OPEN_WORKFLOW:-capability}"
 GPU_IDS_CSV="${GPU_IDS:-0,1,2,3}"
-MAX_STEPS="${MAX_STEPS:-3000}"
+MAX_STEPS="${MAX_STEPS:-4000}"
 
 if (( $# != 0 )); then
     echo "The fixed AutoOpen launcher does not accept command-line arguments." >&2
@@ -31,6 +31,21 @@ if (( ${#GPU_IDS_ARRAY[@]} < 1 )); then
 fi
 
 declare -a PIDS=()
+declare -a COMMON_RUNTIME_ARGS=(
+    --headless
+    --device cuda:0
+    --max_steps "${MAX_STEPS}"
+    --batch_contact_ik_backend exact_workers
+    --batch_path_backend exact_workers
+    --batch_panel_clearance_backend gpu
+    --batch_geometry_fallback_backend numpy_batch
+)
+export AUTO_OPEN_FIXED_ENTRY=run_auto_open.sh
+
+run_auto_open_python() {
+    python "${ENTRY}" "${COMMON_RUNTIME_ARGS[@]}" "$@"
+}
+
 cleanup() {
     local pid
     for pid in "${PIDS[@]:-}"; do
@@ -74,12 +89,10 @@ run_capability() {
         rank_dir="${output_root}/rank${rank}"
         console_log="${output_root}/rank${rank}.console.log"
         echo "Starting rank ${rank}: GPU ${gpu_id}, seeds ${rank_seed}-$((rank_seed + envs_per_gpu - 1))"
-        AUTO_OPEN_FIXED_ENTRY=run_auto_open.sh CUDA_VISIBLE_DEVICES="${gpu_id}" \
-            python "${ENTRY}" --headless --disable_rgb_cameras --summary_only \
-            --device cuda:0 --seed "${rank_seed}" --batched_envs "${envs_per_gpu}" \
-            --max_steps "${MAX_STEPS}" --steady_path_workers "${steady_workers}" \
-            --batch_contact_ik_backend exact_workers --batch_path_backend exact_workers \
-            --batch_panel_clearance_backend gpu --batch_geometry_fallback_backend numpy_batch \
+        CUDA_VISIBLE_DEVICES="${gpu_id}" \
+            run_auto_open_python --disable_rgb_cameras --summary_only \
+            --seed "${rank_seed}" --batched_envs "${envs_per_gpu}" \
+            --steady_path_workers "${steady_workers}" \
             --output_dir "${rank_dir}" "${preset_args[@]}" \
             >"${console_log}" 2>&1 &
         PIDS+=("$!")
@@ -145,13 +158,10 @@ run_video_regression() {
             exit 2
         fi
         output_dirs+=("${output_dir}")
-        AUTO_OPEN_FIXED_ENTRY=run_auto_open.sh CUDA_VISIBLE_DEVICES="${gpu_id}" \
-            python "${ENTRY}" --headless --enable_cameras --record_video \
-            --device cuda:0 --seed "${seed}" --batched_envs 1 \
-            --max_steps "${MAX_STEPS}" --output_dir "${output_dir}" \
-            --steady_path_workers 1 --batch_contact_ik_backend exact_workers \
-            --batch_path_backend exact_workers --batch_panel_clearance_backend gpu \
-            --batch_geometry_fallback_backend numpy_batch \
+        CUDA_VISIBLE_DEVICES="${gpu_id}" \
+            run_auto_open_python --enable_cameras --record_video \
+            --seed "${seed}" --batched_envs 1 \
+            --output_dir "${output_dir}" --steady_path_workers 1 \
             >"${console_log}" 2>&1 &
         PIDS+=("$!")
     done
@@ -193,6 +203,9 @@ run_standard_collection() {
     fi
     local camera_mount_position_noise_m=0.02
     local camera_mount_rotation_noise_deg=15.0
+    local camera_focal_scale_noise_fraction=0.08
+    local camera_principal_point_noise_px=5.0
+    local camera_distortion_noise_fraction=0.10
     if [[ -e "${dataset_root}" ]]; then
         echo "Refusing to overwrite existing DATASET_ROOT: ${dataset_root}" >&2
         exit 2
@@ -208,15 +221,15 @@ run_standard_collection() {
                 shard="${dataset_root}/shards/${name}"
                 control="${dataset_root}/logs/${name}-control"
                 log="${dataset_root}/logs/${name}.console.log"
-                if ! AUTO_OPEN_FIXED_ENTRY=run_auto_open.sh CUDA_VISIBLE_DEVICES="${gpu_id}" \
-                    python "${ENTRY}" --headless --device cuda:0 --seed "${seed}" \
-                    --batched_envs 1 --max_steps "${MAX_STEPS}" --summary_only \
-                    --steady_path_workers 1 --batch_contact_ik_backend exact_workers \
-                    --batch_path_backend exact_workers --batch_panel_clearance_backend gpu \
-                    --batch_geometry_fallback_backend numpy_batch \
+                if ! CUDA_VISIBLE_DEVICES="${gpu_id}" \
+                    run_auto_open_python --seed "${seed}" \
+                    --batched_envs 1 --summary_only --steady_path_workers 1 \
                     --standard_dataset_dir "${shard}" \
                     --camera_mount_position_noise_m "${camera_mount_position_noise_m}" \
                     --camera_mount_rotation_noise_deg "${camera_mount_rotation_noise_deg}" \
+                    --camera_focal_scale_noise_fraction "${camera_focal_scale_noise_fraction}" \
+                    --camera_principal_point_noise_px "${camera_principal_point_noise_px}" \
+                    --camera_distortion_noise_fraction "${camera_distortion_noise_fraction}" \
                     --output_dir "${control}" >"${log}" 2>&1; then
                     worker_failures=$((worker_failures + 1))
                 fi
@@ -229,12 +242,19 @@ run_standard_collection() {
     for index in "${!PIDS[@]}"; do
         wait "${PIDS[index]}" || failures=$((failures + 1))
     done
+    if (( failures != 0 )); then
+        echo "Standard collection workers failed; shard aggregation was skipped." >&2
+        exit 1
+    fi
     local standard_seeds_csv elapsed
     standard_seeds_csv="$(IFS=,; echo "${standard_seeds[*]}")"
     elapsed=$(( $(date +%s) - start_epoch ))
     DATASET_ROOT="${dataset_root}" SEEDS_CSV="${standard_seeds_csv}" \
     CAMERA_MOUNT_POSITION_NOISE_M="${camera_mount_position_noise_m}" \
     CAMERA_MOUNT_ROTATION_NOISE_DEG="${camera_mount_rotation_noise_deg}" \
+    CAMERA_FOCAL_SCALE_NOISE_FRACTION="${camera_focal_scale_noise_fraction}" \
+    CAMERA_PRINCIPAL_POINT_NOISE_PX="${camera_principal_point_noise_px}" \
+    CAMERA_DISTORTION_NOISE_FRACTION="${camera_distortion_noise_fraction}" \
     COLLECTION_WALL_TIME_S="${elapsed}" python - <<'PY'
 import os
 from pathlib import Path
@@ -252,10 +272,18 @@ aggregate_standard_shards(
     camera_mount_rotation_noise_deg=float(
         os.environ["CAMERA_MOUNT_ROTATION_NOISE_DEG"]
     ),
+    camera_focal_scale_noise_fraction=float(
+        os.environ["CAMERA_FOCAL_SCALE_NOISE_FRACTION"]
+    ),
+    camera_principal_point_noise_px=float(
+        os.environ["CAMERA_PRINCIPAL_POINT_NOISE_PX"]
+    ),
+    camera_distortion_noise_fraction=float(
+        os.environ["CAMERA_DISTORTION_NOISE_FRACTION"]
+    ),
     collection_wall_time_s=int(os.environ["COLLECTION_WALL_TIME_S"]),
 )
 PY
-    (( failures == 0 )) || exit 1
     echo "Standard collection completed: ${dataset_root}/manifest.json"
 }
 

@@ -17,6 +17,10 @@ for p in [str(LOW_LEVEL_ROOT)]:
 from legged_gym.utils.helpers import build_common_arg_parser, build_env_cfg, format_env_vec, format_float_sequence, load_policy_from_checkpoint
 from legged_gym.utils.isaaclab_app import add_app_launcher_args, launch_app
 from legged_gym.utils.run_metadata import checkpoint_model_path
+from legged_gym.utils.episode_rng import (
+    AUTO_OPEN_CANONICAL_ENV_SEED_ANCHOR,
+    AUTO_OPEN_POLICY_BLOCK_SIZE,
+)
 from legged_gym.scripts.isaaclab_viewer import IsaacLabViewerController
 
 
@@ -76,6 +80,41 @@ class ManipLoco_Policy:
                 raise
             self.rgb_camera_manager = None
             print(f"[rgb_camera][warn] RGB camera manager unavailable: {exc}")
+
+    def _policy_actions(self, observations):
+        """Run DoorMan inference with one batch shape across all workflows."""
+        observations = observations.detach()
+        real_batch = int(observations.shape[0])
+        if not bool(self.env_cfg.enable_doorman_scene):
+            return self.policy(observations, hist_encoding=True)
+
+        episode_seeds = torch.arange(
+            int(self.args.seed),
+            int(self.args.seed) + real_batch,
+            device=observations.device,
+            dtype=torch.long,
+        )
+        relative = episode_seeds - AUTO_OPEN_CANONICAL_ENV_SEED_ANCHOR
+        block_ids = torch.div(
+            relative, AUTO_OPEN_POLICY_BLOCK_SIZE, rounding_mode="floor"
+        )
+        rows = torch.remainder(relative, AUTO_OPEN_POLICY_BLOCK_SIZE)
+        actions = None
+        for block_id in torch.unique(block_ids, sorted=True):
+            env_ids = torch.nonzero(block_ids == block_id, as_tuple=False).flatten()
+            block = observations[env_ids[0]].expand(
+                AUTO_OPEN_POLICY_BLOCK_SIZE, *observations.shape[1:]
+            ).clone()
+            block[rows[env_ids]] = observations[env_ids]
+            block_actions = self.policy(block, hist_encoding=True)
+            if actions is None:
+                actions = torch.empty(
+                    (real_batch, *block_actions.shape[1:]),
+                    device=block_actions.device,
+                    dtype=block_actions.dtype,
+                )
+            actions[env_ids] = block_actions[rows[env_ids]]
+        return actions
 
     def close(self):
         """Release scene and camera references before rebuilding in this app."""
@@ -293,7 +332,7 @@ class ManipLoco_Policy:
         loop_start = time.perf_counter()
         policy_start = time.perf_counter()
         with torch.no_grad():
-            actions = self.policy(self.obs.detach(), hist_encoding=True)
+            actions = self._policy_actions(self.obs)
         policy_dt = time.perf_counter() - policy_start
 
         env_step_start = time.perf_counter()
@@ -437,7 +476,7 @@ class ManipLoco_Policy:
         if self.timestamp == 0:
             print("[doorman] first low-level policy inference...", flush=True)
         with torch.no_grad():
-            actions = self.policy(self.obs.detach(), hist_encoding=True)
+            actions = self._policy_actions(self.obs)
         if self.timestamp == 0:
             print(
                 f"[doorman] first policy action shape={tuple(actions.shape)} "

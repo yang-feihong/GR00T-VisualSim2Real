@@ -7,11 +7,15 @@ import torch
 
 from legged_gym.utils.isaaclab_math import quat_rotate_inverse
 from gr00t.rl.auto_open.geometry import (
+    HANDLE_AXLE_TARGET_MARGIN_M,
+    HANDLE_FREE_TARGET_MARGIN_M,
+    _axial_target_correction,
     _grasp_semantic_axes_world,
     _quat_conjugate_np,
     _quat_mul_np,
     _quat_rotate_inverse_np,
     _quat_rotate_np,
+    _quat_rotate_points_np,
     _rotate_about_z,
     _quat_to_euler_xyz_np,
     _quat_yaw,
@@ -21,6 +25,10 @@ from gr00t.rl.auto_open.utils import as_numpy as _as_np
 
 MAX_BASE_PLANAR_SPEED = 0.4
 MAX_BASE_YAW_RATE = 0.6
+BASE_REVERSAL_CONFIRM_FRAMES = 3
+BASE_REVERSAL_LOCK_FRAMES = 5
+BASE_REVERSAL_JUMP = 0.15
+BASE_REVERSAL_EPSILON = 1.0e-4
 BASE_STATION_TOLERANCE_M = 0.12
 BASE_YAW_TOLERANCE_RAD = 0.08
 THROUGH_STOP_DISTANCE_M = 0.08
@@ -62,12 +70,92 @@ def _limit_base_commands(commands):
     )
     return limited
 
+
+def _stabilize_base_command(self, command):
+    """Reject brief sign reversals outside APPROACH."""
+    target = np.asarray(command, dtype=np.float32).reshape(3)
+    previous = np.asarray(self.base_command_previous, dtype=np.float32).reshape(3)
+    pending_sign = np.asarray(
+        self.base_reversal_pending_sign, dtype=np.int8
+    ).reshape(3)
+    pending_steps = np.asarray(
+        self.base_reversal_pending_steps, dtype=np.int32
+    ).reshape(3)
+    lock_steps = np.asarray(self.base_reversal_lock_steps, dtype=np.int32).reshape(3)
+    output = target.copy()
+    for component in range(3):
+        old = float(previous[component])
+        new = float(target[component])
+        if lock_steps[component] > 0:
+            output[component] = old
+            lock_steps[component] -= 1
+            continue
+        reversing = (
+            abs(old) > BASE_REVERSAL_EPSILON
+            and abs(new) > BASE_REVERSAL_EPSILON
+            and old * new < 0.0
+            and abs(new - old) >= BASE_REVERSAL_JUMP
+        )
+        if not reversing:
+            pending_sign[component] = 0
+            pending_steps[component] = 0
+            continue
+        new_sign = 1 if new > 0.0 else -1
+        if pending_sign[component] == new_sign:
+            pending_steps[component] += 1
+        else:
+            pending_sign[component] = new_sign
+            pending_steps[component] = 1
+        if pending_steps[component] < BASE_REVERSAL_CONFIRM_FRAMES:
+            output[component] = old
+        else:
+            pending_sign[component] = 0
+            pending_steps[component] = 0
+            lock_steps[component] = BASE_REVERSAL_LOCK_FRAMES
+    self.base_command_previous = output.astype(np.float32)
+    self.base_reversal_pending_sign = pending_sign
+    self.base_reversal_pending_steps = pending_steps
+    self.base_reversal_lock_steps = lock_steps
+    return self.base_command_previous.copy()
+
+
+def _zero_cross_base_reversal(self, command):
+    """Insert one zero command before a large APPROACH sign reversal."""
+    target = np.asarray(command, dtype=np.float32).reshape(3)
+    previous = np.asarray(self.base_command_previous, dtype=np.float32).reshape(3)
+    crossing = (previous * target < 0.0) & (
+        np.abs(target - previous) >= BASE_REVERSAL_JUMP
+    )
+    output = target.copy()
+    output[crossing] = 0.0
+    self.base_command_previous = output.astype(np.float32)
+    return self.base_command_previous.copy()
+
+
+def _base_velocity_damping(state):
+    """Return the velocity-only part of the base PD command."""
+    roots = np.asarray(state["root_states"], dtype=np.float32)
+    w, x, y, z = (roots[:, index] for index in range(3, 7))
+    yaw = np.arctan2(
+        2.0 * (w * z + x * y),
+        1.0 - 2.0 * (y * y + z * z),
+    )
+    cosine = np.cos(yaw)
+    sine = np.sin(yaw)
+    command = np.empty((len(roots), 3), dtype=np.float32)
+    command[:, 0] = -(cosine * roots[:, 7] + sine * roots[:, 8])
+    command[:, 1] = -(-sine * roots[:, 7] + cosine * roots[:, 8])
+    command[:, 2] = -0.35 * roots[:, 12]
+    return _limit_base_commands(command)
+
+
 def _base_commands_exact(
     state,
     station_xy,
     station_yaw,
     acceptance_xy=None,
     acceptance_yaw=None,
+    minimum_speed_toward_target_only=False,
 ):
     """Vectorize the scalar controller's mixed-precision default base command."""
     roots = np.asarray(state["root_states"], dtype=np.float32)
@@ -112,12 +200,16 @@ def _base_commands_exact(
         & (planar_norm > 1.0e-6)
         & (planar_norm < 0.15)
     )
+    if minimum_speed_toward_target_only:
+        deadzone &= (command[:, 0] * local_x + command[:, 1] * local_y) > 0.0
     command[deadzone, :2] *= (0.15 / planar_norm[deadzone])[:, None]
     yaw_deadzone = (
         (np.abs(yaw_error) > BASE_YAW_TOLERANCE_RAD)
         & (np.abs(command[:, 2]) > 1.0e-6)
         & (np.abs(command[:, 2]) < 0.2)
     )
+    if minimum_speed_toward_target_only:
+        yaw_deadzone &= (command[:, 2] * yaw_error) > 0.0
     command[yaw_deadzone, 2] = np.copysign(0.2, command[yaw_deadzone, 2])
     acceptance_xy = station_xy if acceptance_xy is None else acceptance_xy
     acceptance_yaw = station_yaw if acceptance_yaw is None else acceptance_yaw
@@ -257,8 +349,41 @@ def _perturb_ee_target(
         rotation_semantic_axes_world=rotation_semantic_axes_world,
     )
     if sample_label == "grasp_chain":
+        target_position = np.asarray(perturbed[0], dtype=np.float32).copy()
+        target_orientation = np.asarray(perturbed[1], dtype=np.float32)
+        jaw_points_local = np.concatenate(
+            (
+                self.open_template["fixed_points"],
+                self.open_template["moving_points"],
+            ),
+            axis=0,
+        )
+        jaw_offsets_world = _quat_rotate_points_np(
+            target_orientation, jaw_points_local
+        )
+        free_axis = np.asarray(
+            self.handle_free_axis_world, dtype=np.float32
+        )
+        jaw_axial = (
+            target_position[None, :]
+            + jaw_offsets_world
+            - self.grasp_center_pos[None, :]
+        ) @ free_axis
+        handle_radius = max(
+            float(self.handle_upper_z - self.handle_lower_z) * 0.5,
+            1.0e-4,
+        )
+        axial_correction = _axial_target_correction(
+            jaw_axial.min(),
+            jaw_axial.max(),
+            self.handle_half_length + handle_radius,
+            HANDLE_AXLE_TARGET_MARGIN_M,
+            HANDLE_FREE_TARGET_MARGIN_M,
+        )
+        target_position += axial_correction * free_axis
+        perturbed = (target_position, target_orientation)
         self.grasp_semantic_position_delta_world = (
-            np.asarray(perturbed[0], dtype=np.float32)
+            target_position
             - np.asarray(target_world, dtype=np.float32)
         )
     return perturbed
@@ -294,6 +419,7 @@ def _base_command(
         np.asarray((target_yaw,), dtype=np.float64),
         np.asarray(acceptance_xy, dtype=np.float32).reshape(1, 2),
         np.asarray((acceptance_yaw,), dtype=np.float64),
+        minimum_speed_toward_target_only=default_target,
     )
     return command[0], float(distance[0]), float(yaw_error[0])
 
@@ -339,6 +465,25 @@ def _ee_world_target(self, local_target):
         np.asarray(local_target, dtype=np.float32).reshape(3) + offset
     )
     return origin + _quat_rotate_np(quat, local_with_center)
+
+
+def _ee_world_orientation_target(self, local_rpy):
+    """Map one goal-frame XYZ Euler orientation into world coordinates."""
+    roll, pitch, yaw = np.asarray(local_rpy, dtype=np.float64).reshape(3)
+    cr, sr = math.cos(0.5 * roll), math.sin(0.5 * roll)
+    cp, sp = math.cos(0.5 * pitch), math.sin(0.5 * pitch)
+    cy, sy = math.cos(0.5 * yaw), math.sin(0.5 * yaw)
+    local_quat = np.asarray(
+        (
+            cr * cp * cy + sr * sp * sy,
+            sr * cp * cy - cr * sp * sy,
+            cr * sp * cy + sr * cp * sy,
+            cr * cp * sy - sr * sp * cy,
+        ),
+        dtype=np.float32,
+    )
+    goal_ref_quat = _as_np(self.env.get_goal_reference_quat())[0]
+    return _quat_mul_np(goal_ref_quat, local_quat)
 
 def _grasp_orientation_delta(self, ee_goal_local, grasp_quat_world):
     """Convert the configured B2Z1 grasp orientation into teleop RPY deltas."""

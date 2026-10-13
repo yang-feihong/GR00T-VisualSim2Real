@@ -72,6 +72,9 @@ def build_grouped_training_doorman_door_cfgs(
                 random_seed=stream_seed(
                     episode_seeds[env_id], "door_physics"
                 ),
+                visual_random_seed=stream_seed(
+                    episode_seeds[env_id], "door_visual"
+                ),
             )
             for asset_cfg, env_id in zip(
                 door_cfg.spawn.assets_cfg, env_ids, strict=True

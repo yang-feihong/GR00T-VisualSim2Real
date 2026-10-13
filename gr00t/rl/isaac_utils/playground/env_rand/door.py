@@ -73,6 +73,7 @@ def _episode_seeded_spawn(function):
 @configclass
 class DoorSpawnerCfg(sim_utils.RigidObjectSpawnerCfg):
     random_seed: Optional[int] = None
+    visual_random_seed: Optional[int] = None
     articulation_props: sim_utils.ArticulationRootPropertiesCfg = None
     articulation_root_name: str = "root"
     door_width: tuple[float, float] = (0.8, 1.1)
@@ -224,10 +225,16 @@ def spawn_door(
 ) -> Usd.Prim:
     global MR
     # Rendering is optional, so its random draws must not alter door physics.
-    # Clone the current stream for visual-only choices while leaving the
-    # existing physical stream and its seed-to-scene mapping unchanged.
-    visual_rng = np.random.RandomState()
-    visual_rng.set_state(np.random.get_state())
+    if cfg.visual_random_seed is None:
+        visual_rng = np.random.RandomState()
+        visual_rng.set_state(np.random.get_state())
+    else:
+        visual_rng = np.random.RandomState(
+            int(cfg.visual_random_seed) % (2**32)
+        )
+    visual_metadata = {"materials": {}, "lights": {}}
+    if cfg.visual_random_seed is not None:
+        visual_metadata["randomSeed"] = str(int(cfg.visual_random_seed))
     if cfg.randomize_material and cfg.dynamic_material_randomization and MR is None:
         MR = _get_material_randomization()
     stage: Usd.Stage = omni.usd.get_context().get_stage()
@@ -707,6 +714,13 @@ def spawn_door(
         bind_visual_material(panel_prim_path, door_panel_material_prim_path, stage)
         bind_visual_material(handle_prim_path, handle_material_prim_path, stage)
         bind_visual_material(covers_prim_path, handle_material_prim_path, stage)
+        visual_metadata.setdefault("materials", {}).update(
+            {
+                "doorFrame": str(door_frame_material_prim_path),
+                "doorPanel": str(door_panel_material_prim_path),
+                "handle": str(handle_material_prim_path),
+            }
+        )
 
         if cfg.dynamic_material_randomization:
             _call_with_numpy_random_stream(visual_rng, MR.add_to_prim,
@@ -965,11 +979,19 @@ def spawn_door(
         )
 
         if cfg.randomize_material and wall_material_prim_paths:
+            front_floor_material = visual_rng.choice(wall_material_prim_paths)
+            rear_floor_material = visual_rng.choice(wall_material_prim_paths)
             bind_visual_material(
-                front_floor_prim_path, visual_rng.choice(wall_material_prim_paths), stage
+                front_floor_prim_path, front_floor_material, stage
             )
             bind_visual_material(
-                rear_floor_prim_path, visual_rng.choice(wall_material_prim_paths), stage
+                rear_floor_prim_path, rear_floor_material, stage
+            )
+            visual_metadata.setdefault("materials", {}).update(
+                {
+                    "frontFloor": str(front_floor_material),
+                    "rearFloor": str(rear_floor_material),
+                }
             )
 
             if cfg.dynamic_material_randomization:
@@ -987,46 +1009,109 @@ def spawn_door(
                 )
 
     if cfg.add_lights:
+        if not cfg.add_walls:
+            front = float(
+                visual_rng.uniform(
+                    cfg.wall_minimum_clearance_fblr[0],
+                    cfg.wall_maximum_clearance_fblr[0],
+                )
+            )
+            rear = float(
+                visual_rng.uniform(
+                    cfg.wall_minimum_clearance_fblr[1],
+                    cfg.wall_maximum_clearance_fblr[1],
+                )
+            )
+            left_front = float(
+                visual_rng.uniform(
+                    cfg.wall_minimum_clearance_fblr[2],
+                    cfg.wall_maximum_clearance_fblr[2],
+                )
+            )
+            right_front = float(
+                visual_rng.uniform(
+                    cfg.wall_minimum_clearance_fblr[3],
+                    cfg.wall_maximum_clearance_fblr[3],
+                )
+            )
+            left_rear = float(
+                visual_rng.uniform(
+                    cfg.wall_minimum_clearance_fblr[2],
+                    cfg.wall_maximum_clearance_fblr[2],
+                )
+            )
+            right_rear = float(
+                visual_rng.uniform(
+                    cfg.wall_minimum_clearance_fblr[3],
+                    cfg.wall_maximum_clearance_fblr[3],
+                )
+            )
         # build lights
         front_light_prim_path = os.path.join(root_prim_path, "front_light")
+        front_light_temperature = float(visual_rng.uniform(4000, 6000))
+        front_light_intensity = float(visual_rng.uniform(4000, 5000))
+        front_light_position = (
+            -front / 2,
+            visual_rng.uniform(-right_front + 0.5, left_front - 0.5) / 2,
+            total_wall_height - 0.05,
+        )
         create_rect_light(
             stage,
             front_light_prim_path,
             (1.2, 0.6),
-            temperature=visual_rng.uniform(4000, 6000),
-            intensity=visual_rng.uniform(4000, 5000),
+            temperature=front_light_temperature,
+            intensity=front_light_intensity,
         )
         set_prim_transform(
             stage,
             front_light_prim_path,
-            (
-                -front / 2,
-                visual_rng.uniform(-right_front + 0.5, left_front - 0.5) / 2,
-                total_wall_height - 0.05,
-            ),
+            front_light_position,
             (0, 0, 0),
             (1.0, 1.0, 1.0),
         )
+        visual_metadata.setdefault("lights", {})["front"] = {
+                "primPath": front_light_prim_path,
+                "size": [1.2, 0.6],
+                "position": [float(value) for value in front_light_position],
+                "temperatureK": front_light_temperature,
+                "intensity": front_light_intensity,
+            }
 
         rear_light_prim_path = os.path.join(root_prim_path, "rear_light")
+        rear_light_temperature = float(visual_rng.uniform(4000, 6000))
+        rear_light_intensity = float(visual_rng.uniform(4000, 5000))
+        rear_light_position = (
+            rear / 2,
+            visual_rng.uniform(-right_rear + 0.5, left_rear - 0.5) / 2,
+            total_wall_height - 0.05,
+        )
         create_rect_light(
             stage,
             rear_light_prim_path,
             (1.2, 0.6),
-            temperature=visual_rng.uniform(4000, 6000),
-            intensity=visual_rng.uniform(4000, 5000),
+            temperature=rear_light_temperature,
+            intensity=rear_light_intensity,
         )
         set_prim_transform(
             stage,
             rear_light_prim_path,
-            (
-                rear / 2,
-                visual_rng.uniform(-right_rear + 0.5, left_rear - 0.5) / 2,
-                total_wall_height - 0.05,
-            ),
+            rear_light_position,
             (0, 0, 0),
             (1.0, 1.0, 1.0),
         )
+        visual_metadata.setdefault("lights", {})["rear"] = {
+                "primPath": rear_light_prim_path,
+                "size": [1.2, 0.6],
+                "position": [float(value) for value in rear_light_position],
+                "temperatureK": rear_light_temperature,
+                "intensity": rear_light_intensity,
+            }
+
+    visual_metadata = {
+        key: value
+        for key, value in visual_metadata.items()
+        if value != {}
+    }
 
     # encode some metadata
     metadata_key = "customData"
@@ -1051,6 +1136,7 @@ def spawn_door(
         "hingeDriveDamping": hinge_drive.GetDampingAttr().Get(),
         "hingeDriveStiffness": hinge_drive.GetStiffnessAttr().Get(),
         "handleDriveMaxForce": handle_drive.GetMaxForceAttr().Get(),
+        "visual": visual_metadata,
     }
     if cfg.add_walls:
         metadata_value["front"] = front

@@ -15,7 +15,7 @@ from legged_gym.utils.door_diagnostic_camera import (
     closed_leaf_pose,
     infer_push_side_leaf,
 )
-from legged_gym.utils.episode_rng import episode_uniform_rows
+from legged_gym.utils.episode_rng import canonical_env_origins, episode_uniform_rows
 from .legged_robot_config import LeggedRobotIsaacLabCfg
 import numpy as np
 
@@ -395,6 +395,7 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         self._wrap_scene_entity_write_methods()
 
     def _setup_scene(self):
+        self._configure_canonical_doorman_env_origins()
         self._setup_imported_scene()
 
         self.robot = Articulation(self.cfg.robot)
@@ -499,6 +500,8 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         self.cfg.terrain.num_envs = self.scene.cfg.num_envs
         self.cfg.terrain.env_spacing = self.scene.cfg.env_spacing
         self._terrain = self.cfg.terrain.class_type(self.cfg.terrain)
+        if self.cfg.enable_doorman_scene:
+            self._terrain.env_origins.copy_(self._canonical_doorman_env_origins)
         self._init_terrain_height_samples()
         self.scene.clone_environments(copy_from_source=False)
         if self.cfg.doorman_door_groups:
@@ -523,6 +526,46 @@ class LeggedRobotIsaacLab(DirectRLEnv):
             global_prim_paths.append(self.cfg.scene_prim_path)
         self.scene.filter_collisions(global_prim_paths=global_prim_paths)
         self.sim.set_camera_view((4.0, 0.0, 2.0), (0.0, 0.0, 0.5))
+
+    def _configure_canonical_doorman_env_origins(self):
+        """Place each episode seed at the same world origin in every workflow."""
+        if not self.cfg.enable_doorman_scene:
+            return
+
+        from pxr import Gf, UsdGeom
+
+        origins = canonical_env_origins(
+            int(getattr(self.cfg, "seed", 0) or 0),
+            self.scene.cfg.num_envs,
+            self.scene.cfg.env_spacing,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        stage = sim_utils.get_current_stage()
+        for env_id, origin in enumerate(origins.cpu().tolist()):
+            prim_path = self.scene.env_prim_paths[env_id]
+            prim = stage.GetPrimAtPath(prim_path)
+            if not prim.IsValid():
+                raise RuntimeError(f"Missing environment prim {prim_path}")
+            xformable = UsdGeom.Xformable(prim)
+            translate_ops = [
+                op
+                for op in xformable.GetOrderedXformOps()
+                if op.GetOpType() == UsdGeom.XformOp.TypeTranslate
+            ]
+            translate_op = (
+                translate_ops[0]
+                if translate_ops
+                else xformable.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble)
+            )
+            translate_op.Set(Gf.Vec3d(*origin))
+
+        # InteractiveScene cloned empty Xforms before task assets were spawned.
+        # Keep its cache and origin bookkeeping aligned for the later asset clone.
+        origin_rows = origins.cpu().tolist()
+        self.scene.cloner._positions = origin_rows
+        self.scene._default_env_origins = origins.clone()
+        self._canonical_doorman_env_origins = origins
 
     def _setup_imported_scene(self):
         scene_usd_path = str(self.cfg.scene_usd_path or "").strip()
@@ -664,14 +707,19 @@ class LeggedRobotIsaacLab(DirectRLEnv):
             )
 
         if projection_type == "opencvFisheye":
+            # This pinhole is only the carrier prim.  Use parameters Omniverse
+            # can represent exactly, then apply the real OpenCV fisheye schema
+            # below.  Supplying the fisheye intrinsics here emits misleading
+            # averaging/centering warnings before the schema overrides them.
+            carrier_focal_px = 0.5 * (float(spec["fx"]) + float(spec["fy"]))
             return sim_utils.PinholeCameraCfg.from_intrinsic_matrix(
                 intrinsic_matrix=[
-                    float(spec["fx"]),
-                    float(spec.get("skew", 0.0)),
-                    float(spec["cx"]),
+                    carrier_focal_px,
                     0.0,
-                    float(spec["fy"]),
-                    float(spec["cy"]),
+                    0.5 * float(spec["width"]),
+                    0.0,
+                    carrier_focal_px,
+                    0.5 * float(spec["height"]),
                     0.0,
                     0.0,
                     1.0,
@@ -701,7 +749,7 @@ class LeggedRobotIsaacLab(DirectRLEnv):
     @staticmethod
     def _apply_rgb_camera_lens_calibration(camera_prim_path: str, spec):
         if str(spec.get("projection_type", "pinhole")) != "opencvFisheye":
-            return
+            return None
 
         from pxr import Gf
 
@@ -729,10 +777,47 @@ class LeggedRobotIsaacLab(DirectRLEnv):
             attribute.Set(value)
         skew = float(spec.get("skew", 0.0))
         if abs(skew) > 1.0e-9:
-            print(
-                f"[rgb_camera][warn] OpenCV fisheye skew={skew:g} px is retained as calibration metadata "
-                "but is not supported by the Isaac Sim lens-distortion schema."
+            raise ValueError(
+                f"OpenCV fisheye skew={skew:g} is not supported by Isaac Sim; "
+                "runtime calibration must contain the effective value 0"
             )
+
+        effective = {}
+        for attribute_name, requested in attributes.items():
+            actual = camera_prim.GetAttribute(attribute_name).Get()
+            if attribute_name.endswith("imageSize"):
+                requested_pair = (int(requested[0]), int(requested[1]))
+                actual_pair = (int(actual[0]), int(actual[1]))
+                if actual_pair != requested_pair:
+                    raise RuntimeError(
+                        f"fisheye calibration readback mismatch for {attribute_name}: "
+                        f"requested={requested_pair} actual={actual_pair}"
+                    )
+                effective["image_size"] = list(actual_pair)
+            elif attribute_name.endswith("model"):
+                if str(actual) != str(requested):
+                    raise RuntimeError(
+                        f"fisheye calibration readback mismatch for {attribute_name}: "
+                        f"requested={requested!r} actual={actual!r}"
+                    )
+                effective["model"] = str(actual)
+            else:
+                requested_value = float(requested)
+                actual_value = float(actual)
+                if actual_value != requested_value:
+                    raise RuntimeError(
+                        f"fisheye calibration readback mismatch for {attribute_name}: "
+                        f"requested={requested_value} actual={actual_value}"
+                    )
+                effective[attribute_name.rsplit(":", 1)[-1]] = actual_value
+        effective["skew"] = 0.0
+        print(
+            f"[rgb_camera] verified effective OpenCV fisheye calibration "
+            f"for {camera_prim_path}: fx={effective['fx']:.6f} "
+            f"fy={effective['fy']:.6f} cx={effective['cx']:.6f} "
+            f"cy={effective['cy']:.6f}"
+        )
+        return effective
 
     def _setup_tiled_rgb_cameras(self, specs, tiled_camera_cls, tiled_camera_cfg_cls, horizontal_aperture: float):
         all_eye_defs = []
@@ -882,7 +967,9 @@ class LeggedRobotIsaacLab(DirectRLEnv):
                     ),
                 )
                 camera = Camera(camera_cfg)
-                self._apply_rgb_camera_lens_calibration(camera_cfg.prim_path, spec)
+                effective_calibration = self._apply_rgb_camera_lens_calibration(
+                    camera_cfg.prim_path, spec
+                )
                 diagnostic = spec.get("door_diagnostic")
                 if diagnostic and float(diagnostic["fill_light_intensity"]) > 0.0:
                     light_cfg = sim_utils.SphereLightCfg(
@@ -912,6 +999,7 @@ class LeggedRobotIsaacLab(DirectRLEnv):
                 "door_diagnostic": spec.get("door_diagnostic"),
                 "valid_circle_mask": spec.get("valid_circle_mask"),
                 "cameras": rig_cameras,
+                "effective_calibration": effective_calibration,
                 "eyes": [
                     {
                         "name": eye_def["eye_name"],

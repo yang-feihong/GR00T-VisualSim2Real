@@ -470,6 +470,10 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
                     transition_mask,
                     self.teleop_arm_joint_speed_limits * float(self.dt),
                 )
+            if torch.any(joint_mask):
+                self.teleop_arm_joint_limited_targets[joint_mask] = (
+                    self._arm_pos_targets_for_step[joint_mask]
+                )
         self._profile_record("arm_target", time.perf_counter() - section_start)
         self._profile_record("pre_total", max(time.perf_counter() - profile_start - rgb_pose_elapsed, 0.0))
 
@@ -1009,11 +1013,24 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
             return
         if mode == "joint":
             changed = env_ids[~self.teleop_arm_joint_control_mask[env_ids]]
+            if changed.numel() > 0:
+                transition_origin = (
+                    self.dof_pos[:, self.arm_joint_ids]
+                    if self._arm_pos_targets_for_step is None
+                    else self._arm_pos_targets_for_step
+                )
+                self.teleop_arm_joint_limited_targets[changed] = (
+                    transition_origin[changed]
+                )
             self._sync_teleop_arm_joint_targets_to_current_pose(changed)
             self.teleop_arm_joint_control_mask[env_ids] = True
         elif mode == "ee":
             changed = env_ids[self.teleop_arm_joint_control_mask[env_ids]]
             self._sync_teleop_ee_goal_to_current_pose(changed)
+            if changed.numel() > 0:
+                actual = self.dof_pos[changed][:, self.arm_joint_ids]
+                self.teleop_cartesian_transition_targets[changed] = actual
+                self.teleop_cartesian_transition_active[changed] = True
             self.teleop_arm_joint_control_mask[env_ids] = False
         else:
             raise ValueError(f"Unsupported teleop arm control mode: {mode}")
@@ -1025,32 +1042,6 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
             self.teleop_arm_control_mode = "mixed"
         if self.num_envs == 1:
             print(f"[teleop] arm control mode: {mode}")
-
-    def begin_cartesian_transition(self, env_ids=None):
-        """Enter Cartesian control continuously from measured arm joints."""
-        if env_ids is None:
-            env_ids = torch.arange(self.num_envs, device=self.device)
-        else:
-            env_ids = torch.as_tensor(
-                env_ids, device=self.device, dtype=torch.long
-            ).reshape(-1)
-        if env_ids.numel() == 0:
-            return
-        actual = self.dof_pos[env_ids][:, self.arm_joint_ids]
-        self.teleop_cartesian_transition_targets[env_ids] = actual
-        self.teleop_cartesian_transition_active[env_ids] = True
-
-    def cartesian_transition_is_active(self, env_ids=None):
-        if env_ids is None:
-            active = self.teleop_cartesian_transition_active
-        else:
-            env_ids = torch.as_tensor(
-                env_ids, device=self.device, dtype=torch.long
-            ).reshape(-1)
-            active = self.teleop_cartesian_transition_active[env_ids]
-        if active.numel() == 1:
-            return bool(active.item())
-        return active.clone()
 
     def _reset_teleop_ee_goal_to_default(self):
         self.curr_ee_goal_sphere[:] = self.reset_init_ee_sphere[:]

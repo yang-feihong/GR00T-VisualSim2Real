@@ -22,12 +22,12 @@ from legged_gym.utils.steady_path_worker import (
 )
 from gr00t.rl.auto_open.cli import LOWLEVEL_ROOT
 from gr00t.rl.auto_open.geometry import (
-    CENTER_HANDLE_MIN_AXIAL_OVERLAP,
+    HANDLE_AXLE_MARGIN_MIN_M,
+    HANDLE_FREE_MARGIN_MIN_M,
     _batched_geometry_metrics_gpu,
     _batched_geometry_metrics_numpy,
     _batched_handle_centers_gpu,
     _batched_panel_finger_clearance_gpu,
-    _center_handle_axial_overlap,
     _make_batched_geometry_cache,
     _resolved_door_prim_path,
 )
@@ -71,6 +71,8 @@ def _numpy_geometry_requires_exact_scalar(
         ("channel_vertical_error", 0.010, True),
         ("grasp_depth", 0.015, False),
         ("panel_clearance", 0.005, False),
+        ("handle_axle_margin", HANDLE_AXLE_MARGIN_MIN_M, False),
+        ("handle_free_margin", HANDLE_FREE_MARGIN_MIN_M, False),
     )
     for name, threshold, absolute_value in boundaries:
         value = float(metrics[name])
@@ -80,14 +82,6 @@ def _numpy_geometry_requires_exact_scalar(
             value = abs(value)
         if abs(value - threshold) <= numerical_guard_m:
             return True
-    axial_overlap = _center_handle_axial_overlap(controller, metrics)
-    if not math.isfinite(axial_overlap):
-        return True
-    if (
-        abs(axial_overlap - CENTER_HANDLE_MIN_AXIAL_OVERLAP)
-        <= numerical_guard_m
-    ):
-        return True
     return False
 
 def _slice_control_state(state, env_id, num_envs):
@@ -164,12 +158,6 @@ class _BatchedEnvView:
                 return
             self._arm_mode_buffer[self._env_id] = joint_mode
         self._env._set_teleop_arm_control_mode(mode, [self._env_id])
-
-    def begin_cartesian_transition(self):
-        self._env.begin_cartesian_transition([self._env_id])
-
-    def cartesian_transition_is_active(self):
-        return self._env.cartesian_transition_is_active([self._env_id])
 
 class _BatchedRunnerView:
     """Collect one controller's commands into shared vectorized teleop buffers."""
@@ -421,6 +409,7 @@ class _BatchedStabilityTracker:
 def _write_batched_episode_result(
     args, controller, runner, state, env_id, seed, step_count, max_finger_force,
     max_abs_hinge_speed, initial_root_state, initial_dof_position,
+    initial_policy_observation, first_low_level_action,
 ):
     episode_dir = args.output_dir / f"seed_{seed}"
     episode_dir.mkdir(parents=True, exist_ok=False)
@@ -428,6 +417,20 @@ def _write_batched_episode_result(
     door_prim = runner.env.sim.stage.GetPrimAtPath(door_path)
     door_randomization = dict(door_prim.GetMetadata("customData") or {})
     arm_joint_ids = _as_np(runner.env.arm_joint_ids).astype(int)
+    env_origin = _as_np(runner.env.scene.env_origins)[env_id]
+    initial_root_local = initial_root_state.copy()
+    initial_root_local[:3] -= env_origin
+    arm_retract_records = controller.arm_retract_randomization_records
+    arm_retract_evaluated = sum(
+        int(record["evaluated_candidates"]) for record in arm_retract_records
+    )
+    arm_retract_unreachable = sum(
+        int(record["unreachable_candidates"]) for record in arm_retract_records
+    )
+    arm_retract_resampled = sum(
+        int(record["rejected_before_acceptance"])
+        for record in arm_retract_records
+    )
     metadata = {
         "schema_version": "doorman_boundary_v1",
         "seed": seed,
@@ -439,6 +442,24 @@ def _write_batched_episode_result(
         "acceptance_diagnostics": controller.last_acceptance_diagnostics,
         "stage_exit_diagnostics": controller.stage_exit_diagnostics,
         "target_noise": controller.target_noise.metadata(),
+        "arm_retract_randomization": {
+            "base_pose_local": controller.arm_retract_pose_local.tolist(),
+            "position_radius_m": float(
+                controller.arm_retract_position_noise_radius_m
+            ),
+            "rotation_bound_deg": float(
+                controller.arm_retract_rotation_noise_deg
+            ),
+            "entries": arm_retract_records,
+            "evaluated_candidates": arm_retract_evaluated,
+            "unreachable_candidates": arm_retract_unreachable,
+            "rejected_before_acceptance": arm_retract_resampled,
+            "unreachable_frequency": (
+                arm_retract_unreachable / arm_retract_evaluated
+                if arm_retract_evaluated
+                else 0.0
+            ),
+        },
         "camera": {"enabled": False, "names": [], "frame_count": {}},
         "scene": {
             "door_prim_path": door_path,
@@ -447,10 +468,15 @@ def _write_batched_episode_result(
         },
         "robot_state": {
             "initial_base_pose_w": initial_root_state.tolist(),
+            "initial_base_pose_env": initial_root_local.tolist(),
             "initial_arm_joint_position": initial_dof_position[arm_joint_ids].tolist(),
             "initial_gripper_position": float(
                 initial_dof_position[int(runner.env.gripper_joint_ids[0].item())]
             ),
+        },
+        "consistency_signature": {
+            "initial_policy_observation": initial_policy_observation.tolist(),
+            "first_low_level_action": first_low_level_action.tolist(),
         },
         "result": {
             "final_stage": controller.stage.name,
@@ -477,26 +503,7 @@ def _run_batched(args, *, controller_cls, stage_enum):
     if args.env_spacing is None:
         args.env_spacing = 8.0
     base_seed = int(args.seed if args.seed is not None else 0)
-    if args.batch_active_env_ids is None:
-        active_env_ids = tuple(range(num_envs))
-    else:
-        active_env_ids = tuple(
-            sorted(
-                {
-                    int(value.strip())
-                    for value in args.batch_active_env_ids.split(",")
-                    if value.strip()
-                }
-            )
-        )
-        if not active_env_ids:
-            raise ValueError("--batch_active_env_ids must select at least one env")
-        if active_env_ids[0] < 0 or active_env_ids[-1] >= num_envs:
-            raise ValueError(
-                "--batch_active_env_ids contains an id outside --batched_envs"
-            )
-    active_env_mask = np.zeros(num_envs, dtype=bool)
-    active_env_mask[list(active_env_ids)] = True
+    active_env_ids = tuple(range(num_envs))
     torch.manual_seed(base_seed)
     np.random.seed(base_seed)
     runner = ManipLoco_Policy(args)
@@ -588,6 +595,11 @@ def _run_batched(args, *, controller_cls, stage_enum):
                 shared_robot_geometry=shared_robot_geometry,
                 target_noise_seed=base_seed + env_id,
                 target_noise_config=args.target_noise_config,
+                arm_retract_pose_local=args.arm_retract_pose_local,
+                arm_retract_position_noise_radius_m=(
+                    args.arm_retract_position_noise_radius_m
+                ),
+                arm_retract_rotation_noise_deg=args.arm_retract_rotation_noise_deg,
             )
             controller.defer_batched_orientation_delta = True
             reset_controller(
@@ -630,6 +642,10 @@ def _run_batched(args, *, controller_cls, stage_enum):
     initial_root_states = _as_np(full_state["root_states"])[:, :7].copy()
     initial_dof_positions = _as_np(full_state["dof_pos"]).copy()
     initial_gripper_positions = _as_np(full_state["gripper_position"]).reshape(-1).copy()
+    initial_policy_observations = _as_np(runner.obs).copy()
+    first_low_level_actions = np.full(
+        (num_envs, env.num_actions), np.nan, dtype=np.float32
+    )
     standard_collector = None
     standard_door_randomization = None
     standard_door_asset_snapshot = None
@@ -638,9 +654,9 @@ def _run_batched(args, *, controller_cls, stage_enum):
     if args.record_video and num_envs != 1:
         raise ValueError("video regression uses the unified runner with batch size one")
     if args.standard_dataset_dir is not None:
-        if num_envs != 1 or active_env_ids != (0,):
+        if num_envs != 1:
             raise ValueError(
-                "standard collection uses the unified runner with exactly one active environment"
+                "standard collection uses the unified runner with exactly one environment"
             )
         from gr00t.rl.data_collection.auto_open_collector import (
             AutoOpenStandardEpisodeCollector,
@@ -744,6 +760,7 @@ def _run_batched(args, *, controller_cls, stage_enum):
             station_yaw,
             nominal_station_xy,
             nominal_station_yaw,
+            minimum_speed_toward_target_only=True,
         )
         base_command_exact_s += time.perf_counter() - phase_start
         phase_start = time.perf_counter()
@@ -755,8 +772,7 @@ def _run_batched(args, *, controller_cls, stage_enum):
             panel_clearance_env_ids = [
                 env_id
                 for env_id, controller in enumerate(controllers)
-                if active_env_mask[env_id]
-                and controller.stage
+                if controller.stage
                 in (
                     Stage.CONTACT_PANEL,
                     Stage.PUSH_OPEN,
@@ -788,9 +804,6 @@ def _run_batched(args, *, controller_cls, stage_enum):
             controller.batched_default_base_command = tuple(
                 value[env_id] for value in batched_base_command
             )
-            if not active_env_mask[env_id]:
-                command_buffers["base"][env_id] = 0.0
-                continue
             if controller.stage in (Stage.SUCCESS, Stage.FAILURE):
                 command_buffers["base"][env_id] = 0.0
                 continue
@@ -911,8 +924,7 @@ def _run_batched(args, *, controller_cls, stage_enum):
         orientation_env_ids = [
             env_id
             for env_id, controller in enumerate(controllers)
-            if active_env_mask[env_id]
-            and controller.stage not in (Stage.SUCCESS, Stage.FAILURE)
+            if controller.stage not in (Stage.SUCCESS, Stage.FAILURE)
         ]
         phase_start = time.perf_counter()
         orientation_delta = _batched_grasp_orientation_delta_gpu(
@@ -945,6 +957,8 @@ def _run_batched(args, *, controller_cls, stage_enum):
             )
         phase_start = time.perf_counter()
         result = runner.step_once()
+        if step == 0:
+            first_low_level_actions[:] = _as_np(result["low_level_action"])
         if standard_collector is not None:
             standard_collector.complete_after_step(result)
         elif args.record_video:
@@ -1006,8 +1020,7 @@ def _run_batched(args, *, controller_cls, stage_enum):
             panel_clearance_env_ids = [
                 env_id
                 for env_id, controller in enumerate(controllers)
-                if active_env_mask[env_id]
-                and controller.stage
+                if controller.stage
                 in (
                     Stage.CONTACT_PANEL,
                     Stage.PUSH_OPEN,
@@ -1086,7 +1099,7 @@ def _run_batched(args, *, controller_cls, stage_enum):
             phase_start = time.perf_counter()
             planning = []
             for env_id, controller in enumerate(controllers):
-                if not active_env_mask[env_id] or controller.stage != Stage.APPROACH:
+                if controller.stage != Stage.APPROACH:
                     continue
                 sliced_state = state_rows[env_id]
                 root_state = _as_np(sliced_state["root_states"])[0]
@@ -1178,8 +1191,6 @@ def _run_batched(args, *, controller_cls, stage_enum):
         phase_start = time.perf_counter()
         deferred_path_requests = []
         for env_id, (view, controller) in enumerate(zip(views, controllers)):
-            if not active_env_mask[env_id]:
-                continue
             if controller.stage in (Stage.SUCCESS, Stage.FAILURE):
                 continue
             sliced_state = state_rows[env_id]
@@ -1327,7 +1338,69 @@ def _run_batched(args, *, controller_cls, stage_enum):
             max_abs_hinge_speeds[env_id],
             initial_root_states[env_id],
             initial_dof_positions[env_id],
+            initial_policy_observations[env_id],
+            first_low_level_actions[env_id],
         )
+    retract_records = [
+        record
+        for env_id in active_env_ids
+        for record in controllers[env_id].arm_retract_randomization_records
+    ]
+    retract_evaluated = sum(
+        int(record["evaluated_candidates"]) for record in retract_records
+    )
+    retract_rejected = [
+        rejected
+        for record in retract_records
+        for rejected in record["rejected"]
+    ]
+    retract_resampled = sum(
+        int(record["rejected_before_acceptance"])
+        for record in retract_records
+    )
+    rejected_pose = np.asarray(
+        [record["pose_local"] for record in retract_rejected], dtype=np.float64
+    ).reshape(-1, 6)
+    rejected_delta = np.asarray(
+        [
+            record["position_delta_m"] + record["rpy_delta_rad"]
+            for record in retract_rejected
+        ],
+        dtype=np.float64,
+    ).reshape(-1, 6)
+    retract_distribution = None
+    if len(rejected_delta):
+        retract_distribution = {
+            "dimensions": ["x", "y", "z", "roll", "pitch", "yaw"],
+            "pose_local_mean": rejected_pose.mean(axis=0).tolist(),
+            "pose_local_std": rejected_pose.std(axis=0).tolist(),
+            "delta_mean": rejected_delta.mean(axis=0).tolist(),
+            "delta_std": rejected_delta.std(axis=0).tolist(),
+            "delta_min": rejected_delta.min(axis=0).tolist(),
+            "delta_max": rejected_delta.max(axis=0).tolist(),
+            "delta_quantiles": {
+                str(percentile): np.percentile(
+                    rejected_delta, percentile, axis=0
+                ).tolist()
+                for percentile in (5, 25, 50, 75, 95)
+            },
+        }
+    arm_retract_summary = {
+        "entries": len(retract_records),
+        "evaluated_candidates": retract_evaluated,
+        "unreachable_candidates": len(retract_rejected),
+        "rejected_before_acceptance": retract_resampled,
+        "entries_requiring_resample": sum(
+            int(record["rejected_before_acceptance"] > 0)
+            for record in retract_records
+        ),
+        "unreachable_frequency": (
+            len(retract_rejected) / retract_evaluated
+            if retract_evaluated
+            else 0.0
+        ),
+        "rejected_distribution": retract_distribution,
+    }
     if args.record_video:
         episode_dir = args.output_dir / f"seed_{base_seed}"
         video_dir = episode_dir / "video"
@@ -1395,6 +1468,7 @@ def _run_batched(args, *, controller_cls, stage_enum):
         "batch_timing": batch_timing,
         "panel_clearance_backend": args.batch_panel_clearance_backend,
         "geometry_fallback_backend": args.batch_geometry_fallback_backend,
+        "arm_retract_randomization": arm_retract_summary,
         "geometry_numpy_backend": (
             geometry_numpy_backend_stats
             if args.batch_geometry_fallback_backend == "numpy_batch"

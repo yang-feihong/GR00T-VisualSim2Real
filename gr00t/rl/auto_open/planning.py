@@ -10,6 +10,8 @@ from gr00t.rl.envs.door.b2z1_reset_geometry import (
     solve_b2z1_arm_ik,
 )
 from gr00t.rl.auto_open.control import (
+    _ee_world_orientation_target,
+    _ee_world_target,
     _quat_distance,
     _quat_nlerp,
     _perturb_ee_target,
@@ -309,6 +311,180 @@ def _select_reachable_panel_contact_target(
         flush=True,
     )
     return candidates[selected].astype(np.float32)
+
+
+ARM_RETRACT_CANDIDATE_BATCH_SIZE = 64
+ARM_RETRACT_MAX_CANDIDATES = 4096
+
+
+def _sample_ball_uniform_volume(rng, count, radius):
+    """Sample Cartesian offsets uniformly by volume inside a 3-D ball."""
+    directions = rng.normal(size=(count, 3))
+    norms = np.linalg.norm(directions, axis=1, keepdims=True)
+    while np.any(norms <= 1.0e-12):
+        invalid = norms[:, 0] <= 1.0e-12
+        directions[invalid] = rng.normal(size=(int(np.sum(invalid)), 3))
+        norms = np.linalg.norm(directions, axis=1, keepdims=True)
+    radii = float(radius) * np.cbrt(rng.random(count))
+    return directions / norms * radii[:, None]
+
+
+def _sample_reachable_arm_retract_pose(self, state, stage_label):
+    """Sample one per-entry retract pose, rejecting candidates by batched IK."""
+    entry_index = int(self.arm_retract_entry_count)
+    self.arm_retract_entry_count += 1
+    seed_sequence = np.random.SeedSequence(
+        [self.arm_retract_random_seed, 0xA2E7_2AC7, entry_index]
+    )
+    rng = np.random.default_rng(seed_sequence)
+    base_pose = np.asarray(self.arm_retract_pose_local, dtype=np.float64)
+    radius = float(self.arm_retract_position_noise_radius_m)
+    rotation_bound = math.radians(float(self.arm_retract_rotation_noise_deg))
+
+    dof_names = list(state["dof_names"])
+    dof_positions = _as_np(state["dof_pos"])[0]
+    dof_index = {name: index for index, name in enumerate(dof_names)}
+    initial_arm = np.asarray(
+        [dof_positions[dof_index[name]] for name in self.ee_steady_model.arm_joint_names],
+        dtype=np.float64,
+    )
+    root = _as_np(state["root_states"])[0].astype(np.float64)
+    root_xyzw = root[3:7][[1, 2, 3, 0]]
+    device = torch.device(self.env.device)
+    dtype = torch.float64
+    joint_lower = torch.as_tensor(
+        self.ee_steady_model.lower_limits, device=device, dtype=dtype
+    )
+    joint_upper = torch.as_tensor(
+        self.ee_steady_model.upper_limits, device=device, dtype=dtype
+    )
+    rejected = []
+    evaluated_count = 0
+
+    while evaluated_count < ARM_RETRACT_MAX_CANDIDATES:
+        count = min(
+            ARM_RETRACT_CANDIDATE_BATCH_SIZE,
+            ARM_RETRACT_MAX_CANDIDATES - evaluated_count,
+        )
+        position_delta = _sample_ball_uniform_volume(rng, count, radius)
+        rpy_delta = rng.uniform(-rotation_bound, rotation_bound, size=(count, 3))
+        poses = np.repeat(base_pose[None, :], count, axis=0)
+        poses[:, :3] += position_delta
+        poses[:, 3:] += rpy_delta
+        positions_world = np.stack(
+            [_ee_world_target(self, pose[:3]) for pose in poses]
+        ).astype(np.float64)
+        orientations_wxyz = np.stack(
+            [_ee_world_orientation_target(self, pose[3:]) for pose in poses]
+        ).astype(np.float64)
+        orientations_xyzw = orientations_wxyz[:, [1, 2, 3, 0]]
+
+        root_position = torch.as_tensor(
+            root[:3], device=device, dtype=dtype
+        ).expand(count, -1)
+        root_quaternion = torch.as_tensor(
+            root_xyzw, device=device, dtype=dtype
+        ).expand(count, -1)
+        target_position = torch.as_tensor(
+            positions_world, device=device, dtype=dtype
+        )
+        target_rotation = quaternion_xyzw_to_matrix(
+            torch.as_tensor(orientations_xyzw, device=device, dtype=dtype)
+        )
+        initial_joint_position = torch.as_tensor(
+            initial_arm, device=device, dtype=dtype
+        ).expand(count, -1)
+        solutions, position_error, orientation_error = solve_b2z1_arm_ik(
+            root_position,
+            root_quaternion,
+            target_position,
+            target_rotation,
+            initial_joint_position,
+            joint_lower,
+            joint_upper,
+            iterations=120,
+            damping=0.03,
+        )
+        joint_margin = torch.minimum(
+            solutions - joint_lower,
+            joint_upper - solutions,
+        ).amin(dim=1)
+        reachable = (
+            (position_error <= 1.0e-4)
+            & (orientation_error <= 2.0e-4)
+            & (joint_margin >= 2.0e-3)
+        )
+        reachable_np = reachable.detach().cpu().numpy()
+        position_error_np = position_error.detach().cpu().numpy()
+        orientation_error_np = orientation_error.detach().cpu().numpy()
+        joint_margin_np = joint_margin.detach().cpu().numpy()
+        rejected_indices = np.flatnonzero(~reachable_np)
+        for index in rejected_indices:
+            rejected.append(
+                {
+                    "pose_local": poses[index].tolist(),
+                    "position_delta_m": position_delta[index].tolist(),
+                    "rpy_delta_rad": rpy_delta[index].tolist(),
+                    "position_error_m": float(position_error_np[index]),
+                    "orientation_error_rad": float(orientation_error_np[index]),
+                    "joint_margin_rad": float(joint_margin_np[index]),
+                }
+            )
+        evaluated_count += count
+        reachable_indices = np.flatnonzero(reachable_np)
+        if reachable_indices.size:
+            selected = int(reachable_indices[0])
+            rejected_before_acceptance = evaluated_count - count + selected
+            record = {
+                "entry_index": entry_index,
+                "stage": str(stage_label),
+                "evaluated_candidates": evaluated_count,
+                "unreachable_candidates": len(rejected),
+                "rejected_before_acceptance": rejected_before_acceptance,
+                "draws_until_acceptance": rejected_before_acceptance + 1,
+                "accepted_pose_local": poses[selected].tolist(),
+                "accepted_position_delta_m": position_delta[selected].tolist(),
+                "accepted_rpy_delta_rad": rpy_delta[selected].tolist(),
+                "accepted_position_error_m": float(position_error_np[selected]),
+                "accepted_orientation_error_rad": float(
+                    orientation_error_np[selected]
+                ),
+                "accepted_joint_margin_rad": float(joint_margin_np[selected]),
+                "rejected": rejected,
+            }
+            self.arm_retract_randomization_records.append(record)
+            self.active_arm_retract_pose_local = poses[selected].astype(np.float32)
+            print(
+                "[doorman][arm-retract-randomization] "
+                f"stage={stage_label} entry={entry_index} "
+                f"evaluated={evaluated_count} unreachable={len(rejected)} "
+                f"pose_local={self.active_arm_retract_pose_local.round(5).tolist()}",
+                flush=True,
+            )
+            return self.active_arm_retract_pose_local
+
+    self.arm_retract_randomization_records.append(
+        {
+            "entry_index": entry_index,
+            "stage": str(stage_label),
+            "evaluated_candidates": evaluated_count,
+            "unreachable_candidates": len(rejected),
+            "rejected_before_acceptance": evaluated_count,
+            "draws_until_acceptance": None,
+            "accepted_pose_local": None,
+            "accepted_position_delta_m": None,
+            "accepted_rpy_delta_rad": None,
+            "accepted_position_error_m": None,
+            "accepted_orientation_error_rad": None,
+            "accepted_joint_margin_rad": None,
+            "rejected": rejected,
+        }
+    )
+    raise RuntimeError(
+        "arm retract randomization found no exact IK solution after "
+        f"{ARM_RETRACT_MAX_CANDIDATES} candidates for {stage_label}"
+    )
+
 
 def _prepare_panel_contact_command(self, state):
     """Prepare CONTACT_PANEL's target before the stateful command runs."""

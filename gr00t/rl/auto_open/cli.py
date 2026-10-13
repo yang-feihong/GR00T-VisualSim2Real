@@ -10,6 +10,17 @@ from legged_gym.utils.isaaclab_app import add_app_launcher_args
 SCRIPT_ROOT = Path(__file__).resolve().parents[1]
 LOWLEVEL_ROOT = SCRIPT_ROOT / "third_party" / "visual_wholebody_lowlevel"
 
+# [x, y, z, roll, pitch, yaw] in the B2Z1 goal-reference frame.  This is the
+# shared physical endpoint for RESTORE_GRIPPER and PUSH_ARM_RETRACT.
+DEFAULT_ARM_RETRACT_POSE_LOCAL = (
+    0.30,
+    0.0,
+    0.30,
+    -1.5707963267948966,
+    0.0,
+    0.0,
+)
+
 def _parser() -> argparse.ArgumentParser:
     parser = build_common_arg_parser()
     add_app_launcher_args(parser)
@@ -30,14 +41,6 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Run independent AutoOpen controllers in one vectorized SimulationApp.",
-    )
-    parser.add_argument(
-        "--batch_active_env_ids",
-        default=None,
-        help=(
-            "Comma-separated env ids to execute inside a fully initialized batch. "
-            "Diagnostic only; all environments are still created to preserve randomization."
-        ),
     )
     parser.add_argument(
         "--steady_path_workers",
@@ -81,6 +84,35 @@ def _parser() -> argparse.ArgumentParser:
             "Repeat for independent variables; omitted variables remain zero."
         ),
     )
+    parser.add_argument(
+        "--arm_retract_pose_local",
+        type=float,
+        nargs=6,
+        default=DEFAULT_ARM_RETRACT_POSE_LOCAL,
+        metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
+        help=(
+            "Shared six-DoF EE endpoint for RESTORE_GRIPPER and "
+            "PUSH_ARM_RETRACT, expressed in the B2Z1 goal-reference frame."
+        ),
+    )
+    parser.add_argument(
+        "--arm_retract_position_noise_radius_m",
+        type=float,
+        default=0.05,
+        help=(
+            "Per-entry uniform-volume position randomization radius for "
+            "RESTORE_GRIPPER and PUSH_ARM_RETRACT."
+        ),
+    )
+    parser.add_argument(
+        "--arm_retract_rotation_noise_deg",
+        type=float,
+        default=5.0,
+        help=(
+            "Per-entry independent absolute XYZ Euler randomization bound "
+            "for RESTORE_GRIPPER and PUSH_ARM_RETRACT."
+        ),
+    )
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument(
         "--standard_dataset_dir",
@@ -109,6 +141,24 @@ def _parser() -> argparse.ArgumentParser:
             "rotation angle in each nominal camera frame."
         ),
     )
+    parser.add_argument(
+        "--camera_focal_scale_noise_fraction",
+        type=float,
+        default=0.0,
+        help="Standard-data-only shared fx/fy scale variation per camera.",
+    )
+    parser.add_argument(
+        "--camera_principal_point_noise_px",
+        type=float,
+        default=0.0,
+        help="Standard-data-only principal-point variation radius in pixels.",
+    )
+    parser.add_argument(
+        "--camera_distortion_noise_fraction",
+        type=float,
+        default=0.0,
+        help="Standard-data-only relative variation of fisheye k1 through k4.",
+    )
     parser.add_argument("--max_steps", type=int, default=3000)
     parser.add_argument(
         "--disable_rgb_cameras",
@@ -134,6 +184,48 @@ def _parser() -> argparse.ArgumentParser:
     )
     return parser
 
+
+def _resolve_runtime_camera_config(
+    args,
+    nominal_camera_config: Path,
+    *,
+    position_radius_m: float = 0.0,
+    rotation_angle_deg: float = 0.0,
+    focal_scale_fraction: float = 0.0,
+    principal_point_radius_px: float = 0.0,
+    distortion_relative_fraction: float = 0.0,
+):
+    """Materialize the sole renderer-facing camera configuration."""
+    from gr00t.rl.data_collection.camera_mount_randomization import (
+        randomize_camera_mounts,
+    )
+
+    nominal_camera_config = Path(nominal_camera_config)
+    nominal_config = json.loads(
+        nominal_camera_config.read_text(encoding="utf-8")
+    )
+    actual_config, camera_randomization = randomize_camera_mounts(
+        nominal_config,
+        seed=int(args.seed if args.seed is not None else 0),
+        position_radius_m=position_radius_m,
+        rotation_angle_deg=rotation_angle_deg,
+        focal_scale_fraction=focal_scale_fraction,
+        principal_point_radius_px=principal_point_radius_px,
+        distortion_relative_fraction=distortion_relative_fraction,
+    )
+    runtime_config = (
+        Path(args.output_dir)
+        / f"runtime_rgb_cameras_seed{int(args.seed if args.seed is not None else 0)}.json"
+    )
+    runtime_config.parent.mkdir(parents=True, exist_ok=True)
+    runtime_config.write_text(
+        json.dumps(actual_config, indent=2), encoding="utf-8"
+    )
+    args.nominal_rgb_camera_config = str(nominal_camera_config)
+    args.rgb_camera_config = str(runtime_config)
+    args.camera_mount_randomization = camera_randomization
+
+
 def _default_paths(args):
     repo = SCRIPT_ROOT.parent.parent
     run_dir = repo / "ckpt" / "b2z1-low" / "20260918_102500_is-dc7zasdnsm4oadn4-devmachine-0_gpu2_agent1_uhryvo2cn"
@@ -149,32 +241,29 @@ def _default_paths(args):
         nominal_camera_config = Path(
             LOWLEVEL_ROOT / "legged_gym" / "scripts" / "rgb_cameras_dataset.json"
         )
-        args.nominal_rgb_camera_config = str(nominal_camera_config)
-        from gr00t.rl.data_collection.camera_mount_randomization import (
-            randomize_camera_mounts,
-        )
-
-        nominal_config = json.loads(nominal_camera_config.read_text(encoding="utf-8"))
-        actual_config, mount_randomization = randomize_camera_mounts(
-            nominal_config,
-            seed=int(args.seed if args.seed is not None else 0),
+        _resolve_runtime_camera_config(
+            args,
+            nominal_camera_config,
             position_radius_m=args.camera_mount_position_noise_m,
             rotation_angle_deg=args.camera_mount_rotation_noise_deg,
+            focal_scale_fraction=args.camera_focal_scale_noise_fraction,
+            principal_point_radius_px=args.camera_principal_point_noise_px,
+            distortion_relative_fraction=args.camera_distortion_noise_fraction,
         )
-        args.camera_mount_randomization = mount_randomization
-        runtime_config = (
-            Path(args.output_dir)
-            / f"runtime_rgb_cameras_seed{int(args.seed if args.seed is not None else 0)}.json"
-        )
-        runtime_config.parent.mkdir(parents=True, exist_ok=True)
-        runtime_config.write_text(
-            json.dumps(actual_config, indent=2), encoding="utf-8"
-        )
-        args.rgb_camera_config = str(runtime_config)
     elif args.disable_rgb_cameras:
         args.rgb_camera_config = None
-    elif not args.rgb_camera_config:
-        args.rgb_camera_config = str(LOWLEVEL_ROOT / "legged_gym" / "scripts" / "rgb_cameras.json")
+    else:
+        nominal_camera_config = Path(
+            args.rgb_camera_config
+            if args.rgb_camera_config
+            else (
+                LOWLEVEL_ROOT / "legged_gym" / "scripts" / "rgb_cameras.json"
+            )
+        )
+        _resolve_runtime_camera_config(
+            args,
+            nominal_camera_config,
+        )
     if not hasattr(args, "nominal_rgb_camera_config"):
         args.nominal_rgb_camera_config = args.rgb_camera_config
     if not hasattr(args, "camera_mount_randomization"):

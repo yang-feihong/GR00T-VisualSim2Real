@@ -15,7 +15,9 @@ from gr00t.rl.data_collection.auto_open_standard import (
 )
 from gr00t.rl.data_collection.auto_open_writer import (
     AutoOpenEpisodeData,
+    _contact_acceptance_summary,
     _physical_acceptance_reasons,
+    _short_round_trips,
     aggregate_standard_shards,
 )
 from gr00t.rl.data_collection.auto_open_collector import _door_edge_gap_m
@@ -186,6 +188,47 @@ def test_boundary_validator_quarantines_missing_approach_stop():
         terminal_robot_clear=np.ones(frames, dtype=bool),
     )
     assert "approach_missing_25_frame_stop" in result.quarantine_reasons
+
+
+def test_short_round_trip_audit_detects_a_jump_returning_within_100ms():
+    values = np.zeros((12, 2), dtype=np.float32)
+    values[:, 1] = -0.2
+    values[4:6, 1] = 0.2
+    events = _short_round_trips(
+        values,
+        jump_threshold=0.15,
+        return_tolerance=0.03,
+        require_sign_reversal=True,
+    )
+    assert events == [
+        {"frame": 4, "return_frame": 6, "component": 1, "jump": pytest.approx(0.4)}
+    ]
+
+
+def test_contact_classifier_rejects_non_foot_ground_contact():
+    episode = AutoOpenEpisodeData(
+        episode_index=0,
+        seed=1700,
+        observation_state=np.zeros((10, 58), dtype=np.float32),
+        action=np.zeros((10, 25), dtype=np.float32),
+        images={},
+        raw_audit={},
+        raw_contacts=(
+            {
+                "frame_index": 5,
+                "body_a_path": "/World/envs/env_0/Robot/FR_calf",
+                "body_b_path": "/World/ground/terrain/GroundPlane/CollisionPlane",
+                "max_contact_force": 812.9,
+                "max_normal_impulse": 4.0,
+                "max_penetration_depth": 0.0,
+            },
+        ),
+    )
+    summary = _contact_acceptance_summary(
+        episode, np.full(10, "THROUGH", dtype=object)
+    )
+    assert len(summary["abnormal"]) == 1
+    assert summary["abnormal"][0]["reason"] == "non_foot_robot_ground_contact"
 
 
 def test_physical_validator_requires_standard_full_open_target():

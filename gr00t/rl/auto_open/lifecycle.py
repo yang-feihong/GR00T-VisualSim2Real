@@ -37,6 +37,10 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
     self.base_hold_target_yaw = None
     self.base_hold_nominal_xy = None
     self.base_hold_nominal_yaw = None
+    self.base_command_previous = np.zeros(3, dtype=np.float32)
+    self.base_reversal_pending_sign = np.zeros(3, dtype=np.int8)
+    self.base_reversal_pending_steps = np.zeros(3, dtype=np.int32)
+    self.base_reversal_lock_steps = np.zeros(3, dtype=np.int32)
     self.approach_settle_steps = 0
     self.approach_stop_latched = False
     self.pregrasp_settle_steps = 0
@@ -92,6 +96,10 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
     self.release_retreat_path_index = 0
     self.release_restore_command_path = None
     self.release_restore_orientation_path = None
+    self.arm_retract_entry_count = 0
+    self.arm_retract_randomization_records = []
+    self.active_arm_retract_pose_local = self.arm_retract_pose_local.copy()
+    self.restore_retract_pose_sampled = False
     self.panel_contact_target_world = None
     self.panel_contact_desired_ee_world = None
     self.panel_contact_command_target_world = None
@@ -148,6 +156,8 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
     self.through_settle_steps = 0
     self.through_stop_latched = False
     self.through_stability_failure_counts = {}
+    self.through_motion_ready = False
+    self.through_entry_stable_steps = 0
     self.push_target_hinge_angle = None
     self.failure_reason = None
     self.failure_stage = None
@@ -215,6 +225,12 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
     if self.panel_center_world is None or self.hinge_world is None:
         raise RuntimeError("door panel or hinge geometry is unavailable")
     self.grasp_center_pos = _physical_handle_grasp_position(self, handle_state)
+    self.handle_free_axis_world = _quat_rotate_np(
+        handle_state[3:7], self.handle_free_axis_local
+    )
+    self.handle_free_axis_world /= max(
+        float(np.linalg.norm(self.handle_free_axis_world)), 1.0e-8
+    )
     # Define the push point in door-local physical coordinates rather than
     # as a fraction of the randomized panel dimensions.
     self.panel_push_world = self.hinge_world.copy()
@@ -278,8 +294,6 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
     self.initial_door_root = door_root.copy()
     self.default_ee_goal_local = _as_np(state["ee_goal_cart_local"])[0]
     self.default_ee_goal_delta_rpy = _as_np(state["ee_goal_delta_rpy"])[0]
-    self.push_retracted_ee_goal_local = self.default_ee_goal_local.copy()
-    self.push_retracted_ee_goal_local[0] = 0.36
     middle_arm_joint_target = np.asarray(
         self.env.cfg.doorman_arm_joint_init_center, dtype=np.float32
     )
