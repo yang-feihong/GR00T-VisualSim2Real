@@ -187,6 +187,7 @@ run_standard_collection() {
     local dataset_root="${DATASET_ROOT:?Set DATASET_ROOT to a new dataset directory}"
     local seed_start="${SEED_START:-1700}"
     local requested_count="${NUM_EPISODES:-4}"
+    local workers_per_gpu="${STANDARD_WORKERS_PER_GPU:-4}"
     local -a standard_seeds=()
     if [[ -n "${SEEDS:-}" ]]; then
         IFS=',' read -r -a standard_seeds <<< "${SEEDS}"
@@ -201,6 +202,10 @@ run_standard_collection() {
         echo "Standard collection requires at least one seed." >&2
         exit 2
     fi
+    if [[ ! "${workers_per_gpu}" =~ ^[1-4]$ ]]; then
+        echo "STANDARD_WORKERS_PER_GPU must be an integer from 1 to 4." >&2
+        exit 2
+    fi
     local camera_mount_position_noise_m=0.02
     local camera_mount_rotation_noise_deg=15.0
     local camera_focal_scale_noise_fraction=0.08
@@ -211,12 +216,18 @@ run_standard_collection() {
         exit 2
     fi
     mkdir -p "${dataset_root}/shards" "${dataset_root}/logs"
-    local gpu_count="${#GPU_IDS_ARRAY[@]}" index gpu_id
-    for index in "${!GPU_IDS_ARRAY[@]}"; do
-        gpu_id="${GPU_IDS_ARRAY[index]}"
+    local gpu_count="${#GPU_IDS_ARRAY[@]}"
+    local worker_count=$((gpu_count * workers_per_gpu))
+    if (( worker_count > count )); then
+        worker_count="${count}"
+    fi
+    local worker_index gpu_index gpu_id
+    for ((worker_index=0; worker_index<worker_count; worker_index++)); do
+        gpu_index=$((worker_index % gpu_count))
+        gpu_id="${GPU_IDS_ARRAY[gpu_index]}"
         (
             local worker_failures=0 offset seed name shard control log
-            for ((offset=index; offset<count; offset+=gpu_count)); do
+            for ((offset=worker_index; offset<count; offset+=worker_count)); do
                 seed="${standard_seeds[offset]}"; name="episode-seed${seed}"
                 shard="${dataset_root}/shards/${name}"
                 control="${dataset_root}/logs/${name}-control"
@@ -239,8 +250,8 @@ run_standard_collection() {
         PIDS+=("$!")
     done
     local failures=0
-    for index in "${!PIDS[@]}"; do
-        wait "${PIDS[index]}" || failures=$((failures + 1))
+    for worker_index in "${!PIDS[@]}"; do
+        wait "${PIDS[worker_index]}" || failures=$((failures + 1))
     done
     if (( failures != 0 )); then
         echo "Standard collection workers failed; shard aggregation was skipped." >&2

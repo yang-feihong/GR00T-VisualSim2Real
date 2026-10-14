@@ -132,23 +132,6 @@ def _zero_cross_base_reversal(self, command):
     return self.base_command_previous.copy()
 
 
-def _base_velocity_damping(state):
-    """Return the velocity-only part of the base PD command."""
-    roots = np.asarray(state["root_states"], dtype=np.float32)
-    w, x, y, z = (roots[:, index] for index in range(3, 7))
-    yaw = np.arctan2(
-        2.0 * (w * z + x * y),
-        1.0 - 2.0 * (y * y + z * z),
-    )
-    cosine = np.cos(yaw)
-    sine = np.sin(yaw)
-    command = np.empty((len(roots), 3), dtype=np.float32)
-    command[:, 0] = -(cosine * roots[:, 7] + sine * roots[:, 8])
-    command[:, 1] = -(-sine * roots[:, 7] + cosine * roots[:, 8])
-    command[:, 2] = -0.35 * roots[:, 12]
-    return _limit_base_commands(command)
-
-
 def _base_commands_exact(
     state,
     station_xy,

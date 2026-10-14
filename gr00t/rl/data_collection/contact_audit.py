@@ -26,6 +26,46 @@ class ContactPairMaximum:
     ccd_triggered: bool = False
 
 
+def aggregate_contact_pair_maxima(
+    rows: Iterable[ContactPairMaximum],
+) -> tuple[ContactPairMaximum, ...]:
+    """Return one non-empty record per unordered physical body pair."""
+    maxima = {}
+    for row in rows:
+        impulse = float(row.max_normal_impulse)
+        force = float(row.max_contact_force)
+        penetration = float(row.max_penetration_depth)
+        if impulse == 0.0 and force == 0.0 and penetration == 0.0:
+            continue
+
+        original_pair = (str(row.body_a_path), str(row.body_b_path))
+        pair = tuple(sorted(original_pair))
+        normal = tuple(float(value) for value in row.contact_normal_world)
+        if pair != original_pair:
+            normal = tuple(-value for value in normal)
+        current = maxima.get(pair)
+        if current is None:
+            maxima[pair] = ContactPairMaximum(
+                pair[0], pair[1], impulse, force, penetration,
+                tuple(float(value) for value in row.contact_point_world),
+                normal, bool(row.ccd_triggered),
+            )
+            continue
+
+        strongest_is_new = impulse > current.max_normal_impulse
+        maxima[pair] = ContactPairMaximum(
+            pair[0], pair[1],
+            max(current.max_normal_impulse, impulse),
+            max(current.max_contact_force, force),
+            max(current.max_penetration_depth, penetration),
+            (tuple(float(value) for value in row.contact_point_world)
+             if strongest_is_new else current.contact_point_world),
+            normal if strongest_is_new else current.contact_normal_world,
+            bool(current.ccd_triggered or row.ccd_triggered),
+        )
+    return tuple(maxima[pair] for pair in sorted(maxima))
+
+
 def _nearest_actor_path(prim):
     """Return the rigid actor owning a collision prim, or the static prim."""
     from pxr import UsdPhysics
@@ -206,10 +246,11 @@ class SubstepContactAudit:
                 f"contact audit observed {self._substeps} physics substeps; "
                 f"expected {self.expected_substeps}"
             )
-        return tuple(
+        directional_rows = tuple(
             ContactPairMaximum(body_a, body_b, *values)
             for (body_a, body_b), values in sorted(self._maxima.items())
         )
+        return aggregate_contact_pair_maxima(directional_rows)
 
     def attach(self):
         """Observe scene updates without changing their order or return values."""

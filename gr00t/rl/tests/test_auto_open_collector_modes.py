@@ -20,6 +20,10 @@ def _collector(*, joint_mode=True):
         )
     )
     collector.arm_indices = np.arange(6, dtype=np.int64)
+    collector._middle_preset_interval = False
+    collector._middle_preset_reset_active = False
+    collector._middle_preset_reset_complete = False
+    collector._middle_preset_stable_frames = 0
     return collector
 
 
@@ -27,6 +31,9 @@ def _snapshot(position, velocity=None):
     return {
         "dof_pos": np.asarray(position, dtype=np.float32),
         "dof_vel": np.zeros(6, dtype=np.float32)
+        if velocity is None
+        else np.asarray(velocity, dtype=np.float32),
+        "arm_velocity": np.zeros(6, dtype=np.float32)
         if velocity is None
         else np.asarray(velocity, dtype=np.float32),
     }
@@ -63,3 +70,16 @@ def test_settled_middle_preset_is_inactive():
     middle = collector.controller.middle_arm_joint_target
 
     assert collector._mode_flags(_snapshot(middle + 0.01), middle) == (True, False)
+
+
+def test_middle_preset_reset_completion_is_latched_across_velocity_noise():
+    collector = _collector()
+    middle = collector.controller.middle_arm_joint_target
+
+    assert collector._mode_flags(_snapshot(middle + 0.10), middle) == (False, True)
+    for _ in range(9):
+        assert collector._mode_flags(_snapshot(middle), middle) == (False, True)
+    assert collector._mode_flags(_snapshot(middle), middle) == (True, False)
+    assert collector._mode_flags(
+        _snapshot(middle, velocity=np.full(6, 0.20)), middle
+    ) == (True, False)

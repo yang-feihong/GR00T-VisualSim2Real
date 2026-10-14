@@ -229,3 +229,35 @@ def test_push_retract_slews_orientation_instead_of_jumping_to_endpoint():
     )
     torch.testing.assert_close(_quat_distance(start, buffers.ee_quat), torch.tensor([0.025]))
     assert _quat_distance(buffers.ee_quat, endpoint).item() > 1.5
+
+
+def test_terminal_hold_dispatches_exact_zero_after_reversal_filter():
+    fsm = TensorDoorFSM.__new__(TensorDoorFSM)
+    fsm.Stage = SimpleNamespace(THROUGH=16, SUCCESS=17)
+    fsm.stage = torch.tensor([16], dtype=torch.int64)
+    fsm.through_command_xy = torch.zeros((1, 2))
+    fsm.through_command_yaw = torch.zeros(1)
+    fsm.through_station_xy = torch.zeros((1, 2))
+    fsm.through_station_yaw = torch.zeros(1)
+    fsm.through_stop_latched = torch.zeros(1, dtype=torch.bool)
+    fsm.through_motion_ready = torch.ones(1, dtype=torch.bool)
+    fsm.base_command_previous = torch.tensor([[0.2, -0.2, 0.2]])
+    fsm.base_reversal_pending_sign = torch.zeros((1, 3), dtype=torch.int8)
+    fsm.base_reversal_pending_steps = torch.zeros((1, 3), dtype=torch.int32)
+    fsm.base_reversal_lock_steps = torch.full((1, 3), 5, dtype=torch.int32)
+    fsm.pending_station_distance = torch.zeros(1)
+    fsm.pending_yaw_error = torch.zeros(1)
+    fsm.middle_arm_joint_target = torch.zeros((1, 6))
+    fsm.q_closed = torch.zeros(1)
+    state = {"root_states": torch.tensor([[0.0, 0.0, 0.5, 1.0] + [0.0] * 9])}
+    buffers = SimpleNamespace(
+        base=torch.ones((1, 3)),
+        arm_joint_mode=torch.zeros(1, dtype=torch.bool),
+        arm_joint=torch.ones((1, 6)),
+        gripper=torch.ones((1, 1)),
+    )
+
+    fsm.command_through(state, buffers)
+
+    torch.testing.assert_close(buffers.base, torch.zeros((1, 3)))
+    assert fsm.through_stop_latched.tolist() == [True]

@@ -408,6 +408,9 @@ def _run_tensor_fsm_loop(
         "planning_s": 0.0,
         "geometry_gpu_s": 0.0,
         "panel_clearance_backend_s": 0.0,
+        "standard_capture_s": 0.0,
+        "standard_complete_s": 0.0,
+        "standard_finalize_s": 0.0,
     }
     step_counts = torch.zeros(num_envs, dtype=torch.int32, device=env.device)
     max_finger_forces = torch.zeros(num_envs, dtype=torch.float32, device=env.device)
@@ -485,6 +488,7 @@ def _run_tensor_fsm_loop(
         timing["teleop_prepare_s"] += time.perf_counter() - prepare_start
 
         if standard_collector is not None:
+            standard_capture_start = time.perf_counter()
             capture_state = _slice_all_control_states(
                 _control_state_to_host(device_state, 1), 1
             )[0]
@@ -500,13 +504,21 @@ def _run_tensor_fsm_loop(
             standard_collector.capture_before_step(
                 capture_state, high, stage_name=stage_name
             )
+            timing["standard_capture_s"] += (
+                time.perf_counter() - standard_capture_start
+            )
 
         physics_start = time.perf_counter()
         result = runner.step_once()
+        timing["policy_physics_s"] += time.perf_counter() - physics_start
         if step == 0:
             first_actions[:] = result["low_level_action"]
         if standard_collector is not None:
+            standard_complete_start = time.perf_counter()
             standard_collector.complete_after_step(result)
+            timing["standard_complete_s"] += (
+                time.perf_counter() - standard_complete_start
+            )
         elif args.record_video:
             manager = runner.rgb_camera_manager
             if manager is None or not manager.enabled:
@@ -520,7 +532,6 @@ def _run_tensor_fsm_loop(
                     )
                 video_frames.setdefault(name, []).append(images[0])
                 video_timestamps.setdefault(name, []).append(timestamp)
-        timing["policy_physics_s"] += time.perf_counter() - physics_start
         device_state = result["state"]
         hinge_speed = device_state["door_joint_velocity"][:, fsm.hinge_idx].abs()
         max_hinge_speeds = torch.maximum(max_hinge_speeds, hinge_speed)
@@ -634,6 +645,7 @@ def _run_tensor_fsm_loop(
             video_dir / "all_cameras_mosaic.mp4",
         )
     if standard_collector is not None:
+        standard_finalize_start = time.perf_counter()
         _finish_standard_collection(
             args,
             collector=standard_collector,
@@ -645,6 +657,15 @@ def _run_tensor_fsm_loop(
             initial_gripper_position=initial_gripper_positions[0],
             door_randomization=standard_door_randomization,
             door_asset_snapshot=standard_door_asset_snapshot,
+        )
+        timing["standard_finalize_s"] += (
+            time.perf_counter() - standard_finalize_start
+        )
+        timing.update(
+            {
+                f"collector_{name}": float(value)
+                for name, value in standard_collector.timing.items()
+            }
         )
     summary = {
         "batch_seed": base_seed,

@@ -25,6 +25,11 @@ same step budget.
 `standard_collection` accepts a comma-separated `SEEDS` list selected from a
 completed capability regression. If omitted, it uses `SEED_START` and
 `NUM_EPISODES`. Control, physics, camera, and acceptance options remain fixed.
+It runs four independent camera workers per physical GPU by default, the
+highest reviewed setting on the 48 GB RTX A6000 hosts. The bounded
+`STANDARD_WORKERS_PER_GPU=1..4` setting exists for smaller runs and hardware;
+it changes scheduling only, and same-seed state, action, contact, and stage
+artifacts are required to remain identical.
 The dataset root receives a manifest, a machine-readable aggregate acceptance
 report, a Chinese aggregate summary, and the measured collection wall time in
 addition to each independently validated shard.

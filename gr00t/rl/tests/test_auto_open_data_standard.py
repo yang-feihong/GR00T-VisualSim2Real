@@ -7,20 +7,30 @@ import pytest
 from gr00t.rl.data_collection.auto_open_standard import (
     ACTION_NAMES,
     OBSERVATION_STATE_NAMES,
+    dataset_tool_quaternion_from_gripper_quaternion,
     derive_stage_boundaries,
     height_invariant_pose,
+    dataset_tool_pose_from_gripper_pose,
     pack_action,
     pack_observation_state,
     transform_dataset_images,
 )
 from gr00t.rl.data_collection.auto_open_writer import (
     AutoOpenEpisodeData,
+    AutoOpenDatasetWriter,
+    StreamingVideoEncoder,
     _contact_acceptance_summary,
+    _episode_acceptance_metrics,
     _physical_acceptance_reasons,
     _short_round_trips,
     aggregate_standard_shards,
+    _verify_video,
 )
 from gr00t.rl.data_collection.auto_open_collector import _door_edge_gap_m
+from gr00t.rl.data_collection.contact_audit import (
+    ContactPairMaximum,
+    aggregate_contact_pair_maxima,
+)
 
 
 def _yaw_quaternion(yaw):
@@ -30,6 +40,55 @@ def _yaw_quaternion(yaw):
 def _yaw_matrix(yaw):
     c, s = math.cos(yaw), math.sin(yaw)
     return np.asarray(((c, -s, 0.0), (s, c, 0.0), (0.0, 0.0, 1.0)))
+
+
+def _roll_matrix(roll):
+    c, s = math.cos(roll), math.sin(roll)
+    return np.asarray(((1.0, 0.0, 0.0), (0.0, c, -s), (0.0, s, c)))
+
+
+def test_dataset_tool_pose_uses_single_offset_and_no_fixed_mesh_axis_roll():
+    expected_rotation = _yaw_matrix(0.37)
+    production_rotation = expected_rotation @ _roll_matrix(-math.pi / 2.0)
+    production_position = np.asarray((0.42, -0.13, 0.91))
+
+    position, rotation = dataset_tool_pose_from_gripper_pose(
+        production_position, production_rotation
+    )
+
+    np.testing.assert_array_equal(position, production_position)
+    np.testing.assert_allclose(rotation, expected_rotation, atol=1.0e-12)
+    production_quaternion = np.asarray(
+        (
+            math.cos(-math.pi / 4.0),
+            math.sin(-math.pi / 4.0),
+            0.0,
+            0.0,
+        )
+    )
+    dataset_quaternion = dataset_tool_quaternion_from_gripper_quaternion(
+        production_quaternion
+    )
+    np.testing.assert_allclose(dataset_quaternion, (1.0, 0.0, 0.0, 0.0), atol=1.0e-12)
+
+
+def test_observation_packs_world_velocities_in_body_coordinates():
+    packed = pack_observation_state(
+        arm_position=np.zeros(6),
+        arm_velocity=np.zeros(6),
+        gripper_feedback=0.0,
+        b2_position=np.zeros(12),
+        b2_velocity=np.zeros(12),
+        root_position_world=np.zeros(3),
+        root_quaternion_wxyz=_yaw_quaternion(math.pi / 2.0),
+        root_linear_velocity_world=np.asarray((1.0, 0.0, 0.0)),
+        root_angular_velocity_world=np.asarray((0.0, 1.0, 0.0)),
+        actual_tool_position_world=np.zeros(3),
+        actual_tool_rotation_world=np.eye(3),
+    )
+
+    np.testing.assert_allclose(packed[43:46], (0.0, -1.0, 0.0), atol=1.0e-7)
+    np.testing.assert_allclose(packed[46:49], (1.0, 0.0, 0.0), atol=1.0e-7)
 
 
 def test_fixed_schema_dimensions_and_action_alias():
@@ -115,6 +174,18 @@ def test_camera_transform_has_exact_keys_shapes_and_rotation():
     np.testing.assert_array_equal(
         transformed["observation.images.base_0_rgb"], np.rot90(base, 1)
     )
+
+
+def test_streaming_video_encoder_preserves_frame_count_with_background_worker(tmp_path):
+    path = tmp_path / "episode.mp4"
+    encoder = StreamingVideoEncoder(path, (16, 20, 3))
+    for value in range(12):
+        encoder.append(np.full((16, 20, 3), value, dtype=np.uint8))
+    encoder.close()
+
+    assert encoder.frame_count == 12
+    assert encoder.encode_wall_s > 0.0
+    _verify_video(path, (16, 20, 3), 12)
 
 
 def test_three_stage_boundaries_are_half_open_and_terminal_hold_is_retained():
@@ -205,6 +276,22 @@ def test_short_round_trip_audit_detects_a_jump_returning_within_100ms():
     ]
 
 
+def test_arm_round_trip_audit_does_not_flag_sustained_motion_then_retraction():
+    values = np.asarray(
+        (0.0, -0.043, -0.093, -0.149, -0.212, -0.281, -0.270, -0.261, -0.240, -0.213),
+        dtype=np.float32,
+    )
+
+    events = _short_round_trips(
+        values,
+        jump_threshold=0.05,
+        return_tolerance=0.015,
+        require_isolated_jump=True,
+    )
+
+    assert events == []
+
+
 def test_contact_classifier_rejects_non_foot_ground_contact():
     episode = AutoOpenEpisodeData(
         episode_index=0,
@@ -229,6 +316,24 @@ def test_contact_classifier_rejects_non_foot_ground_contact():
     )
     assert len(summary["abnormal"]) == 1
     assert summary["abnormal"][0]["reason"] == "non_foot_robot_ground_contact"
+
+
+def test_contact_aggregation_drops_zero_rows_and_merges_mirrors():
+    rows = (
+        ContactPairMaximum("/A", "/B", 0.2, 4.0, 0.001, (1, 2, 3), (1, 0, 0)),
+        ContactPairMaximum("/B", "/A", 0.3, 3.0, 0.002, (4, 5, 6), (-1, 0, 0)),
+        ContactPairMaximum("/C", "/D", 0.0, 0.0, 0.0, (0, 0, 0), (0, 0, 0)),
+    )
+
+    aggregated = aggregate_contact_pair_maxima(rows)
+
+    assert len(aggregated) == 1
+    assert (aggregated[0].body_a_path, aggregated[0].body_b_path) == ("/A", "/B")
+    assert aggregated[0].max_normal_impulse == pytest.approx(0.3)
+    assert aggregated[0].max_contact_force == pytest.approx(4.0)
+    assert aggregated[0].max_penetration_depth == pytest.approx(0.002)
+    assert aggregated[0].contact_point_world == (4.0, 5.0, 6.0)
+    assert aggregated[0].contact_normal_world == (1.0, 0.0, 0.0)
 
 
 def test_physical_validator_requires_standard_full_open_target():
@@ -307,6 +412,24 @@ def test_physical_validator_requires_standard_full_open_target():
         event_frames={"handle_unlocked": 70, "door_gap_20mm": 77, "robot_clear": 90},
     )
     assert _physical_acceptance_reasons(episode, boundary) == []
+    metrics = _episode_acceptance_metrics(episode, boundary, [])
+    assert metrics["physical_result"]["max_door_gap_before_release_m"] == pytest.approx(0.03)
+    assert metrics["physical_result"]["door_gap_at_stage2_end_m"] == pytest.approx(0.03)
+    assert metrics["physical_result"]["max_door_gap_episode_m"] == pytest.approx(0.03)
+    assert metrics["contacts"]["unique_frame_pair_rows"] == 2
+
+    inconsistent_audit = dict(audit)
+    inconsistent_audit["arm_joint_position"] = np.zeros(
+        (frames, 6), dtype=np.float32
+    )
+    inconsistent_audit["arm_joint_position"][80:, 2] = 0.1
+    inconsistent_episode = AutoOpenEpisodeData(
+        **{**episode.__dict__, "raw_audit": inconsistent_audit}
+    )
+    assert any(
+        reason.startswith("arm_velocity_position_inconsistent")
+        for reason in _physical_acceptance_reasons(inconsistent_episode, boundary)
+    )
 
     zero_contact_episode = AutoOpenEpisodeData(
         **{
@@ -334,6 +457,15 @@ def test_physical_validator_requires_standard_full_open_target():
         moving_episode, boundary
     )
 
+    nonzero_terminal_action = action.copy()
+    nonzero_terminal_action[-50:, 1] = 0.01
+    nonzero_terminal_episode = AutoOpenEpisodeData(
+        **{**episode.__dict__, "action": nonzero_terminal_action}
+    )
+    assert "terminal_base_command_not_zero" in _physical_acceptance_reasons(
+        nonzero_terminal_episode, boundary
+    )
+
     episode.action[68:72, 14] = -0.785
     assert "invalid_gripper_closed_open_grasp_open_closed_sequence" in (
         _physical_acceptance_reasons(episode, boundary)
@@ -356,7 +488,7 @@ def test_standard_shard_aggregation_writes_machine_and_chinese_reports(tmp_path)
                 "frames": 100,
                 "stage_duration_s": {"approach": 1.0},
                 "control": {"stage2_entry_q5_target_step_rad": 0.02},
-                "contacts": {"nonzero_handle_rows": 20},
+                "contacts": {"nonzero_handle_unique_frame_pair_rows": 20},
                 "terminal_actual": {"window_frames": 50},
                 "reasons": [],
             }
@@ -379,3 +511,34 @@ def test_standard_shard_aggregation_writes_machine_and_chinese_reports(tmp_path)
     assert manifest["collection_wall_time_s"] == 123
     assert manifest["acceptance_report"] == "acceptance_report.json"
     assert (root / "DATASET_ACCEPTANCE_SUMMARY_ZH.md").is_file()
+
+
+def test_camera_calibration_covers_renderer_config_and_saved_pixel_transform(tmp_path):
+    writer = AutoOpenDatasetWriter(
+        tmp_path,
+        camera_calibration={"cameras": []},
+        simulation_provenance={"camera_calibration_id": "abc123"},
+    )
+
+    assert writer.camera_calibration["renderer_runtime_camera_config_id"] == "abc123"
+    assert writer.simulation_provenance["renderer_runtime_camera_config_id"] == (
+        "abc123"
+    )
+    base_transform = writer.camera_calibration["dataset_image_transforms"][
+        "observation.images.base_0_rgb"
+    ]
+    assert base_transform["operation"] == "rot90_counterclockwise"
+    assert base_transform["source_shape_hwc"] == [480, 640, 3]
+    assert base_transform["dataset_shape_hwc"] == [640, 480, 3]
+    assert base_transform["source_to_dataset_pixel_homography"] == [
+        [0.0, 1.0, 0.0],
+        [-1.0, 0.0, 639.0],
+        [0.0, 0.0, 1.0],
+    ]
+    assert len(writer.camera_calibration["calibration_id"]) == 64
+    assert writer.simulation_provenance["camera_calibration_id"] == (
+        writer.camera_calibration["calibration_id"]
+    )
+    assert writer.camera_calibration["calibration_id_source"] == (
+        "sha256_of_effective_renderer_config_and_dataset_pixel_transforms"
+    )

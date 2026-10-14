@@ -2277,21 +2277,6 @@ class TensorDoorFSM:
         self.transition(rows, self.Stage.THROUGH)
         self.stage_steps[rows] = 1
 
-    def _base_velocity_damping(
-        self, roots: torch.Tensor
-    ) -> torch.Tensor:
-        yaw = _yaw_from_wxyz(roots[:, 3:7])
-        cosine, sine = torch.cos(yaw), torch.sin(yaw)
-        command = torch.stack(
-            (
-                -(cosine * roots[:, 7] + sine * roots[:, 8]),
-                -(-sine * roots[:, 7] + cosine * roots[:, 8]),
-                -0.35 * roots[:, 12],
-            ),
-            dim=-1,
-        )
-        return _limit_base_command(command)
-
     def command_through(
         self, state: dict[str, torch.Tensor], buffers: TensorCommandBuffers
     ) -> None:
@@ -2320,9 +2305,7 @@ class TensorDoorFSM:
         self.through_stop_latched[rows] = latched
         through = self.stage[rows] == int(self.Stage.THROUGH)
         command = torch.where(
-            (through & latched)[:, None],
-            self._base_velocity_damping(state["root_states"][rows]),
-            command,
+            (through & latched)[:, None], torch.zeros_like(command), command
         )
         command = torch.where(
             (through & ~self.through_motion_ready[rows])[:, None],
@@ -2330,6 +2313,12 @@ class TensorDoorFSM:
             command,
         )
         command = self._stabilize_base(rows, command)
+        # Terminal supervision requires the dispatched command itself to be
+        # exactly zero.  Apply this after reversal filtering so no previous
+        # nonzero command can leak into the terminal hold window.
+        command = torch.where(
+            (through & latched)[:, None], torch.zeros_like(command), command
+        )
         self.pending_station_distance[rows] = distance
         self.pending_yaw_error[rows] = yaw_error
         buffers.base[rows] = command

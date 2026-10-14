@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from pathlib import Path
+import time
 
 import numpy as np
 import torch
@@ -15,7 +16,11 @@ from gr00t.rl.envs.door.b2z1_reset_geometry import (
 
 from .auto_open_standard import (
     B2_JOINT_NAMES,
+    CONTROL_HZ,
     TERMINAL_ARM_JOINT_SPEED_RAD_S,
+    dataset_tool_quaternion_from_gripper_quaternion,
+    dataset_tool_pose_from_gripper_pose,
+    height_invariant_pose,
     pack_action,
     pack_observation_state,
     quaternion_wxyz_to_matrix,
@@ -42,6 +47,7 @@ HANDLE_PRESS_STAGES = {
 }
 
 MIDDLE_PRESET_POSITION_TOLERANCE_RAD = 0.05
+MIDDLE_PRESET_STABLE_FRAMES = 10
 
 
 def _numpy(value):
@@ -102,8 +108,14 @@ class AutoOpenStandardEpisodeCollector:
         self.audit = defaultdict(list)
         self.contacts = []
         self.events = {}
+        self.timing = defaultdict(float)
         self._pending = None
         self._previous_stage = None
+        self._previous_arm_position = None
+        self._middle_preset_interval = False
+        self._middle_preset_reset_active = False
+        self._middle_preset_reset_complete = False
+        self._middle_preset_stable_frames = 0
 
         dof_names = list(self.env.dof_names)
         self.arm_indices = np.asarray(
@@ -135,13 +147,18 @@ class AutoOpenStandardEpisodeCollector:
         stage_name = stage_name or self.controller.stage.name
         frame_index = len(self.states)
         sim_time_ns = int(round(frame_index * 20_000_000))
+        phase_start = time.perf_counter()
         rgb_frames = self._read_current_images()
+        self.timing["image_read_s"] += time.perf_counter() - phase_start
+        phase_start = time.perf_counter()
         images = transform_dataset_images(
             {
                 "base_0_rgb": _numpy(rgb_frames["base_0_rgb"]),
                 "left_wrist_0_rgb": _numpy(rgb_frames["left_wrist_0_rgb"]),
             }
         )
+        self.timing["image_transform_s"] += time.perf_counter() - phase_start
+        phase_start = time.perf_counter()
         for name, image in images.items():
             if self.video_staging_root is None:
                 self.images[name].append(image)
@@ -154,11 +171,14 @@ class AutoOpenStandardEpisodeCollector:
                 )
                 self.video_encoders[name] = encoder
             encoder.append(image)
+        self.timing["video_enqueue_wait_s"] += time.perf_counter() - phase_start
 
+        phase_start = time.perf_counter()
         snapshot = self._snapshot_state(state)
         self.states.append(snapshot["packed_state"])
         self._append_state_audit(snapshot, frame_index, sim_time_ns, stage_name)
         self.contact_audit.begin_tick()
+        self.timing["state_snapshot_s"] += time.perf_counter() - phase_start
         self._pending = {
             "state": state,
             "snapshot": snapshot,
@@ -199,6 +219,7 @@ class AutoOpenStandardEpisodeCollector:
         if self._pending is None:
             raise RuntimeError("capture_before_step must precede complete_after_step")
         pending = self._pending
+        phase_start = time.perf_counter()
         post_state = result["state"]
         arm_target = _numpy(post_state["arm_position_target"])[0].astype(np.float32)
         arm_raw_target = _numpy(post_state["arm_raw_position_target"])[0].astype(
@@ -221,7 +242,9 @@ class AutoOpenStandardEpisodeCollector:
             gripper_target=gripper_dispatched,
         )
         self.actions.append(packed_action)
+        self.timing["action_pack_s"] += time.perf_counter() - phase_start
 
+        phase_start = time.perf_counter()
         contacts = self.contact_audit.end_tick()
         max_impulse = max((row.max_normal_impulse for row in contacts), default=0.0)
         max_force = max((row.max_contact_force for row in contacts), default=0.0)
@@ -254,6 +277,7 @@ class AutoOpenStandardEpisodeCollector:
                 }
             )
         self._record_events(post_state)
+        self.timing["contact_finalize_s"] += time.perf_counter() - phase_start
         self._pending = None
 
     def finish(self, acceptance_reasons=(), provenance=None):
@@ -261,6 +285,11 @@ class AutoOpenStandardEpisodeCollector:
             raise RuntimeError("cannot finish with an incomplete control frame")
         for encoder in self.video_encoders.values():
             encoder.close()
+        encode_times = [
+            float(encoder.encode_wall_s) for encoder in self.video_encoders.values()
+        ]
+        self.timing["video_encode_worker_s_sum"] = sum(encode_times)
+        self.timing["video_encode_worker_s_max"] = max(encode_times, default=0.0)
         return AutoOpenEpisodeData(
             episode_index=self.episode_index,
             seed=self.seed,
@@ -287,16 +316,27 @@ class AutoOpenStandardEpisodeCollector:
         ee_position = _numpy(state["ee_pos"])[0]
         ee_quaternion = _numpy(state["ee_orn"])[0]
         ee_rotation = quaternion_wxyz_to_matrix(ee_quaternion)
-        tool_position = ee_position + ee_rotation @ np.asarray((0.1, 0.0, 0.0))
+        tool_position, tool_rotation = dataset_tool_pose_from_gripper_pose(
+            ee_position, ee_rotation
+        )
+        tool_quaternion = dataset_tool_quaternion_from_gripper_quaternion(
+            ee_quaternion
+        )
         body_state = _numpy(state["robot_body_state_w"])[0]
         contact_forces = _numpy(state["contact_forces_w"])[0]
         foot_forces = contact_forces[self.foot_indices]
         foot_normal_force = np.maximum(foot_forces[:, 2], 0.0)
         door_q = _numpy(state["door_joint_position"])[0]
         door_qd = _numpy(state["door_joint_velocity"])[0]
+        arm_position = np.asarray(dof_pos[self.arm_indices], dtype=np.float64)
+        if self._previous_arm_position is None:
+            arm_velocity = np.zeros_like(arm_position)
+        else:
+            arm_velocity = (arm_position - self._previous_arm_position) * CONTROL_HZ
+        self._previous_arm_position = arm_position.copy()
         packed_state = pack_observation_state(
-            arm_position=dof_pos[self.arm_indices],
-            arm_velocity=dof_vel[self.arm_indices],
+            arm_position=arm_position,
+            arm_velocity=arm_velocity,
             gripper_feedback=dof_pos[self.gripper_index],
             b2_position=dof_pos[self.b2_indices],
             b2_velocity=dof_vel[self.b2_indices],
@@ -305,17 +345,19 @@ class AutoOpenStandardEpisodeCollector:
             root_linear_velocity_world=root[7:10],
             root_angular_velocity_world=root[10:13],
             actual_tool_position_world=tool_position,
-            actual_tool_rotation_world=ee_rotation,
+            actual_tool_rotation_world=tool_rotation,
         )
         return {
             "packed_state": packed_state,
             "root": root,
             "dof_pos": dof_pos,
             "dof_vel": dof_vel,
+            "arm_velocity": arm_velocity,
             "ee_position": ee_position,
             "ee_quaternion": ee_quaternion,
             "tool_position": tool_position,
-            "tool_rotation": ee_rotation,
+            "tool_rotation": tool_rotation,
+            "tool_quaternion": tool_quaternion,
             "body_state": body_state,
             "foot_forces": foot_forces,
             "foot_normal_force": foot_normal_force,
@@ -335,7 +377,10 @@ class AutoOpenStandardEpisodeCollector:
         self.audit["root_linear_velocity_world"].append(value["root"][7:10])
         self.audit["root_angular_velocity_world"].append(value["root"][10:13])
         self.audit["arm_joint_position"].append(value["dof_pos"][self.arm_indices])
-        self.audit["arm_joint_velocity"].append(value["dof_vel"][self.arm_indices])
+        self.audit["arm_joint_velocity"].append(value["arm_velocity"])
+        self.audit["physx_arm_joint_velocity"].append(
+            value["dof_vel"][self.arm_indices]
+        )
         self.audit["gripper_feedback"].append(value["dof_pos"][self.gripper_index])
         self.audit["b2_joint_position"].append(value["dof_pos"][self.b2_indices])
         self.audit["b2_joint_velocity"].append(value["dof_vel"][self.b2_indices])
@@ -345,7 +390,9 @@ class AutoOpenStandardEpisodeCollector:
         self.audit["foot_contact"].append(value["foot_normal_force"] > 1.0)
         self.audit["foot_normal_force"].append(value["foot_normal_force"])
         self.audit["ee_pose_world_xyzw"].append(
-            np.concatenate((value["tool_position"], value["ee_quaternion"][[1, 2, 3, 0]]))
+            np.concatenate(
+                (value["tool_position"], value["tool_quaternion"][[1, 2, 3, 0]])
+            )
         )
         self.audit["door_hinge_position"].append(value["door_q"][controller.hinge_idx])
         self.audit["door_hinge_velocity"].append(value["door_qd"][controller.hinge_idx])
@@ -380,6 +427,7 @@ class AutoOpenStandardEpisodeCollector:
     def _mode_flags(self, snapshot, arm_raw_target):
         joint_mode = bool(_numpy(self.env.teleop_arm_joint_control_mask)[0])
         if not joint_mode:
+            self._clear_middle_preset_mode()
             return False, False
 
         middle_target = np.asarray(
@@ -391,21 +439,41 @@ class AutoOpenStandardEpisodeCollector:
             rtol=0.0,
             atol=1.0e-6,
         )
-        if returning_to_middle:
-            arm_position = np.asarray(snapshot["dof_pos"])[self.arm_indices]
-            arm_velocity = np.asarray(snapshot["dof_vel"])[self.arm_indices]
-            middle_reached = bool(
-                np.max(np.abs(arm_position - middle_target))
-                < MIDDLE_PRESET_POSITION_TOLERANCE_RAD
-                and np.max(np.abs(arm_velocity))
-                < TERMINAL_ARM_JOINT_SPEED_RAD_S
-            )
-            if not middle_reached:
-                return False, True
+        if not returning_to_middle:
+            self._clear_middle_preset_mode()
+            return True, False
 
-        # Joint control that holds the current pose, including a settled
-        # middle preset, is inactive rather than reset.
-        return True, False
+        arm_position = np.asarray(snapshot["dof_pos"])[self.arm_indices]
+        arm_velocity = np.asarray(snapshot["arm_velocity"])
+        middle_reached = bool(
+            np.max(np.abs(arm_position - middle_target))
+            < MIDDLE_PRESET_POSITION_TOLERANCE_RAD
+            and np.max(np.abs(arm_velocity))
+            < TERMINAL_ARM_JOINT_SPEED_RAD_S
+        )
+        if not self._middle_preset_interval:
+            self._middle_preset_interval = True
+            self._middle_preset_reset_active = not middle_reached
+            self._middle_preset_reset_complete = middle_reached
+            self._middle_preset_stable_frames = 0
+
+        if self._middle_preset_reset_complete:
+            return True, False
+
+        self._middle_preset_stable_frames = (
+            self._middle_preset_stable_frames + 1 if middle_reached else 0
+        )
+        if self._middle_preset_stable_frames >= MIDDLE_PRESET_STABLE_FRAMES:
+            self._middle_preset_reset_active = False
+            self._middle_preset_reset_complete = True
+            return True, False
+        return False, True
+
+    def _clear_middle_preset_mode(self):
+        self._middle_preset_interval = False
+        self._middle_preset_reset_active = False
+        self._middle_preset_reset_complete = False
+        self._middle_preset_stable_frames = 0
 
     def _target_height_invariant_pose(self, snapshot, arm_target):
         root_position = torch.as_tensor(snapshot["root"][:3], dtype=torch.float64)[None]
@@ -416,16 +484,15 @@ class AutoOpenStandardEpisodeCollector:
         position, rotation, _ = b2z1_gripper_pose_and_jacobian(
             root_position, root_quaternion_xyzw, arm
         )
-        tool_position = position[0].numpy() + rotation[0].numpy() @ np.asarray(
-            (0.1, 0.0, 0.0)
+        tool_position, tool_rotation = dataset_tool_pose_from_gripper_pose(
+            position[0].numpy(), rotation[0].numpy()
         )
-        from .auto_open_standard import height_invariant_pose
 
         return height_invariant_pose(
             snapshot["root"][:3],
             snapshot["root"][3:7],
             tool_position,
-            rotation[0].numpy(),
+            tool_rotation,
         )
 
     def _record_events(self, state):

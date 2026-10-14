@@ -203,9 +203,16 @@ RESTORE_GRIPPER 与 PUSH_ARM_RETRACT 共用中心目标，坐标为 B2Z1 goal-re
 | `approach` | `APPROACH` |
 | `handle_press` | `PREGRASP` 至 `RESTORE_GRIPPER` |
 | `traversal` | `ALIGN_PANEL` 至 `THROUGH` |
-| `terminal_hold` | `SUCCESS` 后的稳定终止段 |
+| `terminal_hold` | `THROUGH` 末尾、转入 `SUCCESS` 前的稳定终止段 |
 
 控制频率为 `50 Hz`，物理频率为 `200 Hz`，每个控制帧包含 4 个物理 substep。标准输出包括双相机视频、58 维 observation、25 维 action、完整状态审计、原始接触、门资产路径/hash、PhysX/碰撞参数、实际相机标定、机器可读验收报告和中文验收摘要。
+
+状态和 EE 坐标语义与实采数据保持一致：
+
+- 58 维 state 中 `b2_body_v*` 和 `b2_body_w*` 均为同帧 trunk 坐标系速度，不直接写世界系 root 速度；
+- 正式 FK 已包含机械链末端合计 `0.100 m` 的工具点位移，采集器不再二次增加工具偏移；
+- 数据集工具姿态不包含 URDF gripper-link 的固定 `-90 deg` x 轴网格坐标旋转；
+- 实际 EE state、关节目标重算的 control EE，以及 raw audit 的世界系 EE pose 共用同一工具坐标定义。
 
 机械臂监督模式：
 
@@ -214,17 +221,19 @@ RESTORE_GRIPPER 与 PUSH_ARM_RETRACT 共用中心目标，坐标为 B2Z1 goal-re
 - 正在回到 middle preset：`inactive=0, reset=1`；
 - 已到达 middle preset 并保持：`inactive=1, reset=0`。
 
-终止段必须连续稳定，不能只依赖命令归零。当前阈值为：底盘线速度 `<0.05 m/s`、底盘角速度 `<0.05 rad/s`、机械臂关节速度 `<0.08 rad/s`、夹爪速度 `<0.05 rad/s`、门速度 `<2 deg/s`，持续 50 帧。
+终止段的底盘指令必须连续 50 帧严格为零，同时实际系统必须稳定，不能只依赖命令归零。当前实际状态阈值为：底盘线速度 `<0.05 m/s`、底盘角速度 `<0.05 rad/s`、机械臂关节速度 `<0.08 rad/s`、夹爪速度 `<0.05 rad/s`、门速度 `<2 deg/s`。
 
 接触报告区分脚-地面、夹爪-把手、夹爪-门板、门内部接触和异常机器人-环境接触；力、冲量和穿透均来自 PhysX substep 数据。异常接触或超过分类阈值的穿透会进入隔离原因，不能自动判为合格。
 
 当前标准采集烟测位于：
 
 ```text
-logs_rl/tensor_fsm_standard_slew_smoke_20261013
+logs_rl/auto_open_standard_semantics_fixed_20261013
 ```
 
-seed 1700 控制成功并通过数据自动验收：`2774` 帧、双相机 `50 Hz`、状态/动作时钟抖动 `0 ns`、非零把手接触 `1820` 行、短时底盘/机械臂目标往返均为 `0`、隔离原因和例外均为空。单 seed 整体采集及验收耗时 `550 s`。
+seed 1700 控制成功并通过数据自动验收：`2760` 帧、双相机 `50 Hz`、状态/动作时钟抖动 `0 ns`、非零把手接触 `1820` 行、短时底盘/机械臂目标往返均为 `0`、隔离原因和例外均为空。单 seed 整体采集及验收耗时 `475 s`。
+
+对全部 2760 帧使用正式 FK 和 raw audit 独立复算：control EE 两个兼容字段的最大绝对误差均为 `0`，实际 EE state 最大绝对误差为 `8.94e-8`，B2 机身系线速度和角速度最大绝对误差分别为 `2.89e-8`、`4.57e-8`。末 50 帧实际下发底盘命令为严格 `[0, 0, 0]`，对应机身位移 `6.48 mm`，且实际速度满足终止稳定阈值。
 
 ## GPU 张量运行时
 

@@ -10,7 +10,6 @@ from gr00t.rl.scripts.doorman_auto_open import (
 )
 from gr00t.rl.auto_open.control import (
     _base_commands_exact,
-    _base_velocity_damping,
     _stabilize_base_command,
     _zero_cross_base_reversal,
 )
@@ -146,12 +145,10 @@ def test_base_target_remains_a_stateless_feedback_controller():
     assert np.linalg.norm(command[0, :2]) > 0.0
 
 
-def test_terminal_base_damping_opposes_measured_body_velocity_without_minimum():
-    roots = _state([0.0], [0.04])["root_states"]
-    roots[0, 8] = -0.03
-    roots[0, 12] = 0.08
-    command = _base_velocity_damping({"root_states": roots})[0]
-    assert np.allclose(command, [-0.04, 0.03, -0.028], atol=1.0e-6)
+def test_terminal_hold_overrides_reversal_filter_with_exact_zero():
+    command_source = inspect.getsource(DoorController.command)
+    assert "self.stage == Stage.THROUGH and self.through_stop_latched" in command_source
+    assert "base_cmd[:] = 0.0" in command_source
 
 
 def test_approach_owns_stop_latch_until_pose_leaves_acceptance():

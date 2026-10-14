@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Mapping, Sequence
 
 import numpy as np
@@ -105,6 +106,48 @@ def matrix_to_rot6d(rotation):
     return np.concatenate((rotation[:, 0], rotation[:, 1]))
 
 
+def dataset_tool_pose_from_gripper_pose(gripper_position_world, gripper_rotation_world):
+    """Convert the production gripper-link FK pose to the dataset EE convention."""
+    position = _as_float_array(
+        gripper_position_world, (3,), "gripper_position_world"
+    )
+    rotation = _as_float_array(
+        gripper_rotation_world, (3, 3), "gripper_rotation_world"
+    )
+    # Production FK already includes the 0.051 m stator and 0.049 m EE
+    # translations along the shared tool x axis.  Its final fixed -90 degree
+    # x rotation is a gripper-link frame convention, not part of the dataset
+    # tool frame used by real demonstrations.
+    gripper_to_dataset = np.asarray(
+        ((1.0, 0.0, 0.0), (0.0, 0.0, -1.0), (0.0, 1.0, 0.0)),
+        dtype=np.float64,
+    )
+    return position.copy(), rotation @ gripper_to_dataset
+
+
+def dataset_tool_quaternion_from_gripper_quaternion(gripper_quaternion_wxyz):
+    """Return the dataset tool-frame quaternion in wxyz order."""
+    quaternion = _as_float_array(
+        gripper_quaternion_wxyz, (4,), "gripper_quaternion_wxyz"
+    )
+    norm = np.linalg.norm(quaternion)
+    if norm < 1.0e-12:
+        raise ValueError("gripper_quaternion_wxyz has zero norm")
+    quaternion = quaternion / norm
+    w, x, y, z = quaternion
+    cosine = math.sqrt(0.5)
+    sine = cosine
+    return np.asarray(
+        (
+            w * cosine - x * sine,
+            w * sine + x * cosine,
+            y * cosine + z * sine,
+            -y * sine + z * cosine,
+        ),
+        dtype=np.float64,
+    )
+
+
 def root_rpy(root_quaternion_wxyz):
     rotation = quaternion_wxyz_to_matrix(root_quaternion_wxyz)
     roll = np.arctan2(rotation[2, 1], rotation[2, 2])
@@ -162,12 +205,15 @@ def pack_observation_state(
     b2_velocity = _as_float_array(b2_velocity, (12,), "b2_velocity")
     root_position = _as_float_array(root_position_world, (3,), "root_position_world")
     root_quaternion = _as_float_array(root_quaternion_wxyz, (4,), "root_quaternion_wxyz")
-    linear_velocity = _as_float_array(
+    linear_velocity_world = _as_float_array(
         root_linear_velocity_world, (3,), "root_linear_velocity_world"
     )
-    angular_velocity = _as_float_array(
+    angular_velocity_world = _as_float_array(
         root_angular_velocity_world, (3,), "root_angular_velocity_world"
     )
+    world_to_body = quaternion_wxyz_to_matrix(root_quaternion).T
+    linear_velocity_body = world_to_body @ linear_velocity_world
+    angular_velocity_body = world_to_body @ angular_velocity_world
     roll, pitch, yaw = root_rpy(root_quaternion)
     ee_pose = height_invariant_pose(
         root_position,
@@ -184,8 +230,8 @@ def pack_observation_state(
             b2_velocity,
             np.asarray((roll, pitch, root_position[2])),
             np.asarray((root_position[0], root_position[1], yaw)),
-            linear_velocity,
-            angular_velocity,
+            linear_velocity_body,
+            angular_velocity_body,
             ee_pose,
         )
     ).astype(np.float32)

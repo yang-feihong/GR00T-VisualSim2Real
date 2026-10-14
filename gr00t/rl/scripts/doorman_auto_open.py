@@ -57,7 +57,6 @@ from gr00t.rl.auto_open.control import (  # noqa: E402
     _arm_pose_is_stable,
     _base_advance_target,
     _base_command,
-    _base_velocity_damping,
     _current_panel_station,
     _desired_grasp_quat,
     _effective_grasp_target,
@@ -1623,7 +1622,7 @@ class DoorController:
                 self.through_stop_latched, station_dist, yaw_error
             )
             if self.stage == Stage.THROUGH and self.through_stop_latched:
-                base_cmd[:] = _base_velocity_damping(state)[0]
+                base_cmd[:] = 0.0
             if self.stage == Stage.THROUGH and not self.through_motion_ready:
                 base_cmd[:] = 0.0
             _set_base_tracking_target(
@@ -1653,6 +1652,10 @@ class DoorController:
             base_cmd[:] = 0.0
 
         base_cmd = _stabilize_base_command(self, _limit_base_commands(base_cmd))
+        if self.stage == Stage.THROUGH and self.through_stop_latched:
+            # Keep the complete terminal hold supervision exactly zero even
+            # when reversal filtering still contains a previous command.
+            base_cmd[:] = 0.0
 
         ee_local = (
             torch.as_tensor(ee_local_override, device=self.env.device, dtype=torch.float32).reshape(1, 3)

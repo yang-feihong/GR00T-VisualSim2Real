@@ -275,3 +275,10 @@ def test_fixed_launcher_has_one_python_invocation_and_one_common_contract():
         "--batch_geometry_fallback_backend numpy_batch",
     ):
         assert launcher.count(option) == 1
+
+
+def test_standard_collection_uses_bounded_reviewed_workers_per_gpu():
+    launcher = (SCRIPTS / "run_auto_open.sh").read_text(encoding="utf-8")
+    assert 'STANDARD_WORKERS_PER_GPU:-4' in launcher
+    assert '[[ ! "${workers_per_gpu}" =~ ^[1-4]$ ]]' in launcher
+    assert "worker_count=$((gpu_count * workers_per_gpu))" in launcher

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import queue
 import shutil
+import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
@@ -34,6 +37,30 @@ CAMERA_KEYS = (
 CAMERA_SHAPES = {
     CAMERA_KEYS[0]: (640, 480, 3),
     CAMERA_KEYS[1]: (480, 640, 3),
+}
+DATASET_IMAGE_TRANSFORMS = {
+    CAMERA_KEYS[0]: {
+        "source_camera_name": "base_0_rgb",
+        "source_shape_hwc": [480, 640, 3],
+        "dataset_shape_hwc": [640, 480, 3],
+        "operation": "rot90_counterclockwise",
+        "source_to_dataset_pixel_homography": [
+            [0.0, 1.0, 0.0],
+            [-1.0, 0.0, 639.0],
+            [0.0, 0.0, 1.0],
+        ],
+    },
+    CAMERA_KEYS[1]: {
+        "source_camera_name": "left_wrist_0_rgb",
+        "source_shape_hwc": [480, 640, 3],
+        "dataset_shape_hwc": [480, 640, 3],
+        "operation": "identity",
+        "source_to_dataset_pixel_homography": [
+            [1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+        ],
+    },
 }
 
 ROUND_TRIP_WINDOW_FRAMES = 5
@@ -124,6 +151,7 @@ _AUDIT_FIXED_LISTS = {
     "root_angular_velocity_world": 3,
     "arm_joint_position": 6,
     "arm_joint_velocity": 6,
+    "physx_arm_joint_velocity": 6,
     "b2_joint_position": 12,
     "b2_joint_velocity": 12,
     "foot_position_world": 12,
@@ -212,6 +240,43 @@ class StreamingVideoEncoder:
         self.stream.options = {"crf": "23"}
         self.frame_count = 0
         self.closed = False
+        self.encode_wall_s = 0.0
+        self._queue = queue.Queue(maxsize=8)
+        self._worker_error = None
+        self._worker = threading.Thread(
+            target=self._encode_worker,
+            name=f"video-encoder-{self.path.name}",
+            daemon=True,
+        )
+        self._worker.start()
+
+    def _encode_worker(self):
+        try:
+            while True:
+                image = self._queue.get()
+                if image is None:
+                    break
+                started = time.perf_counter()
+                frame = self._av.VideoFrame.from_ndarray(image, format="rgb24")
+                for packet in self.stream.encode(frame):
+                    self.container.mux(packet)
+                self.encode_wall_s += time.perf_counter() - started
+            for packet in self.stream.encode():
+                self.container.mux(packet)
+        except BaseException as exc:
+            self._worker_error = exc
+        finally:
+            self.container.close()
+
+    def _put(self, value):
+        while True:
+            if self._worker_error is not None:
+                raise RuntimeError("background video encoder failed") from self._worker_error
+            try:
+                self._queue.put(value, timeout=0.1)
+                return
+            except queue.Full:
+                continue
 
     def append(self, image):
         if self.closed:
@@ -222,18 +287,17 @@ class StreamingVideoEncoder:
                 f"video frame {self.frame_count} must be uint8 "
                 f"{self.expected_shape}, got {image.dtype} {image.shape}"
             )
-        frame = self._av.VideoFrame.from_ndarray(image, format="rgb24")
-        for packet in self.stream.encode(frame):
-            self.container.mux(packet)
+        self._put(image)
         self.frame_count += 1
 
     def close(self):
         if self.closed:
             return
-        for packet in self.stream.encode():
-            self.container.mux(packet)
-        self.container.close()
+        self._put(None)
+        self._worker.join()
         self.closed = True
+        if self._worker_error is not None:
+            raise RuntimeError("background video encoder failed") from self._worker_error
 
 
 def _verify_video(path: Path, expected_shape, expected_frames: int):
@@ -284,8 +348,35 @@ def _first_index(mask, start=0):
     return None if len(indices) == 0 else int(start) + int(indices[0])
 
 
+def _true_runs(mask):
+    mask = np.asarray(mask, dtype=bool)
+    padded = np.pad(mask.astype(np.int8), (1, 1))
+    edges = np.diff(padded)
+    starts = np.flatnonzero(edges == 1)
+    stops = np.flatnonzero(edges == -1)
+    return tuple((int(start), int(stop)) for start, stop in zip(starts, stops))
+
+
+def _gripper_release_start(gripper):
+    """First command that starts opening the gripper after grasp closure."""
+    gripper = np.asarray(gripper, dtype=np.float64)
+    fully_open = gripper <= (-np.pi / 3 + 1.0e-3)
+    first_open = _first_index(fully_open)
+    if first_open is None:
+        return None
+    grasp_close = _first_index(gripper > gripper[first_open] + 0.10, first_open + 1)
+    if grasp_close is None:
+        return None
+    return _first_index(gripper < gripper[grasp_close] - 0.01, grasp_close + 1)
+
+
 def _short_round_trips(
-    values, *, jump_threshold, return_tolerance, require_sign_reversal=False
+    values,
+    *,
+    jump_threshold,
+    return_tolerance,
+    require_sign_reversal=False,
+    require_isolated_jump=False,
 ):
     """Find a large dispatched-target jump that returns within 100 ms."""
     values = np.asarray(values, dtype=np.float64)
@@ -295,6 +386,13 @@ def _short_round_trips(
     for frame in range(1, len(values)):
         jump = values[frame] - values[frame - 1]
         for component in np.flatnonzero(np.abs(jump) >= jump_threshold):
+            if require_isolated_jump and frame >= 2:
+                previous_jump = values[frame - 1, component] - values[frame - 2, component]
+                if (
+                    previous_jump * jump[component] > 0.0
+                    and abs(previous_jump) >= 0.5 * abs(jump[component])
+                ):
+                    continue
             if require_sign_reversal and not (
                 values[frame - 1, component] * values[frame, component] < 0.0
             ):
@@ -328,7 +426,8 @@ def _contact_acceptance_summary(episode, stages):
     for row in episode.raw_contacts:
         force = float(row.get("max_contact_force", 0.0))
         impulse = float(row.get("max_normal_impulse", 0.0))
-        if force <= 1.0e-6 and impulse <= 1.0e-9:
+        penetration = float(row.get("max_penetration_depth", 0.0))
+        if force == 0.0 and impulse == 0.0 and penetration == 0.0:
             continue
         frame = int(row.get("frame_index", -1))
         stage = str(stages[frame]) if 0 <= frame < len(stages) else "UNKNOWN"
@@ -397,7 +496,6 @@ def _contact_acceptance_summary(episode, stages):
             )
         if contact_class is None:
             continue
-        penetration = float(row.get("max_penetration_depth", 0.0))
         metrics = class_maxima[contact_class]
         metrics["rows"] += 1
         metrics["max_penetration_m"] = max(
@@ -493,6 +591,7 @@ def _physical_acceptance_reasons(episode, boundary):
         arm_targets,
         jump_threshold=ARM_ROUND_TRIP_JUMP,
         return_tolerance=ARM_ROUND_TRIP_RETURN_TOLERANCE,
+        require_isolated_jump=True,
     )
     if base_round_trips:
         first = base_round_trips[0]
@@ -539,8 +638,10 @@ def _physical_acceptance_reasons(episode, boundary):
             reasons.append("invalid_gripper_closed_open_grasp_open_closed_sequence")
         elif not np.all(closed[final_close:]):
             reasons.append("gripper_reopened_after_final_close")
+        release_start = _gripper_release_start(gripper)
     else:
         release_open = None
+        release_start = None
 
     handle = boundary.boundaries.get("handle_press")
     traversal = boundary.boundaries.get("traversal")
@@ -553,7 +654,7 @@ def _physical_acceptance_reasons(episode, boundary):
         gap_frame = episode.event_frames.get("door_gap_20mm")
         if gap_frame is None:
             reasons.append("door_gap_never_reached_20mm")
-        elif release_open is not None and int(gap_frame) > int(release_open):
+        elif release_start is not None and int(gap_frame) >= int(release_start):
             reasons.append("gripper_released_before_20mm_door_gap")
         if episode.event_frames.get("handle_unlocked") is None:
             reasons.append("handle_never_unlocked_latch")
@@ -561,6 +662,11 @@ def _physical_acceptance_reasons(episode, boundary):
         arm_q = np.asarray(audit["arm_joint_position"], dtype=np.float64)
         if abs(float(arm_q[traversal.start_frame - 1, 5])) > 0.2:
             reasons.append("q6_outside_0p2rad_before_traversal")
+        reset_runs = _true_runs(
+            action[traversal.start_frame : traversal.stop_frame, 4] > 0.5
+        )
+        if len(reset_runs) > 1:
+            reasons.append(f"stage3_reset_reentered:run_count={len(reset_runs)}")
     if episode.event_frames.get("robot_clear") is None:
         reasons.append("robot_never_cleared_door_plane")
 
@@ -580,6 +686,48 @@ def _physical_acceptance_reasons(episode, boundary):
             f"frame={first['frame']},class={first['class']},"
             f"depth={first['penetration_m']:.6f},limit={first['limit_m']:.6f}"
         )
+
+    contact_keys = set()
+    zero_contact_rows = 0
+    duplicate_contact_rows = 0
+    noncanonical_contact_rows = 0
+    for row in episode.raw_contacts:
+        values = (
+            float(row.get("max_contact_force", 0.0)),
+            float(row.get("max_normal_impulse", 0.0)),
+            float(row.get("max_penetration_depth", 0.0)),
+        )
+        if values == (0.0, 0.0, 0.0):
+            zero_contact_rows += 1
+        directed_pair = (
+            str(row.get("body_a_path", "")),
+            str(row.get("body_b_path", "")),
+        )
+        pair = tuple(sorted(directed_pair))
+        if directed_pair != pair:
+            noncanonical_contact_rows += 1
+        key = (int(row.get("frame_index", -1)), pair)
+        if key in contact_keys:
+            duplicate_contact_rows += 1
+        contact_keys.add(key)
+    if zero_contact_rows:
+        reasons.append(f"raw_contact_zero_rows:{zero_contact_rows}")
+    if duplicate_contact_rows:
+        reasons.append(f"raw_contact_duplicate_frame_pairs:{duplicate_contact_rows}")
+    if noncanonical_contact_rows:
+        reasons.append(f"raw_contact_noncanonical_pairs:{noncanonical_contact_rows}")
+
+    arm_position = np.asarray(audit["arm_joint_position"], dtype=np.float64)
+    arm_velocity = np.asarray(audit["arm_joint_velocity"], dtype=np.float64)
+    if frames > 1:
+        causal_velocity = np.diff(arm_position, axis=0) * CONTROL_HZ
+        velocity_error = float(
+            np.max(np.abs(arm_velocity[1:] - causal_velocity))
+        )
+        if velocity_error > 1.0e-4:
+            reasons.append(
+                f"arm_velocity_position_inconsistent:{velocity_error:.6f}"
+            )
 
     handle_boundary = boundary.boundaries.get("handle_press")
     if handle_boundary is not None:
@@ -613,12 +761,15 @@ def _physical_acceptance_reasons(episode, boundary):
         reasons.append("terminal_actual_stability_window_missing")
     else:
         terminal = slice(frames - TERMINAL_STABILITY_FRAMES, frames)
+        terminal_base_command = action[terminal, :3]
         root_linear = np.asarray(audit["root_linear_velocity_world"], dtype=np.float64)[terminal]
         root_angular = np.asarray(audit["root_angular_velocity_world"], dtype=np.float64)[terminal]
         arm_velocity = np.asarray(audit["arm_joint_velocity"], dtype=np.float64)[terminal]
         hinge_velocity = np.asarray(audit["door_hinge_velocity"], dtype=np.float64)[terminal]
         gripper_feedback = np.asarray(audit["gripper_feedback"], dtype=np.float64)[terminal]
         gripper_velocity = np.abs(np.diff(gripper_feedback, prepend=gripper_feedback[0])) * CONTROL_HZ
+        if np.max(np.abs(terminal_base_command)) > 1.0e-7:
+            reasons.append("terminal_base_command_not_zero")
         if np.max(np.linalg.norm(root_linear, axis=1)) >= TERMINAL_BASE_LINEAR_SPEED_M_S:
             reasons.append("terminal_base_linear_velocity_not_stable")
         if np.max(np.linalg.norm(root_angular, axis=1)) >= TERMINAL_BASE_ANGULAR_SPEED_RAD_S:
@@ -644,11 +795,13 @@ def _episode_acceptance_metrics(episode, boundary, reasons):
     base_ns = array("base_image_capture_time_ns")
     wrist_ns = array("wrist_image_capture_time_ns")
     arm_targets = array("arm_joint_target_dispatched", 6)
+    arm_position = array("arm_joint_position", 6)
     arm_velocity = array("arm_joint_velocity", 6)
     base_command = array("base_command_dispatched", 3)
     root_linear = array("root_linear_velocity_world", 3)
     root_angular = array("root_angular_velocity_world", 3)
     stages = np.asarray(audit.get("autoopen_stage", [""] * frames), dtype=str)
+    door_gap = array("door_edge_gap_m")
     contacts = list(episode.raw_contacts)
     base_round_trips = _short_round_trips(
         base_command,
@@ -660,6 +813,7 @@ def _episode_acceptance_metrics(episode, boundary, reasons):
         arm_targets,
         jump_threshold=ARM_ROUND_TRIP_JUMP,
         return_tolerance=ARM_ROUND_TRIP_RETURN_TOLERANCE,
+        require_isolated_jump=True,
     )
     contact_summary = _contact_acceptance_summary(episode, stages)
     handle_contacts = [
@@ -682,6 +836,53 @@ def _episode_acceptance_metrics(episode, boundary, reasons):
     ) + 1
     stage2_entry = int(stage2_entries[0]) if len(stage2_entries) == 1 else None
     terminal_slice = slice(max(0, frames - CONTROL_HZ), frames)
+    handle_boundary = (
+        None if boundary is None else boundary.boundaries.get("handle_press")
+    )
+    traversal_boundary = (
+        None if boundary is None else boundary.boundaries.get("traversal")
+    )
+    gripper = np.asarray(episode.action[:, 14], dtype=np.float64)
+    release_start = _gripper_release_start(gripper)
+    before_release_stop = frames if release_start is None else release_start
+    before_release_start = (
+        0 if handle_boundary is None else handle_boundary.start_frame
+    )
+    if handle_boundary is None:
+        stage2_gap = np.zeros(0, dtype=np.float64)
+        stage2_end_gap = None
+    else:
+        stage2_gap = door_gap[handle_boundary.start_frame : handle_boundary.stop_frame]
+        stage2_end_gap = (
+            float(door_gap[handle_boundary.stop_frame - 1])
+            if handle_boundary.stop_frame > handle_boundary.start_frame
+            else None
+        )
+    reset_runs = ()
+    if traversal_boundary is not None:
+        reset_runs = tuple(
+            (
+                start + traversal_boundary.start_frame,
+                stop + traversal_boundary.start_frame,
+            )
+            for start, stop in _true_runs(
+                episode.action[
+                    traversal_boundary.start_frame : traversal_boundary.stop_frame, 4
+                ] > 0.5
+            )
+        )
+    velocity_position_error = (
+        float(
+            np.max(
+                np.abs(
+                    arm_velocity[1:]
+                    - np.diff(arm_position, axis=0) * CONTROL_HZ
+                )
+            )
+        )
+        if frames > 1
+        else 0.0
+    )
     return {
         "episode_index": int(episode.episode_index),
         "seed": int(episode.seed),
@@ -721,17 +922,29 @@ def _episode_acceptance_metrics(episode, boundary, reasons):
             "base_short_round_trips": base_round_trips,
             "arm_short_round_trip_count": len(arm_round_trips),
             "arm_short_round_trips": arm_round_trips,
+            "stage3_reset_run_count": len(reset_runs),
+            "stage3_reset_runs": [list(run) for run in reset_runs],
+            "max_arm_velocity_position_error_rad_s": velocity_position_error,
         },
         "physical_result": {
             "max_handle_angle_deg": float(np.rad2deg(np.max(np.abs(array("handle_position"))))) if frames else 0.0,
-            "max_door_gap_m": float(np.max(array("door_edge_gap_m"))) if frames else 0.0,
+            "max_door_gap_before_release_m": (
+                float(np.max(door_gap[before_release_start:before_release_stop]))
+                if before_release_stop > before_release_start
+                else 0.0
+            ),
+            "max_door_gap_stage2_m": (
+                float(np.max(stage2_gap)) if len(stage2_gap) else 0.0
+            ),
+            "door_gap_at_stage2_end_m": stage2_end_gap,
+            "max_door_gap_episode_m": float(np.max(door_gap)) if frames else 0.0,
             "final_door_angle_deg": float(np.rad2deg(array("door_hinge_position")[-1])) if frames else 0.0,
             "robot_clear_frame": episode.event_frames.get("robot_clear"),
         },
         "contacts": {
-            "rows": len(contacts),
-            "handle_rows": len(handle_contacts),
-            "nonzero_handle_rows": len(nonzero_handle_contacts),
+            "unique_frame_pair_rows": len(contacts),
+            "handle_unique_frame_pair_rows": len(handle_contacts),
+            "nonzero_handle_unique_frame_pair_rows": len(nonzero_handle_contacts),
             "max_force_n": max((float(row.get("max_contact_force", 0.0)) for row in contacts), default=0.0),
             "max_normal_impulse_ns": max((float(row.get("max_normal_impulse", 0.0)) for row in contacts), default=0.0),
             "max_penetration_m": max((float(row.get("max_penetration_depth", 0.0)) for row in contacts), default=0.0),
@@ -748,6 +961,9 @@ def _episode_acceptance_metrics(episode, boundary, reasons):
         },
         "terminal_actual": {
             "window_frames": min(frames, CONTROL_HZ),
+            "max_base_command_abs": np.max(
+                np.abs(base_command[terminal_slice]), axis=0
+            ).tolist() if frames else [0.0] * 3,
             "max_base_linear_speed_m_s": float(np.max(np.linalg.norm(root_linear[terminal_slice], axis=1))) if frames else 0.0,
             "max_base_angular_speed_rad_s": float(np.max(np.linalg.norm(root_angular[terminal_slice], axis=1))) if frames else 0.0,
             "max_arm_speed_rad_s": float(np.max(np.abs(arm_velocity[terminal_slice]))) if frames else 0.0,
@@ -765,6 +981,29 @@ class AutoOpenDatasetWriter:
         self.root = Path(root)
         self.camera_calibration = dict(camera_calibration)
         self.simulation_provenance = dict(simulation_provenance)
+        renderer_config_id = self.simulation_provenance.get("camera_calibration_id")
+        if renderer_config_id:
+            self.camera_calibration["renderer_runtime_camera_config_id"] = str(
+                renderer_config_id
+            )
+            self.simulation_provenance["renderer_runtime_camera_config_id"] = str(
+                renderer_config_id
+            )
+        self.camera_calibration["dataset_image_transforms"] = (
+            DATASET_IMAGE_TRANSFORMS
+        )
+        calibration_payload = json.dumps(
+            self.camera_calibration,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        calibration_id = hashlib.sha256(calibration_payload).hexdigest()
+        self.camera_calibration["calibration_id"] = calibration_id
+        self.camera_calibration["calibration_id_source"] = (
+            "sha256_of_effective_renderer_config_and_dataset_pixel_transforms"
+        )
+        self.simulation_provenance["camera_calibration_id"] = calibration_id
         self.accepted = []
         self.quarantined = []
         self.boundaries = {}
@@ -786,6 +1025,40 @@ class AutoOpenDatasetWriter:
             reasons.append("state_action_frame_count_mismatch")
         if not np.isfinite(state).all() or not np.isfinite(action).all():
             reasons.append("non_finite_training_values")
+        if state.shape == (frames, 58) and action.shape == (frames, 25):
+            audit_state_fields = (
+                ("arm_joint_position", slice(0, 6)),
+                ("arm_joint_velocity", slice(6, 12)),
+                ("gripper_feedback", 12),
+                ("b2_joint_position", slice(13, 25)),
+                ("b2_joint_velocity", slice(25, 37)),
+            )
+            for name, state_index in audit_state_fields:
+                if name not in episode.raw_audit:
+                    continue
+                expected = np.asarray(episode.raw_audit[name], dtype=np.float32)
+                actual = state[:, state_index]
+                if expected.shape != actual.shape or not np.allclose(
+                    actual, expected, rtol=0.0, atol=1.0e-6
+                ):
+                    reasons.append(f"training_state_raw_audit_mismatch:{name}")
+            audit_action_fields = (
+                ("base_command_dispatched", slice(0, 3)),
+                ("arm_teleop_inactive_dispatched", 3),
+                ("arm_reset_dispatched", 4),
+                ("gripper_target_dispatched", 14),
+            )
+            for name, action_index in audit_action_fields:
+                if name not in episode.raw_audit:
+                    continue
+                expected = np.asarray(episode.raw_audit[name], dtype=np.float32)
+                actual = action[:, action_index]
+                if expected.shape != actual.shape or not np.allclose(
+                    actual, expected, rtol=0.0, atol=1.0e-6
+                ):
+                    reasons.append(f"training_action_raw_audit_mismatch:{name}")
+            if not np.array_equal(action[:, 5:14], action[:, 16:25]):
+                reasons.append("control_ee_alias_mismatch")
         use_staged_videos = bool(episode.staged_videos)
         for key in CAMERA_KEYS:
             if use_staged_videos:
@@ -935,6 +1208,9 @@ class AutoOpenDatasetWriter:
             meta / "acceptance_report.json",
             {
                 "schema_version": SCHEMA_VERSION,
+                "camera_calibration_id": self.camera_calibration.get(
+                    "calibration_id"
+                ),
                 "total_episodes": len(self.accepted) + len(self.quarantined),
                 "accepted_episodes": len(self.accepted),
                 "quarantined_episodes": len(self.quarantined),
@@ -962,6 +1238,9 @@ class AutoOpenDatasetWriter:
             {
                 "codebase_version": "v2.0",
                 "schema_version": SCHEMA_VERSION,
+                "camera_calibration_id": self.camera_calibration.get(
+                    "calibration_id"
+                ),
                 "fps": CONTROL_HZ,
                 "total_episodes": len(self.accepted),
                 "total_frames": self._global_frames,
@@ -995,7 +1274,7 @@ class AutoOpenDatasetWriter:
             for name, values in stage_values.items()
         }
         rows = [
-            "| seed | 结果 | 帧数 | Stage2 入口 q5 目标步进(rad) | 把手最大角(deg) | 门缝最大值(m) | 把手非零接触行 | 原因 |",
+            "| seed | 结果 | 帧数 | Stage2 入口 q5 目标步进(rad) | 把手最大角(deg) | Stage2结束门缝(m) | 把手非零唯一接触 | 原因 |",
             "|---:|---|---:|---:|---:|---:|---:|---|",
         ]
         for report in self._episode_reports:
@@ -1003,8 +1282,8 @@ class AutoOpenDatasetWriter:
                 f"| {report['seed']} | {'通过' if report['accepted'] else '隔离'} | "
                 f"{report['frames']} | {report['control']['stage2_entry_q5_target_step_rad'] or 0.0:.6f} | "
                 f"{report['physical_result']['max_handle_angle_deg']:.3f} | "
-                f"{report['physical_result']['max_door_gap_m']:.4f} | "
-                f"{report['contacts']['nonzero_handle_rows']} | "
+                f"{float(report['physical_result']['door_gap_at_stage2_end_m'] or 0.0):.4f} | "
+                f"{report['contacts']['nonzero_handle_unique_frame_pair_rows']} | "
                 f"{'; '.join(report['reasons']) or '无'} |"
             )
         summary.write_text(
@@ -1111,16 +1390,20 @@ def aggregate_standard_shards(
             (float(row.get("physical_result", {}).get("max_handle_angle_deg", 0.0)) for row in episode_rows),
             default=0.0,
         ),
-        "min_door_gap_m": min(
-            (float(row.get("physical_result", {}).get("max_door_gap_m", 0.0)) for row in episode_rows),
+        "min_door_gap_before_release_m": min(
+            (float(row.get("physical_result", {}).get("max_door_gap_before_release_m", 0.0)) for row in episode_rows),
+            default=0.0,
+        ),
+        "min_door_gap_at_stage2_end_m": min(
+            (float(row.get("physical_result", {}).get("door_gap_at_stage2_end_m") or 0.0) for row in episode_rows),
             default=0.0,
         ),
         "min_final_door_angle_deg": min(
             (float(row.get("physical_result", {}).get("final_door_angle_deg", 0.0)) for row in episode_rows),
             default=0.0,
         ),
-        "nonzero_handle_contact_rows": sum(
-            int(row.get("contacts", {}).get("nonzero_handle_rows", 0))
+        "nonzero_handle_unique_frame_pair_rows": sum(
+            int(row.get("contacts", {}).get("nonzero_handle_unique_frame_pair_rows", 0))
             for row in episode_rows
         ),
         "max_penetration_m": max(
@@ -1173,7 +1456,7 @@ def aggregate_standard_shards(
             f"| {row['seed']} | {'通过' if row.get('accepted') else '隔离'} | "
             f"{row.get('frames', 0)} | "
             f"{float(row.get('control', {}).get('stage2_entry_q5_target_step_rad') or 0.0):.6f} | "
-            f"{int(row.get('contacts', {}).get('nonzero_handle_rows', 0))} | "
+            f"{int(row.get('contacts', {}).get('nonzero_handle_unique_frame_pair_rows', 0))} | "
             f"{int(row.get('terminal_actual', {}).get('window_frames', 0))} | "
             f"{'; '.join(row.get('reasons', [])) or '无'} |"
         )
@@ -1187,8 +1470,8 @@ def aggregate_standard_shards(
         f"- 总训练帧：`{total_frames}`；状态、动作及两路相机：`{CONTROL_HZ} Hz`\n"
         f"- 最大仿真时钟抖动：`{delivery_metrics['max_sim_tick_jitter_ns']} ns`；最大跨相机偏差：`{delivery_metrics['max_camera_skew_ns']} ns`\n"
         f"- Stage2入口最大q5目标步进：`{delivery_metrics['max_stage2_entry_q5_target_step_rad']:.6f} rad`\n"
-        f"- 把手最小最大按压角：`{delivery_metrics['min_handle_angle_deg']:.3f} deg`；最小门缝：`{delivery_metrics['min_door_gap_m']:.4f} m`；最小最终门角：`{delivery_metrics['min_final_door_angle_deg']:.3f} deg`\n"
-        f"- 把手非零接触总行数：`{delivery_metrics['nonzero_handle_contact_rows']}`；最大穿透：`{delivery_metrics['max_penetration_m']:.6f} m`\n"
+        f"- 把手最小最大按压角：`{delivery_metrics['min_handle_angle_deg']:.3f} deg`；释放前最小最大门缝：`{delivery_metrics['min_door_gap_before_release_m']:.4f} m`；Stage2结束最小门缝：`{delivery_metrics['min_door_gap_at_stage2_end_m']:.4f} m`；最小最终门角：`{delivery_metrics['min_final_door_angle_deg']:.3f} deg`\n"
+        f"- 把手非零唯一帧/物体对记录总数：`{delivery_metrics['nonzero_handle_unique_frame_pair_rows']}`；最大穿透：`{delivery_metrics['max_penetration_m']:.6f} m`\n"
         f"- 三阶段时长统计：`{json.dumps(stage_summary, ensure_ascii=False)}`\n"
         f"- 隔离原因：`{json.dumps(reason_counts, ensure_ascii=False)}`\n"
         f"- 例外：`{json.dumps(exceptions, ensure_ascii=False)}`\n\n"
