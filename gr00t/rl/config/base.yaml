@@ -4,6 +4,7 @@ defaults:
   - _self_
   - base/hydra
   - base/structure
+  - static_scene: none
   - callbacks/model_save
   - callbacks/autoresume
   - callbacks/wandb
@@ -51,4 +52,3 @@ eval_overrides:
   num_envs: 1
   auto_load_latest: False
   use_wandb: False
-

@@ -1749,6 +1749,26 @@ class LeggedRobotBase(BaseTask):
             else:
                 self.target_robot_root_states[env_ids] = self.base_init_state
                 self.target_robot_root_states[env_ids, :3] += self.env_origins[env_ids]
+
+            scene_spawn_sampler = getattr(
+                self.simulator, "sample_static_scene_robot_spawns", None
+            )
+            scene_spawn_poses = (
+                scene_spawn_sampler(env_ids) if scene_spawn_sampler is not None else None
+            )
+            if scene_spawn_poses is not None:
+                self.target_robot_root_states[env_ids, :2] = (
+                    self.env_origins[env_ids, :2] + scene_spawn_poses[:, :2]
+                )
+                yaw = scene_spawn_poses[:, 2]
+                yaw_quat = torch.zeros((len(env_ids), 4), device=self.device)
+                yaw_quat[:, 2] = torch.sin(0.5 * yaw)
+                yaw_quat[:, 3] = torch.cos(0.5 * yaw)
+                self.target_robot_root_states[env_ids, 3:7] = quat_mul_norm(
+                    yaw_quat,
+                    self.target_robot_root_states[env_ids, 3:7],
+                    w_last=True,
+                )
             # base velocities
 
             if self.config.domain_rand.get("randomize_initial_root_vel", True):

@@ -86,6 +86,10 @@ if DEFAULT_ISAACSIM_VERSION == "4.5":
         randomize_table_material,
     )
     from gr00t.rl.simulator.isaacsim.isaacsim_articulation_cfg import ARTICULATION_CFG
+    from gr00t.rl.simulator.isaacsim.vlnverse_scene import (
+        install_vlnverse_scenes,
+        static_scene_enabled,
+    )
     from gr00t.rl.utils.helpers import dict_to_true_list
 
 elif DEFAULT_ISAACSIM_VERSION == "4.2":
@@ -144,6 +148,10 @@ elif DEFAULT_ISAACSIM_VERSION == "4.2":
         randomize_table_material,
     )
     from gr00t.rl.simulator.isaacsim.isaacsim_articulation_cfg import ARTICULATION_CFG
+    from gr00t.rl.simulator.isaacsim.vlnverse_scene import (
+        install_vlnverse_scenes,
+        static_scene_enabled,
+    )
     from gr00t.rl.utils.helpers import dict_to_true_list
 
 else:
@@ -201,6 +209,21 @@ class IsaacSim(BaseSimulator):
         self.env_config = config
         self.terrain_config = config.terrain
         self.domain_rand_config = config.domain_rand
+
+        static_scene_config = getattr(config, "static_scene", None)
+        if static_scene_enabled(static_scene_config):
+            provider = str(getattr(static_scene_config, "provider", ""))
+            if provider != "vlnverse":
+                raise ValueError(f"Unsupported static scene provider: {provider}")
+            self.simulator_config.scene.replicate_physics = False
+            minimum_spacing = float(getattr(static_scene_config, "env_spacing_m", 0.0))
+            if self.simulator_config.scene.env_spacing < minimum_spacing:
+                logger.info(
+                    f"Increasing environment spacing from "
+                    f"{self.simulator_config.scene.env_spacing} m to "
+                    f"{minimum_spacing} m for VLNVerse scenes"
+                )
+                self.simulator_config.scene.env_spacing = minimum_spacing
 
         # for reset event manager
         self.num_envs = self.simulator_config.scene.num_envs
@@ -820,6 +843,29 @@ class IsaacSim(BaseSimulator):
         except Exception as e:
             logger.warning(f"Memory cleanup failed: {e}")
 
+    def sample_static_scene_robot_spawns(self, env_ids):
+        """Return deterministic local ``(x, y, yaw)`` poses for scene resets."""
+        candidates = getattr(self, "static_scene_spawn_candidates", None)
+        if candidates is None:
+            return None
+        if not hasattr(self, "_static_scene_spawn_candidates_tensor"):
+            self._static_scene_spawn_candidates_tensor = torch.as_tensor(
+                candidates, dtype=torch.float32, device=self.device
+            )
+            self._static_scene_reset_counts = torch.zeros(
+                self.num_envs, dtype=torch.long, device=self.device
+            )
+            self.static_scene_last_spawn_poses = torch.zeros(
+                (self.num_envs, 3), dtype=torch.float32, device=self.device
+            )
+        env_ids = torch.as_tensor(env_ids, dtype=torch.long, device=self.device)
+        candidate_count = self._static_scene_spawn_candidates_tensor.shape[1]
+        candidate_ids = self._static_scene_reset_counts[env_ids] % candidate_count
+        poses = self._static_scene_spawn_candidates_tensor[env_ids, candidate_ids]
+        self.static_scene_last_spawn_poses[env_ids] = poses
+        self._static_scene_reset_counts[env_ids] += 1
+        return poses
+
     def _setup_scene(self):
         # ---------- Telemetry ----------
         logger.info(f"[TELEMETRY] Rank {getattr(self, 'rank', 'N/A')}: _setup_scene started")
@@ -1186,6 +1232,14 @@ class IsaacSim(BaseSimulator):
                 )
         self._robot = Articulation(robot_articulation_config)
         self.scene.articulations["robot"] = self._robot
+        static_scene_config = getattr(self.env_config, "static_scene", None)
+        if static_scene_enabled(static_scene_config):
+            install_vlnverse_scenes(self, static_scene_config, sim_utils)
+            logger.info(
+                f"Loaded VLNVerse scenes for {self.num_envs} environments "
+                f"({len(set(self.static_scene_ids))} unique): "
+                f"{', '.join(self.static_scene_ids[:8])}"
+            )
         self.contact_sensor = ContactSensor(contact_sensor_config)
         self.scene.sensors["contact_sensor"] = self.contact_sensor
         if hasattr(self.simulator_config, "heightmap"):

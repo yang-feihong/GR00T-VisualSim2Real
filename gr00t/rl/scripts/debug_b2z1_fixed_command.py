@@ -455,6 +455,12 @@ def main(config: OmegaConf):
             output_dir = Path(str(camera_dump_dir))
             output_dir.mkdir(parents=True, exist_ok=True)
             images = env.simulator.get_rgb_images_uint8()
+            if not images and env.simulator.ego_camera is not None:
+                legacy_rgb = env.simulator.ego_camera.data.output["rgb"]
+                if legacy_rgb.dtype != torch.uint8:
+                    scale = 255.0 if legacy_rgb.max() <= 1.0 else 1.0
+                    legacy_rgb = torch.clamp(legacy_rgb * scale, 0, 255).to(torch.uint8)
+                images = {"ego_camera": legacy_rgb}
             for camera_name, image_batch in images.items():
                 rgb = image_batch[0].detach().cpu().numpy().astype("uint8")
                 output_path = output_dir / f"{camera_name}.png"
