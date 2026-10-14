@@ -1,0 +1,20 @@
+# @package _global_
+
+static_scene:
+  enabled: true
+  provider: vlnverse
+  root_dir: /datasets/vlnverse_scenes
+  prim_name: VlnverseScene
+  env_spacing_m: 30.0
+  disable_embedded_physics_scenes: true
+  selection:
+    mode: random  # random, cycle, or fixed
+    seed: ${seed}
+    fixed_scene_id: null
+    scene_ids: []
+    require_navigation_metadata: true
+  robot_spawn:
+    enabled: true
+    candidate_count: 256
+    clearance_radius_m: 0.55
+    free_pixel_value: 255

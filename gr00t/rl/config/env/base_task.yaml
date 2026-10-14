@@ -8,6 +8,7 @@ env:
     num_envs: ${num_envs}
     headless: ${headless}
     simulator: ${simulator}
+    static_scene: ${static_scene}
     save_rendering_dir: null
     experiment_dir: null
     ckpt_dir: null
