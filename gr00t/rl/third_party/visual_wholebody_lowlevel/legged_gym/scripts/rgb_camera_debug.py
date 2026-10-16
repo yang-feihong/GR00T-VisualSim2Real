@@ -351,6 +351,8 @@ class SimRgbCameraManager:
         self.publish_time_s = 0.0
         self.preview_window_name = "RGB Cameras"
         self._cv2 = None
+        self._episode_specs = {}
+        self._configured_env_id = None
 
         config = load_rgb_camera_config(config_path)
         if config is None:
@@ -359,6 +361,16 @@ class SimRgbCameraManager:
             print("[rgb_camera][warn] RGB camera config ignored: IsaacLab RGB camera backend is not available yet.")
             return
         self._create_rigs_from_config(config)
+
+    def set_episode_camera_configs(self, configs_by_env):
+        parsed = {}
+        for env_id, config in dict(configs_by_env).items():
+            value = rgb_camera_specs_from_config(config)
+            if not value["enabled"]:
+                raise ValueError("episode camera configuration must be enabled")
+            parsed[int(env_id)] = value["cameras"]
+        self._episode_specs = parsed
+        self._configured_env_id = None
 
     def _create_rigs_from_config(self, config):
         parsed = rgb_camera_specs_from_config(config)
@@ -426,6 +438,14 @@ class SimRgbCameraManager:
     def render_images(self, env_id=0, rig_names=None, update=False):
         if not self.enabled:
             return {}
+        env_id = int(env_id)
+        if self._episode_specs and self._configured_env_id != env_id:
+            if env_id not in self._episode_specs:
+                raise KeyError(f"missing camera configuration for environment {env_id}")
+            self.env.configure_rgb_camera_specs(
+                self._episode_specs[env_id], env_id=env_id
+            )
+            self._configured_env_id = env_id
         return self.env.render_stereo_rgb_camera_rigs(
             env_id=env_id,
             rig_names=rig_names,

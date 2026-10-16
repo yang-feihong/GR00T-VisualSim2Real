@@ -14,6 +14,7 @@ def _collector(*, joint_mode=True):
     collector.env = SimpleNamespace(
         teleop_arm_joint_control_mask=np.asarray([joint_mode], dtype=bool)
     )
+    collector.env_id = 0
     collector.controller = SimpleNamespace(
         middle_arm_joint_target=np.asarray(
             [-1.57, 1.60, -0.63, -1.10, 0.0, 0.0], dtype=np.float32

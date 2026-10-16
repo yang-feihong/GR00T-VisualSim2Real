@@ -88,12 +88,20 @@ class ManipLoco_Policy:
         if not bool(self.env_cfg.enable_doorman_scene):
             return self.policy(observations, hist_encoding=True)
 
-        episode_seeds = torch.arange(
-            int(self.args.seed),
-            int(self.args.seed) + real_batch,
-            device=observations.device,
-            dtype=torch.long,
-        )
+        explicit_seeds = getattr(self.args, "episode_seeds", None)
+        if explicit_seeds is None:
+            episode_seeds = torch.arange(
+                int(self.args.seed),
+                int(self.args.seed) + real_batch,
+                device=observations.device,
+                dtype=torch.long,
+            )
+        else:
+            if len(explicit_seeds) != real_batch:
+                raise ValueError("episode_seeds must match the policy batch size")
+            episode_seeds = torch.as_tensor(
+                explicit_seeds, device=observations.device, dtype=torch.long
+            )
         relative = episode_seeds - AUTO_OPEN_CANONICAL_ENV_SEED_ANCHOR
         block_ids = torch.div(
             relative, AUTO_OPEN_POLICY_BLOCK_SIZE, rounding_mode="floor"

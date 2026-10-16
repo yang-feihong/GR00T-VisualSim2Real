@@ -48,10 +48,12 @@ from gr00t.rl.auto_open.cli import (  # noqa: E402
     _parser,
 )
 from gr00t.rl.auto_open.control import (  # noqa: E402
+    ALIGN_PANEL_ARRIVAL,
+    APPROACH_ARRIVAL,
     BASE_STATION_TOLERANCE_M,
-    BASE_YAW_TOLERANCE_RAD,
-    THROUGH_STOP_DISTANCE_M,
-    THROUGH_STOP_YAW_RAD,
+    THROUGH_TAIL_RELEASE_DISTANCE,
+    THROUGH_TAIL_TARGET_DISTANCE,
+    base_pose_arrival_regions,
     _approach_base_target,
     _arm_drive_stiffness,
     _arm_pose_is_stable,
@@ -74,6 +76,7 @@ from gr00t.rl.auto_open.control import (  # noqa: E402
     _slew_orientation,
     _through_tail_clearance,
     _zero_cross_base_reversal,
+    update_base_target_arrival,
 )
 from gr00t.rl.auto_open.geometry import (  # noqa: E402
     HANDLE_AXLE_MARGIN_MIN_M,
@@ -278,40 +281,6 @@ THROUGH_ENTRY_UPRIGHT_COS = math.cos(math.radians(10.0))
 PUSH_RETRACT_COMMAND_HOLD_FRAMES = 5
 
 
-def _base_pose_accepted(distance_m, yaw_error_rad):
-    return bool(
-        float(distance_m) < BASE_STATION_TOLERANCE_M
-        and abs(float(yaw_error_rad)) < BASE_YAW_TOLERANCE_RAD
-    )
-
-
-def _through_stop_latch(latched, distance_m, yaw_error_rad):
-    """Latch zero velocity inside the target core; release outside acceptance."""
-    if latched:
-        return _base_pose_accepted(distance_m, yaw_error_rad)
-    return bool(
-        float(distance_m) < THROUGH_STOP_DISTANCE_M
-        and abs(float(yaw_error_rad)) < THROUGH_STOP_YAW_RAD
-    )
-
-
-def _approach_stop_latch(
-    latched,
-    distance_m,
-    yaw_error_rad,
-    planar_speed_m_s,
-    angular_speed_rad_s,
-):
-    """Own the commanded stop while APPROACH verifies measured stability."""
-    if latched:
-        return _base_pose_accepted(distance_m, yaw_error_rad)
-    return bool(
-        _base_pose_accepted(distance_m, yaw_error_rad)
-        and float(planar_speed_m_s) < 0.02
-        and float(angular_speed_rad_s) < 0.05
-    )
-
-
 def _solve_center_vertical_shift(channel_error, fixed_jaw_gap):
     """Closest safe vertical shift satisfying channel and grasp travel limits."""
     error = float(channel_error)
@@ -399,8 +368,8 @@ class DoorController:
         self._introspect()
         self.pregrasp_target_world = None
         self.handle_center_target_world = None
-        self.approach_settle_steps = 0
-        self.approach_stop_latched = False
+        self.base_arrival_settle_steps = 0
+        self.base_arrival_confirmed = False
         self.pregrasp_settle_steps = 0
         self.handle_align_settle_steps = 0
         self.grasp_settle_steps = 0
@@ -494,7 +463,6 @@ class DoorController:
         self.panel_contact_orientation = None
         self.panel_contact_settle_steps = 0
         self.panel_station_xy = None
-        self.panel_station_settle_steps = 0
         self.base_hold_stage = None
         self.base_hold_target_xy = None
         self.base_hold_target_yaw = None
@@ -524,7 +492,7 @@ class DoorController:
         self.push_speed_kp = 0.45
         self.push_speed_ki = 0.50
         self.push_speed_integral_limit = math.radians(8.0)
-        self.push_max_angular_lead = math.radians(4.0)
+        self.push_max_angular_lead = math.radians(2.0)
         self.push_max_ee_step = 0.003
         self.push_speed_error_integral = 0.0
         self.push_command_hinge_angle = None
@@ -562,7 +530,6 @@ class DoorController:
         self.through_best_station_error = math.inf
         self.through_no_progress_steps = 0
         self.through_settle_steps = 0
-        self.through_stop_latched = False
         self.through_stability_failure_counts = {}
         self.through_motion_ready = False
         self.through_entry_stable_steps = 0
@@ -840,19 +807,37 @@ class DoorController:
             self.base_hold_nominal_yaw,
         )
 
+    def _reset_base_arrival(self, profile):
+        self.base_arrival_confirmed = False
+        self.base_arrival_settle_steps = 0
+        self.base_arrival_profile = profile
+
+    def _update_base_arrival_regions(self, inside_inner, inside_outer):
+        (
+            self.base_arrival_confirmed,
+            self.base_arrival_settle_steps,
+            zero_command,
+        ) = update_base_target_arrival(
+            self.base_arrival_confirmed,
+            self.base_arrival_settle_steps,
+            inside_inner,
+            inside_outer,
+            required_settle_frames=self.base_arrival_profile.settle_frames,
+        )
+        return zero_command
+
+    def _update_base_arrival(self, distance_m, yaw_error_rad):
+        return self._update_base_arrival_regions(
+            *base_pose_arrival_regions(
+                distance_m, yaw_error_rad, self.base_arrival_profile
+            )
+        )
+
 
     def _command_approach(self, state):
         """Publish the sole APPROACH command for scalar and batched runners."""
         base_cmd, station_dist, yaw_error = _base_command(self, state)
-        root_state = _as_np(state["root_states"])[0]
-        self.approach_stop_latched = _approach_stop_latch(
-            self.approach_stop_latched,
-            station_dist,
-            yaw_error,
-            np.linalg.norm(root_state[7:9]),
-            np.linalg.norm(root_state[10:13]),
-        )
-        if self.approach_stop_latched:
+        if self._update_base_arrival(station_dist, yaw_error):
             base_cmd[:] = 0.0
         base_cmd = _zero_cross_base_reversal(
             self, _limit_base_commands(base_cmd)
@@ -1422,8 +1407,6 @@ class DoorController:
                             elif target_distance <= self.push_reengage_reach_radius:
                                 self.push_reengage_reachable = True
                             target_reachable = self.push_reengage_reachable
-                            if target_reachable:
-                                base_cmd[:] = 0.0
                             hinge_speed = abs(
                                 float(
                                     _as_np(state["door_joint_velocity"])[
@@ -1564,6 +1547,7 @@ class DoorController:
         else:
             self.ee_command_world = _as_np(state["ee_pos"])[0].copy()
 
+        tracks_base_target = False
         if self.stage == Stage.BASE_ADVANCE:
             if self.disable_push_base_assist:
                 base_advance_target = _as_np(state["root_states"])[0, :2].copy()
@@ -1578,11 +1562,14 @@ class DoorController:
                 base_advance_target,
                 base_advance_yaw,
             )
+            if self.push_reengage_reachable:
+                base_cmd[:] = 0.0
             _set_base_tracking_target(
                 self,
                 base_advance_target, base_advance_yaw
             )
             self.base_hold_stage = None
+            tracks_base_target = True
         elif self.stage == Stage.ALIGN_PANEL:
             panel_nominal_xy, panel_nominal_yaw = _current_panel_station(self, state)
             panel_station_xy, panel_station_yaw = _perturb_base_target(
@@ -1605,6 +1592,7 @@ class DoorController:
                 panel_nominal_yaw,
             )
             self.base_hold_stage = None
+            tracks_base_target = True
         elif self.stage in (Stage.THROUGH, Stage.SUCCESS):
             through_target_xy, through_target_yaw = _perturb_base_target(
                 self,
@@ -1618,12 +1606,19 @@ class DoorController:
                 self.through_station_xy,
                 self.through_station_yaw,
             )
-            self.through_stop_latched = _through_stop_latch(
-                self.through_stop_latched, station_dist, yaw_error
-            )
-            if self.stage == Stage.THROUGH and self.through_stop_latched:
-                base_cmd[:] = 0.0
+            tail_clearance = _through_tail_clearance(self, state)
+            if self.stage == Stage.THROUGH:
+                if self.through_stop_latched:
+                    self.through_stop_latched = (
+                        tail_clearance >= THROUGH_TAIL_RELEASE_DISTANCE
+                    )
+                elif tail_clearance >= THROUGH_TAIL_TARGET_DISTANCE:
+                    self.through_stop_latched = True
+                if self.through_stop_latched:
+                    base_cmd[:] = 0.0
             if self.stage == Stage.THROUGH and not self.through_motion_ready:
+                base_cmd[:] = 0.0
+            elif self.stage == Stage.SUCCESS:
                 base_cmd[:] = 0.0
             _set_base_tracking_target(
                 self,
@@ -1633,6 +1628,7 @@ class DoorController:
                 self.through_station_yaw,
             )
             self.base_hold_stage = None
+            tracks_base_target = self.stage == Stage.THROUGH
         elif self.stage in BASE_HOLD_STAGES:
             hold_target = self._base_hold_target()
             base_cmd, station_dist, yaw_error = _base_command(
@@ -1643,18 +1639,23 @@ class DoorController:
                 hold_target[2],
                 hold_target[3],
             )
-            if (
-                self.stage not in (Stage.PREGRASP, Stage.OPEN_GRIPPER)
-                or _base_pose_accepted(station_dist, yaw_error)
-            ):
-                base_cmd[:] = 0.0
+            tracks_base_target = True
         else:
             base_cmd[:] = 0.0
 
+        stop_for_arrival = False
+        if tracks_base_target and self.stage not in (
+            Stage.BASE_ADVANCE,
+            Stage.THROUGH,
+        ):
+            stop_for_arrival = self._update_base_arrival(
+                station_dist, yaw_error
+            )
+        if stop_for_arrival:
+            base_cmd[:] = 0.0
         base_cmd = _stabilize_base_command(self, _limit_base_commands(base_cmd))
-        if self.stage == Stage.THROUGH and self.through_stop_latched:
-            # Keep the complete terminal hold supervision exactly zero even
-            # when reversal filtering still contains a previous command.
+        if stop_for_arrival:
+            # Arrival owns the stop even if reversal filtering retains motion.
             base_cmd[:] = 0.0
 
         ee_local = (
@@ -1752,6 +1753,7 @@ class DoorController:
         self.through_no_progress_steps = 0
         self.through_settle_steps = 0
         self.through_stability_failure_counts = {}
+        self.through_stop_latched = False
         self.through_motion_ready = False
         self.through_entry_stable_steps = 0
         self._transition_to(Stage.THROUGH)
@@ -1972,19 +1974,7 @@ class DoorController:
             self._begin_through(hinge, opening_speed)
 
         if self.stage == Stage.APPROACH:
-            angular_speed = float(
-                np.linalg.norm(_as_np(state["root_states"])[0, 10:13])
-            )
-            base_stable = bool(
-                station_dist < self.station_tolerance
-                and yaw_error < BASE_YAW_TOLERANCE_RAD
-                and speed < 0.02
-                and angular_speed < 0.05
-            )
-            self.approach_settle_steps = (
-                self.approach_settle_steps + 1 if base_stable else 0
-            )
-            if self.approach_settle_steps >= 25:
+            if self.base_arrival_confirmed:
                 (
                     self.arm_align_command_path,
                     self.arm_align_orientation_path,
@@ -2007,8 +1997,7 @@ class DoorController:
                 and
                 pregrasp_dist <= self.pregrasp_position_tolerance
                 and ee_orientation_error <= self.grasp_orientation_tolerance
-                and station_dist < self.station_tolerance
-                and yaw_error < BASE_YAW_TOLERANCE_RAD
+                and self.base_arrival_confirmed
                 and speed < 0.02
                 and not np.any(handle_contact_norms >= self.grasp_contact_threshold)
                 and arm_stable
@@ -2021,7 +2010,7 @@ class DoorController:
                     "steady_error_m": float(np.linalg.norm(steady_error)),
                     "position_tolerance_m": float(self.pregrasp_position_tolerance),
                     "orientation_tolerance_rad": float(self.grasp_orientation_tolerance),
-                    "station_tolerance_m": float(self.station_tolerance),
+                    "station_tolerance_m": BASE_STATION_TOLERANCE_M,
                     "arm_aligned": bool(arm_aligned),
                     "path_index": int(self.arm_align_path_index),
                     "path_length": int(
@@ -2636,7 +2625,7 @@ class DoorController:
                     _quat_conjugate_np(goal_ref_quat),
                     _as_np(state["ee_orn"])[0],
                 )
-                self.panel_station_settle_steps = 0
+                self._reset_base_arrival(ALIGN_PANEL_ARRIVAL)
                 self._transition_to(Stage.ALIGN_PANEL)
         elif self.stage == Stage.ALIGN_PANEL:
             panel_station_xy, target_yaw = _current_panel_station(self, state)
@@ -2647,17 +2636,7 @@ class DoorController:
             panel_yaw_error = abs(
                 ((target_yaw - current_yaw + math.pi) % (2.0 * math.pi)) - math.pi
             )
-            panel_station_settled = (
-                panel_station_error < 0.08
-                and panel_yaw_error < BASE_YAW_TOLERANCE_RAD
-                and speed < 0.08
-            )
-            self.panel_station_settle_steps = (
-                self.panel_station_settle_steps + 1
-                if panel_station_settled
-                else 0
-            )
-            if self.panel_station_settle_steps >= 15:
+            if self.base_arrival_confirmed:
                 print(
                     f"[doorman][align-panel] centred base at "
                     f"xy={base_xy.round(4).tolist()} target="
@@ -2866,7 +2845,7 @@ class DoorController:
             elif station_dist < self.through_best_station_error - 0.01:
                 self.through_best_station_error = station_dist
                 self.through_no_progress_steps = 0
-            elif station_dist >= self.station_tolerance:
+            elif station_dist >= BASE_STATION_TOLERANCE_M:
                 self.through_no_progress_steps += 1
             else:
                 self.through_no_progress_steps = 0
@@ -2889,8 +2868,7 @@ class DoorController:
                 np.max(np.abs(_as_np(state["door_joint_velocity"])[0]))
             )
             terminal_checks = {
-                "station": station_dist < self.station_tolerance,
-                "yaw": yaw_error < BASE_YAW_TOLERANCE_RAD,
+                "through_tail_clearance": self.through_stop_latched,
                 "base_linear_speed": speed < TERMINAL_BASE_LINEAR_SPEED_M_S,
                 "base_angular_speed": float(np.linalg.norm(base[10:13]))
                 < TERMINAL_BASE_ANGULAR_SPEED_RAD_S,
@@ -2951,7 +2929,7 @@ class DoorController:
                 )
                 self._transition_to(Stage.FAILURE, reset_steps=False)
             elif (
-                station_dist >= self.station_tolerance
+                station_dist >= BASE_STATION_TOLERANCE_M
                 and self.through_no_progress_steps > 150
             ):
                 self.failure_reason = (
@@ -3066,12 +3044,15 @@ def main():
     if args.batched_envs < 1:
         raise SystemExit(
             "AutoOpen has one vectorized execution path; use the fixed launcher "
-            "which supplies --batched_envs (one for a scalar shard)."
+            "which supplies --batched_envs."
         )
-    if args.standard_dataset_dir is not None and args.batched_envs != 1:
-        raise SystemExit(
-            "standard camera collection requires --batched_envs 1 per shard"
-        )
+    if args.episode_seeds is not None:
+        if len(args.episode_seeds) != args.batched_envs:
+            raise SystemExit(
+                "--episode_seeds must contain exactly --batched_envs values"
+            )
+        if len(set(args.episode_seeds)) != len(args.episode_seeds):
+            raise SystemExit("--episode_seeds must not contain duplicates")
     camera_mount_noise_enabled = bool(
         args.camera_mount_position_noise_m > 0.0
         or args.camera_mount_rotation_noise_deg > 0.0

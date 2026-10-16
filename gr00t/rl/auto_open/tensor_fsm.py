@@ -13,6 +13,22 @@ import math
 
 import torch
 
+from gr00t.rl.auto_open.control import (
+    ALIGN_PANEL_ARRIVAL,
+    APPROACH_ARRIVAL,
+    BASE_STATION_TOLERANCE_M,
+    BASE_YAW_TOLERANCE_RAD,
+    THROUGH_TAIL_RELEASE_DISTANCE,
+    THROUGH_TAIL_TARGET_DISTANCE,
+    update_base_target_arrival,
+)
+from gr00t.rl.third_party.visual_wholebody_lowlevel.legged_gym.utils.batch_invariant_math import (
+    fixed_dot,
+    fixed_mean,
+    fixed_norm,
+    fixed_normalize,
+    fixed_sum,
+)
 
 MAX_BASE_PLANAR_SPEED = 0.4
 MAX_BASE_YAW_RATE = 0.6
@@ -20,10 +36,6 @@ BASE_REVERSAL_JUMP = 0.15
 BASE_REVERSAL_CONFIRM_FRAMES = 3
 BASE_REVERSAL_LOCK_FRAMES = 5
 BASE_REVERSAL_EPSILON = 1.0e-4
-BASE_STATION_TOLERANCE_M = 0.12
-BASE_YAW_TOLERANCE_RAD = 0.08
-THROUGH_STOP_DISTANCE_M = 0.08
-THROUGH_STOP_YAW_RAD = 0.05
 THROUGH_ENTRY_STABILITY_FRAMES = 10
 THROUGH_ENTRY_UPRIGHT_COS = math.cos(math.radians(10.0))
 TERMINAL_BASE_LINEAR_SPEED_M_S = 0.05
@@ -86,14 +98,14 @@ def _quat_rotate(quaternion: torch.Tensor, vector: torch.Tensor) -> torch.Tensor
 
 
 def _quat_distance(actual: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    actual = actual / torch.linalg.vector_norm(actual, dim=-1, keepdim=True).clamp_min(1e-8)
-    target = target / torch.linalg.vector_norm(target, dim=-1, keepdim=True).clamp_min(1e-8)
-    dot = torch.sum(actual * target, dim=-1).abs().clamp(0.0, 1.0)
+    actual = fixed_normalize(actual, eps=1e-8)
+    target = fixed_normalize(target, eps=1e-8)
+    dot = fixed_dot(actual, target).abs().clamp(0.0, 1.0)
     return 2.0 * torch.acos(dot)
 
 
 def _axis_angle_quat(axis: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
-    axis = axis / torch.linalg.vector_norm(axis, dim=-1, keepdim=True).clamp_min(1e-8)
+    axis = fixed_normalize(axis, eps=1e-8)
     half = 0.5 * angle
     return torch.cat((torch.cos(half)[..., None], axis * torch.sin(half)[..., None]), dim=-1)
 
@@ -135,7 +147,7 @@ def _slew_position(
     current: torch.Tensor, target: torch.Tensor, max_step: float
 ) -> torch.Tensor:
     delta = target - current
-    distance = torch.linalg.vector_norm(delta, dim=-1, keepdim=True)
+    distance = fixed_norm(delta, keepdim=True)
     scale = torch.clamp(float(max_step) / distance.clamp_min(1e-8), max=1.0)
     return current + delta * scale
 
@@ -143,9 +155,9 @@ def _slew_position(
 def _slew_quaternion(
     current: torch.Tensor, target: torch.Tensor, max_angle: float = 0.025
 ) -> torch.Tensor:
-    current = current / torch.linalg.vector_norm(current, dim=-1, keepdim=True).clamp_min(1e-8)
-    target = target / torch.linalg.vector_norm(target, dim=-1, keepdim=True).clamp_min(1e-8)
-    dot = torch.sum(current * target, dim=-1, keepdim=True)
+    current = fixed_normalize(current, eps=1e-8)
+    target = fixed_normalize(target, eps=1e-8)
+    dot = fixed_dot(current, target, keepdim=True)
     target = torch.where(dot < 0.0, -target, target)
     dot = dot.abs().clamp(0.0, 1.0)
     angle = 2.0 * torch.acos(dot)
@@ -157,7 +169,7 @@ def _slew_quaternion(
         + torch.sin(fraction * theta) * target
     ) / denominator.clamp_min(1e-8)
     output = torch.where((theta < 1e-6) | (angle <= max_angle), target, slerp)
-    return output / torch.linalg.vector_norm(output, dim=-1, keepdim=True).clamp_min(1e-8)
+    return fixed_normalize(output, eps=1e-8)
 
 
 def _orientation_delta(
@@ -171,7 +183,7 @@ def _orientation_delta(
     roll = torch.atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
     pitch = torch.asin((2.0 * (w * y - z * x)).clamp(-1.0, 1.0))
     yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
-    radius = torch.linalg.vector_norm(cart_local, dim=-1).clamp_min(1.0e-8)
+    radius = fixed_norm(cart_local).clamp_min(1.0e-8)
     sphere_pitch = torch.asin((cart_local[:, 2] / radius).clamp(-1.0, 1.0))
     sphere_yaw = torch.atan2(cart_local[:, 1], cart_local[:, 0])
     return torch.stack(
@@ -189,7 +201,7 @@ def _orientation_delta(
 
 def _limit_base_command(command: torch.Tensor) -> torch.Tensor:
     planar = command[:, :2]
-    norm = torch.linalg.vector_norm(planar, dim=-1, keepdim=True)
+    norm = fixed_norm(planar, keepdim=True)
     scale = torch.clamp(MAX_BASE_PLANAR_SPEED / norm.clamp_min(1.0e-8), max=1.0)
     result = command.clone()
     result[:, :2] = planar * scale
@@ -226,21 +238,14 @@ def track_base_pose(
         dim=-1,
     )
     command = _limit_base_command(command)
-    command_distance = torch.linalg.vector_norm(error, dim=-1)
-    planar_norm = torch.linalg.vector_norm(command[:, :2], dim=-1)
-    deadzone = (
-        (command_distance > 0.08)
-        & (planar_norm > 1.0e-6)
-        & (planar_norm < 0.15)
-    )
+    planar_norm = fixed_norm(command[:, :2])
+    deadzone = (planar_norm > 1.0e-6) & (planar_norm < 0.15)
     if minimum_speed_toward_target_only:
         deadzone &= (command[:, 0] * local_x + command[:, 1] * local_y) > 0.0
     scale = torch.where(deadzone, 0.15 / planar_norm.clamp_min(1.0e-8), 1.0)
     command[:, :2] *= scale[:, None]
-    yaw_deadzone = (
-        (yaw_error.abs() > BASE_YAW_TOLERANCE_RAD)
-        & (command[:, 2].abs() > 1.0e-6)
-        & (command[:, 2].abs() < 0.2)
+    yaw_deadzone = (command[:, 2].abs() > 1.0e-6) & (
+        command[:, 2].abs() < 0.2
     )
     if minimum_speed_toward_target_only:
         yaw_deadzone &= command[:, 2] * yaw_error > 0.0
@@ -250,9 +255,7 @@ def track_base_pose(
         command[:, 2],
     )
 
-    acceptance_distance = torch.linalg.vector_norm(
-        acceptance_xy - root_states[:, :2], dim=-1
-    )
+    acceptance_distance = fixed_norm(acceptance_xy - root_states[:, :2])
     acceptance_yaw_error = _wrapped_angle(acceptance_yaw, yaw).abs()
     return command, acceptance_distance, acceptance_yaw_error
 
@@ -282,6 +285,13 @@ class TensorCommandBuffers:
         )
 
     def flush(self, env) -> None:
+        current_joint_mode = env.teleop_arm_joint_control_mask
+        to_joint = torch.where(self.arm_joint_mode & ~current_joint_mode)[0]
+        to_cartesian = torch.where(~self.arm_joint_mode & current_joint_mode)[0]
+        if len(to_joint):
+            env._set_teleop_arm_control_mode("joint", to_joint)
+        if len(to_cartesian):
+            env._set_teleop_arm_control_mode("ee", to_cartesian)
         env.teleop_raw_commands.copy_(self.base)
         env.teleop_raw_ee_goal_cart.copy_(self.ee_cart)
         env.teleop_raw_ee_goal_orn_delta_rpy.copy_(self.ee_rpy)
@@ -289,7 +299,6 @@ class TensorCommandBuffers:
         env.teleop_world_ee_goal_orn_quat.copy_(self.ee_quat)
         env.teleop_world_ee_goal_orn_quat_enabled.copy_(self.ee_quat_enabled)
         env.teleop_arm_joint_pos_targets.copy_(self.arm_joint)
-        env.teleop_arm_joint_control_mask.copy_(self.arm_joint_mode)
         env._teleop_inputs_dirty = True
 
 
@@ -387,15 +396,13 @@ class TensorStabilityWindow:
         self.count[rows] = torch.clamp(self.count[rows] + 1, max=self.window_size)
 
         positions = self.positions[rows]
-        position_span = torch.linalg.vector_norm(
-            positions - positions.mean(dim=1, keepdim=True), dim=-1
+        position_span = fixed_norm(
+            positions - fixed_mean(positions, dim=1, keepdim=True)
         ).amax(dim=1)
         orientations = self.orientations[rows]
-        orientations = orientations / torch.linalg.vector_norm(
-            orientations, dim=-1, keepdim=True
-        ).clamp_min(1.0e-8)
+        orientations = fixed_normalize(orientations, eps=1.0e-8)
         current = orientations[:, -1]
-        dots = torch.abs(torch.sum(orientations * current[:, None, :], dim=-1))
+        dots = fixed_dot(orientations, current[:, None, :]).abs()
         orientation_span = (2.0 * torch.acos(dots.clamp(0.0, 1.0))).amax(dim=1)
         stable = (
             (self.count[rows] >= self.window_size)
@@ -436,9 +443,28 @@ class TensorDoorFSM:
             (self.num_envs,), int(stage_enum.APPROACH), dtype=torch.int64, device=device
         )
         self.stage_steps = torch.zeros(self.num_envs, dtype=torch.int32, device=device)
-        self.approach_settle_steps = torch.zeros_like(self.stage_steps)
-        self.approach_stop_latched = torch.zeros(
+        self.base_arrival_settle_steps = torch.zeros_like(self.stage_steps)
+        self.base_arrival_max_settle_steps = torch.zeros_like(self.stage_steps)
+        self.base_arrival_confirmed = torch.zeros(
             self.num_envs, dtype=torch.bool, device=device
+        )
+        self.base_arrival_inner_distance = torch.full(
+            (self.num_envs,), APPROACH_ARRIVAL.inner_distance_m, device=device
+        )
+        self.base_arrival_outer_distance = torch.full(
+            (self.num_envs,), APPROACH_ARRIVAL.outer_distance_m, device=device
+        )
+        self.base_arrival_inner_yaw = torch.full(
+            (self.num_envs,), APPROACH_ARRIVAL.inner_yaw_rad, device=device
+        )
+        self.base_arrival_outer_yaw = torch.full(
+            (self.num_envs,), APPROACH_ARRIVAL.outer_yaw_rad, device=device
+        )
+        self.base_arrival_required_frames = torch.full(
+            (self.num_envs,),
+            APPROACH_ARRIVAL.settle_frames,
+            dtype=torch.int32,
+            device=device,
         )
         self.base_command_previous = torch.zeros(
             (self.num_envs, 3), dtype=torch.float32, device=device
@@ -475,7 +501,6 @@ class TensorDoorFSM:
             dtype=torch.float32,
             device=device,
         )
-        self.station_tolerance = stack("station_tolerance")
         self.pregrasp_position_tolerance = stack("pregrasp_position_tolerance")
         self.grasp_orientation_tolerance = stack("grasp_orientation_tolerance")
         self.arm_align_desired_target_world = torch.zeros(
@@ -615,7 +640,6 @@ class TensorDoorFSM:
         )
         self.panel_align_ee_goal_local = torch.zeros(vector_shape, device=device)
         self.panel_align_ee_orientation_local = torch.zeros(quat_shape, device=device)
-        self.panel_station_settle_steps = torch.zeros_like(self.stage_steps)
         self.panel_station_xy = stack("panel_station_xy")
         self.door_forward = stack("door_forward")
         align_targets = [
@@ -766,6 +790,55 @@ class TensorDoorFSM:
         self.stage[rows] = int(stage)
         self.stage_steps[rows] = 0
 
+    def configure_base_arrival(self, rows: torch.Tensor, profile) -> None:
+        self.base_arrival_inner_distance[rows] = profile.inner_distance_m
+        self.base_arrival_outer_distance[rows] = profile.outer_distance_m
+        self.base_arrival_inner_yaw[rows] = profile.inner_yaw_rad
+        self.base_arrival_outer_yaw[rows] = profile.outer_yaw_rad
+        self.base_arrival_required_frames[rows] = profile.settle_frames
+
+    def reset_base_arrival(self, rows: torch.Tensor, profile) -> None:
+        self.base_arrival_confirmed[rows] = False
+        self.base_arrival_settle_steps[rows] = 0
+        self.base_arrival_max_settle_steps[rows] = 0
+        self.configure_base_arrival(rows, profile)
+
+    def _update_base_arrival_regions(
+        self,
+        rows: torch.Tensor,
+        inside_inner: torch.Tensor,
+        inside_outer: torch.Tensor,
+    ) -> torch.Tensor:
+        confirmed, steps, zero_command = update_base_target_arrival(
+            self.base_arrival_confirmed[rows],
+            self.base_arrival_settle_steps[rows],
+            inside_inner,
+            inside_outer,
+            required_settle_frames=self.base_arrival_required_frames[rows],
+        )
+        self.base_arrival_confirmed[rows] = confirmed
+        self.base_arrival_settle_steps[rows] = steps
+        self.base_arrival_max_settle_steps[rows] = torch.maximum(
+            self.base_arrival_max_settle_steps[rows], steps
+        )
+        return zero_command
+
+    def _update_base_arrival(
+        self,
+        rows: torch.Tensor,
+        distance: torch.Tensor,
+        yaw_error: torch.Tensor,
+    ) -> torch.Tensor:
+        inside_inner = (
+            (distance < self.base_arrival_inner_distance[rows])
+            & (yaw_error.abs() < self.base_arrival_inner_yaw[rows])
+        )
+        inside_outer = (
+            (distance < self.base_arrival_outer_distance[rows])
+            & (yaw_error.abs() < self.base_arrival_outer_yaw[rows])
+        )
+        return self._update_base_arrival_regions(rows, inside_inner, inside_outer)
+
     def fail(self, rows: torch.Tensor, code: int) -> None:
         if not len(rows):
             return
@@ -848,10 +921,8 @@ class TensorDoorFSM:
             self.base_hold_nominal_yaw[rows],
             minimum_speed_toward_target_only=False,
         )
-        accepted = (distance < BASE_STATION_TOLERANCE_M) & (
-            yaw_error < BASE_YAW_TOLERANCE_RAD
-        )
-        command[accepted] = 0.0
+        stop = self._update_base_arrival(rows, distance, yaw_error)
+        command[stop] = 0.0
         command = self._stabilize_base(rows, command)
         self.pending_station_distance[rows] = distance
         self.pending_yaw_error[rows] = yaw_error
@@ -907,20 +978,8 @@ class TensorDoorFSM:
             self.nominal_station_yaw[rows],
             minimum_speed_toward_target_only=True,
         )
-        planar_speed = torch.linalg.vector_norm(roots[:, 7:9], dim=-1)
-        angular_speed = torch.linalg.vector_norm(roots[:, 10:13], dim=-1)
-        latched = self.approach_stop_latched[rows]
-        inside_acceptance = (
-            (distance < BASE_STATION_TOLERANCE_M)
-            & (yaw_error < BASE_YAW_TOLERANCE_RAD)
-        )
-        latched = torch.where(
-            latched,
-            inside_acceptance,
-            inside_acceptance & (planar_speed < 0.02) & (angular_speed < 0.05),
-        )
-        self.approach_stop_latched[rows] = latched
-        command[latched] = 0.0
+        stop = self._update_base_arrival(rows, distance, yaw_error)
+        command[stop] = 0.0
 
         previous = self.base_command_previous[rows]
         crossing = (previous * command < 0.0) & (
@@ -946,21 +1005,8 @@ class TensorDoorFSM:
         if not torch.any(mask):
             return torch.empty(0, dtype=torch.int64, device=self.device)
         rows = torch.where(mask)[0]
-        roots = state["root_states"][rows]
-        linear_speed = torch.linalg.vector_norm(roots[:, 7:10], dim=-1)
-        angular_speed = torch.linalg.vector_norm(roots[:, 10:13], dim=-1)
-        stable = (
-            (self.pending_station_distance[rows] < BASE_STATION_TOLERANCE_M)
-            & (self.pending_yaw_error[rows] < BASE_YAW_TOLERANCE_RAD)
-            & (linear_speed < 0.02)
-            & (angular_speed < 0.05)
-        )
-        settled = torch.where(
-            stable, self.approach_settle_steps[rows] + 1, 0
-        )
-        self.approach_settle_steps[rows] = settled
         self.stage_steps[rows] += 1
-        return rows[settled >= 25]
+        return rows[self.base_arrival_confirmed[rows]]
 
     def command_pregrasp_open(
         self, state: dict[str, torch.Tensor], buffers: TensorCommandBuffers
@@ -987,8 +1033,8 @@ class TensorDoorFSM:
             return torch.empty(0, dtype=torch.int64, device=self.device)
         rows = torch.where(mask)[0]
         stable, _, _ = self.arm_stability.update(state, rows)
-        position_error = torch.linalg.vector_norm(
-            state["ee_pos"][rows] - self.arm_align_desired_target_world[rows], dim=-1
+        position_error = fixed_norm(
+            state["ee_pos"][rows] - self.arm_align_desired_target_world[rows]
         )
         orientation_error = _quat_distance(
             state["ee_orn"][rows],
@@ -996,19 +1042,18 @@ class TensorDoorFSM:
                 rows, (self.arm_align_path.length[rows] - 1).to(torch.int64)
             ],
         )
-        root_speed = torch.linalg.vector_norm(state["root_states"][rows, 7:10], dim=-1)
+        root_speed = fixed_norm(state["root_states"][rows, 7:10])
         contacts = state.get("handle_finger_contact_forces_w")
         no_contact = torch.ones(len(rows), dtype=torch.bool, device=self.device)
         if contacts is not None:
             no_contact = torch.all(
-                torch.linalg.vector_norm(contacts[rows], dim=-1) < 1.0, dim=-1
+                fixed_norm(contacts[rows]) < 1.0, dim=-1
             )
         aligned = (
             self.arm_align_path.complete(rows)
             & (position_error <= self.pregrasp_position_tolerance[rows])
             & (orientation_error <= self.grasp_orientation_tolerance[rows])
-            & (self.pending_station_distance[rows] < self.station_tolerance[rows])
-            & (self.pending_yaw_error[rows] < BASE_YAW_TOLERANCE_RAD)
+            & self.base_arrival_confirmed[rows]
             & (root_speed < 0.02)
             & no_contact
             & stable
@@ -1079,9 +1124,7 @@ class TensorDoorFSM:
                     (len(grasp_rows), 2), dtype=torch.float32, device=self.device
                 )
             else:
-                contact_norms = torch.linalg.vector_norm(
-                    contact_forces[grasp_rows], dim=-1
-                )
+                contact_norms = fixed_norm(contact_forces[grasp_rows])
             fixed_contact = contact_norms[:, 0] >= 1.0
             moving_contact = contact_norms[:, 1] >= 1.0
             fixed_center = geometry["fixed_center"][grasp]
@@ -1133,21 +1176,19 @@ class TensorDoorFSM:
                 torch.full((*shape, 3), torch.nan, dtype=torch.float32, device=self.device),
             )
         points = points[rows]
-        norms = torch.linalg.vector_norm(forces[rows], dim=-1)
+        norms = fixed_norm(forces[rows])
         handle_pose = state["door_body_state_w"][rows, self.handle_body_idx, :7]
         center = handle_pose[:, :3] + _quat_rotate(
             handle_pose[:, 3:7], self.handle_center_local[rows]
         )
         axis = _quat_rotate(handle_pose[:, 3:7], self.handle_axis_local[rows])
         delta = points - center[:, None, :]
-        axial_raw = torch.sum(delta * axis[:, None, :], dim=-1)
+        axial_raw = fixed_dot(delta, axis[:, None, :])
         axial = torch.maximum(
             torch.minimum(axial_raw, self.handle_half_length[rows, None]),
             -self.handle_half_length[rows, None],
         )
-        radial = torch.linalg.vector_norm(
-            delta - axial[..., None] * axis[:, None, :], dim=-1
-        )
+        radial = fixed_norm(delta - axial[..., None] * axis[:, None, :])
         present = (
             torch.isfinite(points).all(dim=-1)
             & (radial <= 0.018)
@@ -1164,15 +1205,13 @@ class TensorDoorFSM:
             handle_pose[:, 3:7], self.handle_center_local[rows]
         )
         axis = _quat_rotate(handle_pose[:, 3:7], self.handle_axis_local[rows])
-        axis = axis / torch.linalg.vector_norm(axis, dim=-1, keepdim=True).clamp_min(1e-8)
+        axis = fixed_normalize(axis, eps=1e-8)
         delta = points - center[:, None, :]
-        axial = torch.sum(delta * axis[:, None, :], dim=-1)
+        axial = fixed_dot(delta, axis[:, None, :])
         radial = delta - axial[..., None] * axis[:, None, :]
         closing_axis = torch.cross(-self.door_normal[rows], axis, dim=-1)
-        closing_axis /= torch.linalg.vector_norm(
-            closing_axis, dim=-1, keepdim=True
-        ).clamp_min(1e-8)
-        closing = torch.sum(radial * closing_axis[:, None, :], dim=-1)
+        closing_axis = fixed_normalize(closing_axis, eps=1e-8)
+        closing = fixed_dot(radial, closing_axis[:, None, :])
         return (
             torch.isfinite(points).all(dim=(1, 2))
             & torch.all(
@@ -1211,16 +1250,16 @@ class TensorDoorFSM:
                 & (geometry["panel_clearance"][center] >= 0.005)
             )
             ready = (
-                (torch.linalg.vector_norm(
+                (fixed_norm(
                     state["ee_pos"][center_rows]
-                    - self.arm_forward_desired_target_world[center_rows], dim=-1
+                    - self.arm_forward_desired_target_world[center_rows]
                 ) <= 0.012)
                 & (_quat_distance(
                     state["ee_orn"][center_rows], self.arm_forward_command_quat[center_rows]
                 ) <= self.grasp_orientation_tolerance[center_rows])
                 & ((state["gripper_position"][center_rows, 0] - self.q_open[center_rows]).abs() < 0.02)
                 & capture_ready
-                & (torch.linalg.vector_norm(state["root_states"][center_rows, 7:10], dim=-1) < 0.02)
+                & (fixed_norm(state["root_states"][center_rows, 7:10]) < 0.02)
                 & stable[center]
                 & ~panel_collision
             )
@@ -1294,7 +1333,7 @@ class TensorDoorFSM:
         axis = _quat_rotate(
             panel_pose[:, 3:7], self.handle_joint_axis_panel_local[rows]
         )
-        axis /= torch.linalg.vector_norm(axis, dim=-1, keepdim=True).clamp_min(1e-8)
+        axis = fixed_normalize(axis, eps=1e-8)
         self.turn_handle_axis_world[rows] = axis
         self.turn_axle_world[rows] = handle_pose[:, :3]
         self.turn_grasp_offset_world[rows] = state["ee_pos"][rows] - handle_pose[:, :3]
@@ -1342,9 +1381,7 @@ class TensorDoorFSM:
             self.turn_target_hinge_angle[rows] - current_hinge_delta,
             torch.zeros_like(current_hinge_delta),
         )
-        distance = torch.linalg.vector_norm(
-            self.turn_endpoint_world[rows] - start, dim=-1
-        )
+        distance = fixed_norm(self.turn_endpoint_world[rows] - start)
         angle = _quat_distance(start_q, self.turn_endpoint_quat[rows])
         counts = torch.maximum(
             torch.full_like(self.stage_steps[rows], 120),
@@ -1456,7 +1493,7 @@ class TensorDoorFSM:
         axis = _quat_rotate(
             panel_pose[:, 3:7], self.handle_joint_axis_panel_local[rows]
         )
-        axis /= torch.linalg.vector_norm(axis, dim=-1, keepdim=True).clamp_min(1e-8)
+        axis = fixed_normalize(axis, eps=1e-8)
         self.release_start_world[rows] = state["ee_pos"][rows]
         self.release_start_quat[rows] = state["ee_orn"][rows]
         self.release_start_handle_angle[rows] = state["door_joint_position"][
@@ -1585,8 +1622,8 @@ class TensorDoorFSM:
         present, _, _ = self._handle_contacts(state, rows)
         complete = (
             self.release_retreat_path.complete(rows)
-            & (torch.linalg.vector_norm(
-                state["ee_pos"][rows] - self.release_retreat_target_world[rows], dim=-1
+            & (fixed_norm(
+                state["ee_pos"][rows] - self.release_retreat_target_world[rows]
             ) <= 0.010)
             & ~torch.any(present, dim=-1)
         )
@@ -1644,8 +1681,8 @@ class TensorDoorFSM:
             & (_quat_distance(
                 state["ee_orn"][rows], self.release_endpoint_quat[rows]
             ) < 0.05)
-            & (torch.linalg.vector_norm(
-                state["ee_pos"][rows] - self.release_endpoint_world[rows], dim=-1
+            & (fixed_norm(
+                state["ee_pos"][rows] - self.release_endpoint_world[rows]
             ) <= 0.010)
             & stable
         )
@@ -1664,7 +1701,7 @@ class TensorDoorFSM:
             self.panel_align_ee_orientation_local[completed] = _quat_multiply(
                 _quat_conjugate(reference), state["ee_orn"][completed]
             )
-            self.panel_station_settle_steps[completed] = 0
+            self.reset_base_arrival(completed, ALIGN_PANEL_ARRIVAL)
             self.transition(completed, self.Stage.ALIGN_PANEL)
             self.stage_steps[completed] = 1
         active = self.mask(self.Stage.RESTORE_GRIPPER)
@@ -1685,7 +1722,10 @@ class TensorDoorFSM:
             self.panel_station_nominal_yaw[rows],
             minimum_speed_toward_target_only=False,
         )
+        stop = self._update_base_arrival(rows, distance, yaw_error)
+        command[stop] = 0.0
         command = self._stabilize_base(rows, command)
+        command[stop] = 0.0
         self.pending_station_distance[rows] = distance
         self.pending_yaw_error[rows] = yaw_error
         self.base_hold_target_xy[rows] = self.panel_station_command_xy[rows]
@@ -1704,16 +1744,7 @@ class TensorDoorFSM:
         rows = torch.where(self.mask(self.Stage.ALIGN_PANEL))[0]
         if not len(rows):
             return torch.empty(0, dtype=torch.int64, device=self.device)
-        stable = (
-            (self.pending_station_distance[rows] < 0.08)
-            & (self.pending_yaw_error[rows] < BASE_YAW_TOLERANCE_RAD)
-            & (torch.linalg.vector_norm(state["root_states"][rows, 7:10], dim=-1) < 0.08)
-        )
-        settled = torch.where(
-            stable, self.panel_station_settle_steps[rows] + 1, 0
-        )
-        self.panel_station_settle_steps[rows] = settled
-        completed = rows[settled >= 15]
+        completed = rows[self.base_arrival_confirmed[rows]]
         if len(completed):
             self.panel_contact_plan_valid[completed] = False
             self.panel_contact_settle_steps[completed] = 0
@@ -1804,20 +1835,16 @@ class TensorDoorFSM:
             _yaw_quat(self.hinge_axis_sign[rows] * hinge), self.door_normal[rows]
         )
         ee_error = state["ee_pos"][rows] - self.panel_contact_target_world[rows]
-        signed = torch.sum(ee_error * current_normal, dim=-1)
-        tangent_error = torch.linalg.vector_norm(
-            ee_error - signed[:, None] * current_normal, dim=-1
-        )
+        signed = fixed_dot(ee_error, current_normal)
+        tangent_error = fixed_norm(ee_error - signed[:, None] * current_normal)
         insertion_axis = _quat_rotate(
             state["ee_orn"][rows], self.depth_axis_local[rows]
         )
-        insertion_axis /= torch.linalg.vector_norm(
-            insertion_axis, dim=-1, keepdim=True
-        ).clamp_min(1e-8)
+        insertion_axis = fixed_normalize(insertion_axis, eps=1e-8)
         orientation_error = torch.acos(
-            torch.sum(insertion_axis * -current_normal, dim=-1).clamp(-1.0, 1.0)
+            fixed_dot(insertion_axis, -current_normal).clamp(-1.0, 1.0)
         )
-        ee_speed = torch.linalg.vector_norm(state["ee_vel"][rows, :3], dim=-1)
+        ee_speed = fixed_norm(state["ee_vel"][rows, :3])
         clearance = finger_clearance[rows]
         self.panel_last_finger_clearance[rows] = clearance
         self.panel_last_lateral_error[rows] = tangent_error
@@ -1875,9 +1902,7 @@ class TensorDoorFSM:
         rows = torch.where(self.mask(self.Stage.PUSH_OPEN))[0]
         if not len(rows):
             return torch.empty(0, dtype=torch.int64, device=self.device)
-        reach = torch.linalg.vector_norm(
-            state["ee_goal_cart_local"][rows, :2], dim=-1
-        )
+        reach = fixed_norm(state["ee_goal_cart_local"][rows, :2])
         return rows[reach > self.push_comfort_reach_radius[rows]]
 
     def install_push_retract_pose(
@@ -1962,7 +1987,7 @@ class TensorDoorFSM:
             self.active_arm_retract_pose_local[rows, :3]
             - self.push_detached_ee_goal_local[rows]
         )
-        distance = torch.linalg.vector_norm(delta, dim=-1)
+        distance = fixed_norm(delta)
         moving = self.stage_steps[rows] >= 5
         step = delta * torch.clamp(0.004 / distance.clamp_min(1e-8), max=1.0)[:, None]
         self.push_detached_ee_goal_local[rows] = torch.where(
@@ -1999,11 +2024,11 @@ class TensorDoorFSM:
             rows, self.active_arm_retract_pose_local[rows, 3:]
         )
         retracted = (
-            (torch.linalg.vector_norm(
-                actual_local - self.active_arm_retract_pose_local[rows, :3], dim=-1
+            (fixed_norm(
+                actual_local - self.active_arm_retract_pose_local[rows, :3]
             ) <= 0.010)
             & (_quat_distance(state["ee_orn"][rows], orientation_target) < 0.05)
-            & (torch.linalg.vector_norm(state["ee_vel"][rows, :3], dim=-1) < 0.04)
+            & (fixed_norm(state["ee_vel"][rows, :3]) < 0.04)
         )
         settled = torch.where(
             retracted, self.push_recovery_settle_steps[rows] + 1, 0
@@ -2085,9 +2110,7 @@ class TensorDoorFSM:
         forward = self.door_forward[rows, :2]
         yaw = torch.atan2(forward[:, 1], forward[:, 0])
         line_origin = self.panel_station_xy[rows]
-        current_longitudinal = torch.sum(
-            (base[:, :2] - line_origin) * forward, dim=-1
-        )
+        current_longitudinal = fixed_dot(base[:, :2] - line_origin, forward)
         line_position = line_origin + current_longitudinal[:, None] * forward
         contact = self._tracked_push_contact(state, rows)
         origin = self.env.get_goal_reference_origin()[rows]
@@ -2106,9 +2129,9 @@ class TensorDoorFSM:
             reference, lateral_world
         )[:, :2]
         radius = self.push_reengage_reach_radius[rows]
-        a = torch.sum(forward_local.square(), dim=-1)
-        b = torch.sum(contact_xy * forward_local, dim=-1)
-        c = torch.sum(contact_xy.square(), dim=-1) - radius.square()
+        a = fixed_sum(forward_local.square())
+        b = fixed_dot(contact_xy, forward_local)
+        c = fixed_sum(contact_xy.square()) - radius.square()
         discriminant = b.square() - a * c
         root = torch.sqrt(discriminant.clamp_min(0.0))
         interval_start = (b - root) / a.clamp_min(1e-10)
@@ -2154,17 +2177,16 @@ class TensorDoorFSM:
         displacement = targets - base[:, None, :2]
         points = shoulders[:, None, :, :] + displacement[:, :, None, :]
         segment = panel_end - panel_start
-        segment_norm_sq = torch.sum(segment.square(), dim=-1)
+        segment_norm_sq = fixed_sum(segment.square())
         projection = (
-            torch.sum(
-                (points - panel_start[:, None, None, :])
-                * segment[:, None, None, :],
-                dim=-1,
+            fixed_dot(
+                points - panel_start[:, None, None, :],
+                segment[:, None, None, :],
             )
             / segment_norm_sq[:, None, None].clamp_min(1e-10)
         ).clamp(0.0, 1.0)
         closest = panel_start[:, None, None, :] + projection[..., None] * segment[:, None, None, :]
-        distances = torch.linalg.vector_norm(points - closest, dim=-1).amin(dim=-1)
+        distances = fixed_norm(points - closest).amin(dim=-1)
         required_clearance = (
             self.push_shoulder_collision_radius[rows]
             + self.panel_half_thickness[rows]
@@ -2211,7 +2233,7 @@ class TensorDoorFSM:
         reference = self.env.get_goal_reference_quat()[rows]
         offset = self.env.get_goal_center_offset_local()[rows]
         contact_local = _quat_rotate_inverse(reference, contact - origin) - offset
-        reach = torch.linalg.vector_norm(contact_local[:, :2], dim=-1)
+        reach = fixed_norm(contact_local[:, :2])
         reachable = self.push_reengage_reachable[rows]
         reachable = torch.where(
             reachable,
@@ -2235,7 +2257,7 @@ class TensorDoorFSM:
             reachable
             & (state["door_joint_velocity"][rows, self.hinge_idx].abs()
                < self.turn_release_max_hinge_speed[rows])
-            & (torch.linalg.vector_norm(state["root_states"][rows, 7:9], dim=-1) < 0.04)
+            & (fixed_norm(state["root_states"][rows, 7:9]) < 0.04)
         )
         settled = torch.where(
             ready, self.push_recovery_settle_steps[rows] + 1, 0
@@ -2293,15 +2315,13 @@ class TensorDoorFSM:
             self.through_station_yaw[rows],
             minimum_speed_toward_target_only=False,
         )
+        tail_clearance = self._tail_clearance(state, rows)
         latched = self.through_stop_latched[rows]
-        accepted = (
-            (distance < BASE_STATION_TOLERANCE_M)
-            & (yaw_error < BASE_YAW_TOLERANCE_RAD)
+        latched = torch.where(
+            latched,
+            tail_clearance >= THROUGH_TAIL_RELEASE_DISTANCE,
+            tail_clearance >= THROUGH_TAIL_TARGET_DISTANCE,
         )
-        core = (distance < THROUGH_STOP_DISTANCE_M) & (
-            yaw_error < THROUGH_STOP_YAW_RAD
-        )
-        latched = torch.where(latched, accepted, core)
         self.through_stop_latched[rows] = latched
         through = self.stage[rows] == int(self.Stage.THROUGH)
         command = torch.where(
@@ -2319,6 +2339,7 @@ class TensorDoorFSM:
         command = torch.where(
             (through & latched)[:, None], torch.zeros_like(command), command
         )
+        command = torch.where(through[:, None], command, torch.zeros_like(command))
         self.pending_station_distance[rows] = distance
         self.pending_yaw_error[rows] = yaw_error
         buffers.base[rows] = command
@@ -2334,10 +2355,9 @@ class TensorDoorFSM:
         rear_local[:, 0] = ROBOT_TRUNK_REAR_X
         rear_world = _quat_rotate(base[:, 3:7], rear_local)
         tail_xy = base[:, :2] + rear_world[:, :2]
-        return torch.sum(
-            (tail_xy - self.initial_door_root[rows, :2])
-            * self.door_forward[rows, :2],
-            dim=-1,
+        return fixed_dot(
+            tail_xy - self.initial_door_root[rows, :2],
+            self.door_forward[rows, :2],
         )
 
     def advance_through(self, state: dict[str, torch.Tensor]) -> torch.Tensor:
@@ -2345,8 +2365,8 @@ class TensorDoorFSM:
         if not len(rows):
             return torch.empty(0, dtype=torch.int64, device=self.device)
         base = state["root_states"][rows]
-        speed = torch.linalg.vector_norm(base[:, 7:10], dim=-1)
-        angular_speed = torch.linalg.vector_norm(base[:, 10:13], dim=-1)
+        speed = fixed_norm(base[:, 7:10])
+        angular_speed = fixed_norm(base[:, 10:13])
         hinge = state["door_joint_position"][rows, self.hinge_idx]
         hinge_speed = state["door_joint_velocity"][rows, self.hinge_idx]
         up = _quat_rotate(
@@ -2371,7 +2391,9 @@ class TensorDoorFSM:
             improved, distance, self.through_best_station_error[rows]
         )
         no_progress = torch.where(
-            ~self.through_motion_ready[rows] | improved | (distance < BASE_STATION_TOLERANCE_M),
+            ~self.through_motion_ready[rows]
+            | improved
+            | (distance < BASE_STATION_TOLERANCE_M),
             0,
             self.through_no_progress_steps[rows] + 1,
         )
@@ -2387,8 +2409,7 @@ class TensorDoorFSM:
         gripper_speed = state["dof_vel"][rows, gripper_id].abs()
         door_speed = state["door_joint_velocity"][rows].abs().amax(dim=-1)
         terminal = (
-            (distance < BASE_STATION_TOLERANCE_M)
-            & (self.pending_yaw_error[rows] < BASE_YAW_TOLERANCE_RAD)
+            self.through_stop_latched[rows]
             & (speed < TERMINAL_BASE_LINEAR_SPEED_M_S)
             & (angular_speed < TERMINAL_BASE_ANGULAR_SPEED_RAD_S)
             & (middle_error < 0.05)

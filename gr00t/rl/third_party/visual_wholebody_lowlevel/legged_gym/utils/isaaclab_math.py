@@ -5,9 +5,11 @@ from __future__ import annotations
 import math
 import torch
 
+from .batch_invariant_math import fixed_normalize
+
 
 def normalize(x: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
-    return x / x.norm(dim=-1, keepdim=True).clamp_min(eps)
+    return fixed_normalize(x, eps=eps)
 
 
 def quat_conjugate(q: torch.Tensor) -> torch.Tensor:

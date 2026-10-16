@@ -43,6 +43,13 @@ def _parser() -> argparse.ArgumentParser:
         help="Run independent AutoOpen controllers in one vectorized SimulationApp.",
     )
     parser.add_argument(
+        "--episode_seeds",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Exact episode seed assigned to each environment in the batch.",
+    )
+    parser.add_argument(
         "--steady_path_workers",
         type=int,
         default=0,
@@ -122,6 +129,12 @@ def _parser() -> argparse.ArgumentParser:
             "Opt-in DATA_STANARD.md output root. This passive collector is "
             "disabled by default and does not alter AutoOpen control."
         ),
+    )
+    parser.add_argument(
+        "--collection_camera_mode",
+        choices=("none", "dual", "six"),
+        default="none",
+        help="Camera set recorded by the sole data-collection path.",
     )
     parser.add_argument(
         "--camera_mount_position_noise_m",
@@ -204,26 +217,38 @@ def _resolve_runtime_camera_config(
     nominal_config = json.loads(
         nominal_camera_config.read_text(encoding="utf-8")
     )
-    actual_config, camera_randomization = randomize_camera_mounts(
-        nominal_config,
-        seed=int(args.seed if args.seed is not None else 0),
-        position_radius_m=position_radius_m,
-        rotation_angle_deg=rotation_angle_deg,
-        focal_scale_fraction=focal_scale_fraction,
-        principal_point_radius_px=principal_point_radius_px,
-        distortion_relative_fraction=distortion_relative_fraction,
+    seeds = (
+        [int(seed) for seed in args.episode_seeds]
+        if args.episode_seeds is not None
+        else [int(args.seed if args.seed is not None else 0)]
     )
-    runtime_config = (
-        Path(args.output_dir)
-        / f"runtime_rgb_cameras_seed{int(args.seed if args.seed is not None else 0)}.json"
-    )
-    runtime_config.parent.mkdir(parents=True, exist_ok=True)
-    runtime_config.write_text(
-        json.dumps(actual_config, indent=2), encoding="utf-8"
-    )
+    runtime_configs = {}
+    randomizations = {}
+    runtime_paths = {}
+    for seed in seeds:
+        actual_config, camera_randomization = randomize_camera_mounts(
+            nominal_config,
+            seed=seed,
+            position_radius_m=position_radius_m,
+            rotation_angle_deg=rotation_angle_deg,
+            focal_scale_fraction=focal_scale_fraction,
+            principal_point_radius_px=principal_point_radius_px,
+            distortion_relative_fraction=distortion_relative_fraction,
+        )
+        runtime_config = Path(args.output_dir) / f"runtime_rgb_cameras_seed{seed}.json"
+        runtime_config.parent.mkdir(parents=True, exist_ok=True)
+        runtime_config.write_text(
+            json.dumps(actual_config, indent=2), encoding="utf-8"
+        )
+        runtime_configs[seed] = actual_config
+        randomizations[seed] = camera_randomization
+        runtime_paths[seed] = str(runtime_config)
     args.nominal_rgb_camera_config = str(nominal_camera_config)
-    args.rgb_camera_config = str(runtime_config)
-    args.camera_mount_randomization = camera_randomization
+    args.rgb_camera_config = runtime_paths[seeds[0]]
+    args.episode_camera_configs = runtime_configs
+    args.episode_camera_config_paths = runtime_paths
+    args.camera_mount_randomizations = randomizations
+    args.camera_mount_randomization = randomizations[seeds[0]]
 
 
 def _default_paths(args):
@@ -236,10 +261,24 @@ def _default_paths(args):
     if not args.robot_usd_path:
         args.robot_usd_path = str(repo / "gr00t" / "rl" / "data" / "robots" / "b2z1_lab30" / "b2z1_mount_90_x0p22_y0_z0p17.usd")
     if args.standard_dataset_dir is not None:
-        if args.disable_rgb_cameras:
-            raise SystemExit("standard data collection requires both RGB cameras")
+        if args.collection_camera_mode == "none":
+            if not args.disable_rgb_cameras:
+                raise SystemExit("camera mode none requires --disable_rgb_cameras")
+            args.rgb_camera_config = None
+            args.camera_mount_randomization = {}
+            args.camera_mount_randomizations = {}
+            args.episode_camera_configs = {}
+            args.episode_camera_config_paths = {}
+            return
         nominal_camera_config = Path(
-            LOWLEVEL_ROOT / "legged_gym" / "scripts" / "rgb_cameras_dataset.json"
+            LOWLEVEL_ROOT
+            / "legged_gym"
+            / "scripts"
+            / (
+                "rgb_cameras_dataset.json"
+                if args.collection_camera_mode == "dual"
+                else "rgb_cameras.json"
+            )
         )
         _resolve_runtime_camera_config(
             args,

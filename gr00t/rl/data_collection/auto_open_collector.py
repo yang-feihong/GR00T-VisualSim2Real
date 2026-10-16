@@ -23,28 +23,14 @@ from .auto_open_standard import (
     height_invariant_pose,
     pack_action,
     pack_observation_state,
+    physical_phase_for_autoopen_stage,
     quaternion_wxyz_to_matrix,
-    transform_dataset_images,
+    camera_streams_for_mode,
+    transform_collection_images,
 )
-from .auto_open_writer import (
-    CAMERA_SHAPES,
-    AutoOpenEpisodeData,
-    StreamingVideoEncoder,
-)
+from .auto_open_writer import AutoOpenEpisodeData, StreamingVideoEncoder
 from .contact_audit import SubstepContactAudit
 
-
-HANDLE_PRESS_STAGES = {
-    "PREGRASP",
-    "OPEN_GRIPPER",
-    "CENTER_HANDLE",
-    "GRASP_HANDLE",
-    "TURN_HANDLE",
-    "RETURN_HANDLE",
-    "OPEN_AND_CLEAR",
-    "RETREAT_ARM",
-    "RESTORE_GRIPPER",
-}
 
 MIDDLE_PRESET_POSITION_TOLERANCE_RAD = 0.05
 MIDDLE_PRESET_STABLE_FRAMES = 10
@@ -54,16 +40,6 @@ def _numpy(value):
     if torch.is_tensor(value):
         value = value.detach().cpu().numpy()
     return np.asarray(value)
-
-
-def _phase_for_stage(stage_name: str) -> str:
-    if stage_name == "APPROACH":
-        return "approach"
-    if stage_name in HANDLE_PRESS_STAGES:
-        return "handle_press"
-    if stage_name in {"SUCCESS", "terminal_hold"}:
-        return "terminal_hold"
-    return "traversal"
 
 
 def _door_edge_gap_m(hinge_angle, hinge_to_free_edge, panel_half_thickness):
@@ -77,6 +53,57 @@ def _door_edge_gap_m(hinge_angle, hinge_to_free_edge, panel_half_thickness):
     )
 
 
+def batched_target_height_invariant_poses(root_states, arm_targets):
+    """Compute the dataset EE targets for a whole environment batch once."""
+    roots = np.asarray(root_states, dtype=np.float64)
+    arms = np.asarray(arm_targets, dtype=np.float64)
+    if roots.ndim != 2 or roots.shape[1] < 7:
+        raise ValueError(f"root_states must have shape (N, >=7), got {roots.shape}")
+    if arms.shape != (roots.shape[0], 6):
+        raise ValueError(
+            f"arm_targets must have shape ({roots.shape[0]}, 6), got {arms.shape}"
+        )
+
+    root_position = torch.from_numpy(roots[:, :3])
+    root_quaternion_xyzw = torch.from_numpy(roots[:, [4, 5, 6, 3]])
+    arm = torch.from_numpy(arms)
+    position, rotation, _ = b2z1_gripper_pose_and_jacobian(
+        root_position, root_quaternion_xyzw, arm
+    )
+    position = position.numpy()
+    rotation = rotation.numpy()
+
+    gripper_to_dataset = np.asarray(
+        ((1.0, 0.0, 0.0), (0.0, 0.0, -1.0), (0.0, 1.0, 0.0)),
+        dtype=np.float64,
+    )
+    tool_rotation = rotation @ gripper_to_dataset
+    quaternion = roots[:, 3:7].copy()
+    quaternion /= np.linalg.norm(quaternion, axis=1, keepdims=True)
+    w, x, y, z = quaternion.T
+    yaw = np.arctan2(
+        2.0 * (w * z + x * y),
+        1.0 - 2.0 * (y * y + z * z),
+    )
+    cosine = np.cos(yaw)
+    sine = np.sin(yaw)
+    world_to_yaw = np.zeros((roots.shape[0], 3, 3), dtype=np.float64)
+    world_to_yaw[:, 0, 0] = cosine
+    world_to_yaw[:, 0, 1] = sine
+    world_to_yaw[:, 1, 0] = -sine
+    world_to_yaw[:, 1, 1] = cosine
+    world_to_yaw[:, 2, 2] = 1.0
+
+    translated = position.copy()
+    translated[:, :2] -= roots[:, :2]
+    local_position = np.einsum("nij,nj->ni", world_to_yaw, translated)
+    local_position -= np.asarray((0.22, 0.0, 0.7), dtype=np.float64)
+    local_rotation = world_to_yaw @ tool_rotation
+    return np.concatenate(
+        (local_rotation[:, :, 0], local_rotation[:, :, 1], local_position), axis=1
+    ).astype(np.float32)
+
+
 class AutoOpenStandardEpisodeCollector:
     """Record one environment without participating in AutoOpen decisions."""
 
@@ -88,16 +115,23 @@ class AutoOpenStandardEpisodeCollector:
         episode_index: int,
         seed: int,
         video_staging_root: Path | None = None,
+        capture_images: bool = True,
+        camera_mode: str = "dual",
+        env_id: int = 0,
+        contact_audit=None,
     ):
-        if int(runner.env.num_envs) != 1:
-            raise ValueError("the initial standard collector requires one env per shard")
         self.runner = runner
         self.env = runner.env
         self.controller = controller
+        self.env_id = int(env_id)
+        if not 0 <= self.env_id < int(self.env.num_envs):
+            raise ValueError("env_id is outside the vectorized environment batch")
         self.episode_index = int(episode_index)
         self.seed = int(seed)
-        self.contact_audit = SubstepContactAudit.create(self.env)
-        self.contact_audit.attach()
+        self.contact_audit = contact_audit or SubstepContactAudit.create(self.env)
+        self._owns_contact_audit = contact_audit is None
+        if self._owns_contact_audit:
+            self.contact_audit.attach()
         self.states = []
         self.actions = []
         self.images = defaultdict(list)
@@ -105,6 +139,11 @@ class AutoOpenStandardEpisodeCollector:
         self.video_staging_root = (
             None if video_staging_root is None else Path(video_staging_root)
         )
+        self.capture_images = bool(capture_images)
+        self.camera_mode = str(camera_mode)
+        self.camera_streams = camera_streams_for_mode(self.camera_mode)
+        if self.capture_images != bool(self.camera_streams):
+            raise ValueError("capture_images must agree with camera_mode")
         self.audit = defaultdict(list)
         self.contacts = []
         self.events = {}
@@ -136,48 +175,51 @@ class AutoOpenStandardEpisodeCollector:
         return self.contact_audit.description
 
     def close(self):
-        self.contact_audit.detach()
+        if self._owns_contact_audit:
+            self.contact_audit.detach()
         for encoder in self.video_encoders.values():
             encoder.close()
 
-    def capture_before_step(self, state, high_level_action, *, stage_name=None):
+    def capture_before_step(
+        self, state, high_level_action, *, stage_name=None, begin_contact_tick=True
+    ):
         """Latch observation/image at t[k] immediately before executing action[k]."""
         if self._pending is not None:
             raise RuntimeError("previous standard-data frame has not been completed")
         stage_name = stage_name or self.controller.stage.name
         frame_index = len(self.states)
         sim_time_ns = int(round(frame_index * 20_000_000))
-        phase_start = time.perf_counter()
-        rgb_frames = self._read_current_images()
-        self.timing["image_read_s"] += time.perf_counter() - phase_start
-        phase_start = time.perf_counter()
-        images = transform_dataset_images(
-            {
-                "base_0_rgb": _numpy(rgb_frames["base_0_rgb"]),
-                "left_wrist_0_rgb": _numpy(rgb_frames["left_wrist_0_rgb"]),
-            }
-        )
-        self.timing["image_transform_s"] += time.perf_counter() - phase_start
-        phase_start = time.perf_counter()
-        for name, image in images.items():
-            if self.video_staging_root is None:
-                self.images[name].append(image)
-                continue
-            encoder = self.video_encoders.get(name)
-            if encoder is None:
-                encoder = StreamingVideoEncoder(
-                    self.video_staging_root / name / "episode.mp4",
-                    CAMERA_SHAPES[name],
-                )
-                self.video_encoders[name] = encoder
-            encoder.append(image)
-        self.timing["video_enqueue_wait_s"] += time.perf_counter() - phase_start
+        if self.capture_images:
+            phase_start = time.perf_counter()
+            rgb_frames = self._read_current_images()
+            self.timing["image_read_s"] += time.perf_counter() - phase_start
+            phase_start = time.perf_counter()
+            images = transform_collection_images(
+                {name: _numpy(image) for name, image in rgb_frames.items()},
+                self.camera_mode,
+            )
+            self.timing["image_transform_s"] += time.perf_counter() - phase_start
+            phase_start = time.perf_counter()
+            for name, image in images.items():
+                if self.video_staging_root is None:
+                    self.images[name].append(image)
+                    continue
+                encoder = self.video_encoders.get(name)
+                if encoder is None:
+                    encoder = StreamingVideoEncoder(
+                        self.video_staging_root / name / "episode.mp4",
+                        tuple(self._shape_by_key[name]),
+                    )
+                    self.video_encoders[name] = encoder
+                encoder.append(image)
+            self.timing["video_enqueue_wait_s"] += time.perf_counter() - phase_start
 
         phase_start = time.perf_counter()
         snapshot = self._snapshot_state(state)
         self.states.append(snapshot["packed_state"])
         self._append_state_audit(snapshot, frame_index, sim_time_ns, stage_name)
-        self.contact_audit.begin_tick()
+        if begin_contact_tick:
+            self.contact_audit.begin_tick()
         self.timing["state_snapshot_s"] += time.perf_counter() - phase_start
         self._pending = {
             "state": state,
@@ -199,13 +241,14 @@ class AutoOpenStandardEpisodeCollector:
         manager = self.runner.rgb_camera_manager
         if manager is None or not manager.enabled:
             raise RuntimeError("standard data collection requires an RGB camera manager")
+        source_names = tuple(self.camera_streams)
         images_by_name = manager.render_images(
-            env_id=0,
-            rig_names=("base_0_rgb", "left_wrist_0_rgb"),
-            update=False,
+            env_id=self.env_id,
+            rig_names=source_names,
+            update=True,
         )
         frames = {}
-        for name in ("base_0_rgb", "left_wrist_0_rgb"):
+        for name in source_names:
             images = images_by_name.get(name, ())
             if len(images) != 1:
                 raise RuntimeError(
@@ -214,7 +257,21 @@ class AutoOpenStandardEpisodeCollector:
             frames[name] = images[0]
         return frames
 
-    def complete_after_step(self, result):
+    @property
+    def _shape_by_key(self):
+        return {
+            stream["key"]: stream["shape"]
+            for stream in self.camera_streams.values()
+        }
+
+    def complete_after_step(
+        self,
+        result,
+        *,
+        contacts=None,
+        target_height_invariant_pose=None,
+        joint_mode=None,
+    ):
         """Attach the target actually dispatched over [t[k], t[k+1])."""
         if self._pending is None:
             raise RuntimeError("capture_before_step must precede complete_after_step")
@@ -230,9 +287,13 @@ class AutoOpenStandardEpisodeCollector:
         gripper_actuator_target = float(
             _numpy(post_state["gripper_actuator_target"])[0, 0]
         )
-        inactive, reset = self._mode_flags(pending["snapshot"], arm_raw_target)
-        target_pose = self._target_height_invariant_pose(
-            pending["snapshot"], arm_target
+        inactive, reset = self._mode_flags(
+            pending["snapshot"], arm_raw_target, joint_mode=joint_mode
+        )
+        target_pose = (
+            self._target_height_invariant_pose(pending["snapshot"], arm_target)
+            if target_height_invariant_pose is None
+            else np.asarray(target_height_invariant_pose, dtype=np.float32)
         )
         packed_action = pack_action(
             base_command=base_dispatched,
@@ -245,7 +306,8 @@ class AutoOpenStandardEpisodeCollector:
         self.timing["action_pack_s"] += time.perf_counter() - phase_start
 
         phase_start = time.perf_counter()
-        contacts = self.contact_audit.end_tick()
+        if contacts is None:
+            contacts = self.contact_audit.end_tick()
         max_impulse = max((row.max_normal_impulse for row in contacts), default=0.0)
         max_force = max((row.max_contact_force for row in contacts), default=0.0)
         max_penetration = max(
@@ -418,14 +480,23 @@ class AutoOpenStandardEpisodeCollector:
             )
         )
         self.audit["autoopen_stage"].append(stage_name)
-        self.audit["physical_phase"].append(_phase_for_stage(stage_name))
+        self.audit["physical_phase"].append(
+            physical_phase_for_autoopen_stage(stage_name)
+        )
 
     @staticmethod
     def _pending_state_view(snapshot):
         return {"root_states": snapshot["root"][None, :]}
 
-    def _mode_flags(self, snapshot, arm_raw_target):
-        joint_mode = bool(_numpy(self.env.teleop_arm_joint_control_mask)[0])
+    def _mode_flags(self, snapshot, arm_raw_target, *, joint_mode=None):
+        if joint_mode is None:
+            joint_mode = bool(
+                _numpy(self.env.teleop_arm_joint_control_mask)[
+                    getattr(self, "env_id", 0)
+                ]
+            )
+        else:
+            joint_mode = bool(joint_mode)
         if not joint_mode:
             self._clear_middle_preset_mode()
             return False, False

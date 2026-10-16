@@ -5,6 +5,39 @@ from __future__ import annotations
 import torch
 
 
+def _fixed_order_spd_solve(matrix: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    """Solve a small SPD batch without batch-shape-dependent library kernels."""
+    batch_size, size, width = matrix.shape
+    if size != width or rhs.shape != (batch_size, size):
+        raise ValueError("SPD solve shapes do not agree")
+
+    lower = torch.zeros_like(matrix)
+    for row in range(size):
+        for column in range(row + 1):
+            value = matrix[:, row, column]
+            for inner in range(column):
+                value = value - lower[:, row, inner] * lower[:, column, inner]
+            if row == column:
+                lower[:, row, column] = torch.sqrt(value.clamp_min(1.0e-12))
+            else:
+                lower[:, row, column] = value / lower[:, column, column]
+
+    forward = torch.zeros_like(rhs)
+    for row in range(size):
+        value = rhs[:, row]
+        for column in range(row):
+            value = value - lower[:, row, column] * forward[:, column]
+        forward[:, row] = value / lower[:, row, row]
+
+    solution = torch.zeros_like(rhs)
+    for row in range(size - 1, -1, -1):
+        value = forward[:, row]
+        for column in range(row + 1, size):
+            value = value - lower[:, column, row] * solution[:, column]
+        solution[:, row] = value / lower[:, row, row]
+    return solution
+
+
 def batched_constrained_dls_delta(
     jacobian: torch.Tensor,
     pose_error: torch.Tensor,
@@ -36,19 +69,30 @@ def batched_constrained_dls_delta(
 
         free_float = free.to(jacobian.dtype)
         fixed_delta = torch.where(free, torch.zeros_like(delta), delta)
-        residual = pose_error - torch.bmm(
-            jacobian, fixed_delta.unsqueeze(-1)
-        ).squeeze(-1)
+        fixed_effect = torch.zeros_like(pose_error)
+        for joint in range(joint_count):
+            fixed_effect = fixed_effect + (
+                jacobian[:, :, joint] * fixed_delta[:, joint].unsqueeze(-1)
+            )
+        residual = pose_error - fixed_effect
         free_jacobian = jacobian * free_float.unsqueeze(1)
-        normal = torch.bmm(free_jacobian.transpose(1, 2), free_jacobian)
+        normal = torch.zeros(
+            batch_size,
+            joint_count,
+            joint_count,
+            device=jacobian.device,
+            dtype=jacobian.dtype,
+        )
+        rhs = torch.zeros_like(joint_position)
+        for task_axis in range(jacobian.shape[1]):
+            row = free_jacobian[:, task_axis, :]
+            normal = normal + row.unsqueeze(-1) * row.unsqueeze(-2)
+            rhs = rhs + row * residual[:, task_axis].unsqueeze(-1)
         diagonal = (
             free_float * (float(damping) ** 2) + (~free).to(jacobian.dtype)
         )
         normal = normal + eye.unsqueeze(0) * diagonal.unsqueeze(-1)
-        rhs = torch.bmm(
-            free_jacobian.transpose(1, 2), residual.unsqueeze(-1)
-        ).squeeze(-1)
-        candidate = torch.linalg.solve(normal, rhs.unsqueeze(-1)).squeeze(-1)
+        candidate = _fixed_order_spd_solve(normal, rhs)
 
         violating_low = free & (candidate < lower_delta)
         violating_high = free & (candidate > upper_delta)

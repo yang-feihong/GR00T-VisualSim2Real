@@ -13,6 +13,11 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from gr00t.rl.third_party.visual_wholebody_lowlevel.legged_gym.utils.batch_invariant_math import (
+    fixed_norm,
+    fixed_normalize,
+)
+
 from legged_gym.scripts.manip_loco_interface import ManipLoco_Policy
 from legged_gym.utils.ee_steady_state import B2Z1SteadyEeForwardModel
 from legged_gym.utils.steady_path_worker import (
@@ -38,6 +43,9 @@ from gr00t.rl.auto_open.control import (
     _arm_drive_stiffness,
     _limit_base_commands,
     _perturb_base_target,
+)
+from gr00t.rl.data_collection.auto_open_collector import (
+    batched_target_height_invariant_poses,
 )
 from gr00t.rl.auto_open.utils import as_numpy as _as_np
 from gr00t.rl.auto_open.tensor_fsm import TensorCommandBuffers, TensorDoorFSM
@@ -202,7 +210,7 @@ class _BatchedRunnerView:
             quat = torch.as_tensor(
                 ee_goal_orn_quat_world, device=env.device, dtype=torch.float32
             ).reshape(1, 4)
-            quat = quat / torch.linalg.vector_norm(quat, dim=-1, keepdim=True).clamp_min(1.0e-8)
+            quat = fixed_normalize(quat, eps=1.0e-8)
             env.teleop_world_ee_goal_orn_quat[row] = quat
             if ee_goal_orn_quat_world_enabled is None:
                 env.teleop_world_ee_goal_orn_quat_enabled[row] = True
@@ -313,7 +321,8 @@ def _finish_standard_collection(
     collector,
     controller,
     runner,
-    base_seed,
+    episode_seed,
+    dataset_dir,
     initial_root_state,
     initial_dof_position,
     initial_gripper_position,
@@ -328,29 +337,34 @@ def _finish_standard_collection(
     episode = collector.finish(
         acceptance_reasons=reasons,
         provenance={
-            "seed": base_seed,
+            "seed": episode_seed,
             "initial_root_pose_w": initial_root_state.tolist(),
             "initial_dof_position": initial_dof_position.tolist(),
             "initial_gripper_position": float(initial_gripper_position),
             "door_randomization": door_randomization,
             "door_asset": door_asset_snapshot,
             "camera_mount_randomization": dict(
-                args.camera_mount_randomization or {}
+                getattr(args, "camera_mount_randomizations", {}).get(
+                    int(episode_seed), args.camera_mount_randomization
+                )
+                or {}
             ),
             "contact_audit": collector.contact_view_description,
+            "images_enabled": args.collection_camera_mode != "none",
+            "camera_mode": args.collection_camera_mode,
         },
     )
     collector.close()
     from gr00t.rl.data_collection.auto_open_writer import AutoOpenDatasetWriter
 
-    camera_calibration = json.loads(
-        Path(args.rgb_camera_config).read_text(encoding="utf-8")
+    camera_calibration = getattr(args, "episode_camera_configs", {}).get(
+        int(episode_seed), {"audit_only": True}
     )
     writer = AutoOpenDatasetWriter(
-        args.standard_dataset_dir,
+        dataset_dir,
         camera_calibration=camera_calibration,
         simulation_provenance=_standard_simulation_provenance(
-            args, runner, base_seed
+            args, runner, episode_seed
         ),
     )
     writer.write_episode(episode)
@@ -376,9 +390,10 @@ def _run_tensor_fsm_loop(
     initial_policy_observations,
     initial_gripper_positions,
     reference_buffers,
-    standard_collector,
-    standard_door_randomization,
-    standard_door_asset_snapshot,
+    standard_collectors,
+    standard_door_randomizations,
+    standard_door_asset_snapshots,
+    episode_seeds,
     video_frames,
     video_timestamps,
 ):
@@ -468,7 +483,7 @@ def _run_tensor_fsm_loop(
 
         forces = device_state.get("finger_contact_forces_w")
         if forces is not None:
-            force = torch.linalg.vector_norm(forces, dim=-1).amax(dim=-1)
+            force = fixed_norm(forces).amax(dim=-1)
             max_finger_forces = torch.maximum(max_finger_forces, force)
             unsafe = active & (force > 600.0)
             fsm.fail(torch.where(unsafe)[0], 2)
@@ -487,23 +502,28 @@ def _run_tensor_fsm_loop(
         env._update_effective_teleop_inputs(force=True)
         timing["teleop_prepare_s"] += time.perf_counter() - prepare_start
 
-        if standard_collector is not None:
+        capture_env_ids = []
+        capture_state_host = None
+        if standard_collectors:
             standard_capture_start = time.perf_counter()
-            capture_state = _slice_all_control_states(
-                _control_state_to_host(device_state, 1), 1
-            )[0]
-            high = torch.cat(
-                (
-                    buffers.base[0],
-                    buffers.ee_cart[0],
-                    buffers.ee_rpy[0],
-                    buffers.gripper[0],
-                )
-            ).detach().cpu().numpy()
-            stage_name = Stage(int(fsm.stage[0].item())).name
-            standard_collector.capture_before_step(
-                capture_state, high, stage_name=stage_name
+            capture_env_ids = torch.where(active)[0].detach().cpu().tolist()
+            capture_state_host = _control_state_to_host(device_state, num_envs)
+            capture_states = _slice_all_control_states(
+                capture_state_host, num_envs
             )
+            high_batch = torch.cat(
+                (buffers.base, buffers.ee_cart, buffers.ee_rpy, buffers.gripper),
+                dim=1,
+            ).detach().cpu().numpy()
+            stages_before_step = fsm.stage.detach().cpu().numpy()
+            standard_collectors[0].contact_audit.begin_tick()
+            for env_id in capture_env_ids:
+                standard_collectors[env_id].capture_before_step(
+                    capture_states[env_id],
+                    high_batch[env_id],
+                    stage_name=Stage(int(stages_before_step[env_id])).name,
+                    begin_contact_tick=False,
+                )
             timing["standard_capture_s"] += (
                 time.perf_counter() - standard_capture_start
             )
@@ -513,9 +533,27 @@ def _run_tensor_fsm_loop(
         timing["policy_physics_s"] += time.perf_counter() - physics_start
         if step == 0:
             first_actions[:] = result["low_level_action"]
-        if standard_collector is not None:
+        if standard_collectors:
             standard_complete_start = time.perf_counter()
-            standard_collector.complete_after_step(result)
+            contacts_by_env = standard_collectors[0].contact_audit.end_tick_by_env()
+            post_state_host = _control_state_to_host(result["state"], num_envs)
+            post_states = _slice_all_control_states(
+                post_state_host, num_envs
+            )
+            target_poses = batched_target_height_invariant_poses(
+                capture_state_host["root_states"],
+                post_state_host["arm_position_target"],
+            )
+            joint_modes = (
+                env.teleop_arm_joint_control_mask.detach().cpu().numpy()
+            )
+            for env_id in capture_env_ids:
+                standard_collectors[env_id].complete_after_step(
+                    {"state": post_states[env_id]},
+                    contacts=contacts_by_env.get(env_id, ()),
+                    target_height_invariant_pose=target_poses[env_id],
+                    joint_mode=joint_modes[env_id],
+                )
             timing["standard_complete_s"] += (
                 time.perf_counter() - standard_complete_start
             )
@@ -523,15 +561,23 @@ def _run_tensor_fsm_loop(
             manager = runner.rgb_camera_manager
             if manager is None or not manager.enabled:
                 raise RuntimeError("video regression requires enabled RGB cameras")
-            images_by_name = manager.render_images(env_id=0, update=False)
             timestamp = step * float(env.dt)
-            for name, images in images_by_name.items():
-                if len(images) != 1:
-                    raise RuntimeError(
-                        f"camera {name} returned {len(images)} frames for one environment"
-                    )
-                video_frames.setdefault(name, []).append(images[0])
-                video_timestamps.setdefault(name, []).append(timestamp)
+            for env_id in torch.where(active)[0].detach().cpu().tolist():
+                images_by_name = manager.render_images(
+                    env_id=env_id, update=False
+                )
+                for name, images in images_by_name.items():
+                    if len(images) != 1:
+                        raise RuntimeError(
+                            f"camera {name} returned {len(images)} frames for "
+                            f"environment {env_id}"
+                        )
+                    video_frames.setdefault(env_id, {}).setdefault(
+                        name, []
+                    ).append(images[0])
+                    video_timestamps.setdefault(env_id, {}).setdefault(
+                        name, []
+                    ).append(timestamp)
         device_state = result["state"]
         hinge_speed = device_state["door_joint_velocity"][:, fsm.hinge_idx].abs()
         max_hinge_speeds = torch.maximum(max_hinge_speeds, hinge_speed)
@@ -599,6 +645,10 @@ def _run_tensor_fsm_loop(
     max_forces_np = max_finger_forces.detach().cpu().numpy()
     max_hinge_np = max_hinge_speeds.detach().cpu().numpy()
     first_actions_np = first_actions.detach().cpu().numpy()
+    arrival_settle_np = fsm.base_arrival_settle_steps.detach().cpu().numpy()
+    arrival_max_settle_np = fsm.base_arrival_max_settle_steps.detach().cpu().numpy()
+    arrival_distance_np = fsm.pending_station_distance.detach().cpu().numpy()
+    arrival_yaw_np = fsm.pending_yaw_error.detach().cpu().numpy()
     successes = 0
     base_seed = int(args.seed if args.seed is not None else 0)
     for env_id, controller in enumerate(controllers):
@@ -613,6 +663,23 @@ def _run_tensor_fsm_loop(
             controller.failure_stage = (
                 Stage(origin).name if origin else Stage.FAILURE.name
             )
+        root = final_state["root_states"][env_id]
+        controller.last_acceptance_diagnostics.update(
+            {
+                "base_arrival_settle_steps": int(arrival_settle_np[env_id]),
+                "base_arrival_max_settle_steps": int(arrival_max_settle_np[env_id]),
+                "base_arrival_distance_m": float(arrival_distance_np[env_id]),
+                "base_arrival_yaw_error_rad": float(arrival_yaw_np[env_id]),
+                "base_arrival_linear_speed_m_s": float(np.linalg.norm(root[7:10])),
+                "base_arrival_angular_speed_rad_s": float(np.linalg.norm(root[10:13])),
+                "base_arrival_planar_speed_m_s": float(np.linalg.norm(root[7:9])),
+                "base_arrival_yaw_rate_rad_s": float(abs(root[12])),
+                "base_arrival_velocity_xyz_m_s": root[7:10].astype(float).tolist(),
+                "base_arrival_angular_velocity_xyz_rad_s": root[10:13]
+                .astype(float)
+                .tolist(),
+            }
+        )
         successes += int(controller.stage == Stage.SUCCESS)
         _write_batched_episode_result(
             args,
@@ -620,7 +687,7 @@ def _run_tensor_fsm_loop(
             runner,
             state_rows[env_id],
             env_id,
-            base_seed + env_id,
+            int(episode_seeds[env_id]),
             step_counts_np[env_id],
             max_forces_np[env_id],
             max_hinge_np[env_id],
@@ -630,45 +697,62 @@ def _run_tensor_fsm_loop(
             first_actions_np[env_id],
         )
     if args.record_video:
-        episode_dir = args.output_dir / f"seed_{base_seed}"
-        video_dir = episode_dir / "video"
-        video_dir.mkdir(exist_ok=True)
-        for name, frames in video_frames.items():
-            _save_rgb_video(
-                frames,
-                video_timestamps[name],
-                video_dir / f"{name}.mp4",
+        for env_id, episode_seed in enumerate(episode_seeds):
+            video_dir = (
+                args.output_dir / f"seed_{int(episode_seed)}" / "video"
             )
-        _save_rgb_mosaic_video(
-            video_frames,
-            video_timestamps,
-            video_dir / "all_cameras_mosaic.mp4",
-        )
-    if standard_collector is not None:
+            video_dir.mkdir(exist_ok=True)
+            env_frames = video_frames.get(env_id, {})
+            env_timestamps = video_timestamps.get(env_id, {})
+            for name, frames in env_frames.items():
+                _save_rgb_video(
+                    frames,
+                    env_timestamps[name],
+                    video_dir / f"{name}.mp4",
+                )
+            _save_rgb_mosaic_video(
+                env_frames,
+                env_timestamps,
+                video_dir / "all_cameras_mosaic.mp4",
+            )
+    if standard_collectors:
         standard_finalize_start = time.perf_counter()
-        _finish_standard_collection(
-            args,
-            collector=standard_collector,
-            controller=controllers[0],
-            runner=runner,
-            base_seed=base_seed,
-            initial_root_state=initial_root_states[0],
-            initial_dof_position=initial_dof_positions[0],
-            initial_gripper_position=initial_gripper_positions[0],
-            door_randomization=standard_door_randomization,
-            door_asset_snapshot=standard_door_asset_snapshot,
-        )
+        for env_id, collector in enumerate(standard_collectors):
+            episode_seed = int(episode_seeds[env_id])
+            _finish_standard_collection(
+                args,
+                collector=collector,
+                controller=controllers[env_id],
+                runner=runner,
+                episode_seed=episode_seed,
+                dataset_dir=(
+                    Path(args.standard_dataset_dir)
+                    / f"episode-seed{episode_seed}"
+                ),
+                initial_root_state=initial_root_states[env_id],
+                initial_dof_position=initial_dof_positions[env_id],
+                initial_gripper_position=initial_gripper_positions[env_id],
+                door_randomization=standard_door_randomizations[env_id],
+                door_asset_snapshot=standard_door_asset_snapshots[env_id],
+            )
+        standard_collectors[0].contact_audit.detach()
         timing["standard_finalize_s"] += (
             time.perf_counter() - standard_finalize_start
         )
         timing.update(
             {
                 f"collector_{name}": float(value)
-                for name, value in standard_collector.timing.items()
+                for name, value in {
+                    key: sum(float(c.timing.get(key, 0.0)) for c in standard_collectors)
+                    for key in {
+                        key for c in standard_collectors for key in c.timing
+                    }
+                }.items()
             }
         )
     summary = {
         "batch_seed": base_seed,
+        "episode_seeds": [int(seed) for seed in episode_seeds],
         "num_envs": num_envs,
         "active_env_ids": list(range(num_envs)),
         "successes": successes,
@@ -718,7 +802,10 @@ def _run_tensor_fsm_loop(
     )
     print(f"[doorman][batch] complete: {successes}/{num_envs} active", flush=True)
     if steady_path_executor is not None:
-        steady_path_executor.shutdown(wait=True)
+        steady_path_executor.shutdown(
+            wait=not args.headless,
+            cancel_futures=bool(args.headless),
+        )
     if args.headless:
         sys.stdout.flush()
         sys.stderr.flush()
@@ -737,10 +824,30 @@ def _run_batched(args, *, controller_cls, stage_enum):
     if args.env_spacing is None:
         args.env_spacing = 8.0
     base_seed = int(args.seed if args.seed is not None else 0)
+    episode_seeds = (
+        list(range(base_seed, base_seed + num_envs))
+        if args.episode_seeds is None
+        else [int(seed) for seed in args.episode_seeds]
+    )
+    if len(episode_seeds) != num_envs:
+        raise ValueError("--episode_seeds must contain exactly --batched_envs values")
+    if len(set(episode_seeds)) != num_envs:
+        raise ValueError("--episode_seeds must not contain duplicates")
     torch.manual_seed(base_seed)
     np.random.seed(base_seed)
     runner = ManipLoco_Policy(args)
     env = runner.env
+    if args.collection_camera_mode != "none":
+        manager = runner.rgb_camera_manager
+        if manager is None or not manager.enabled:
+            raise RuntimeError("configured collection cameras were not initialized")
+        configs = getattr(args, "episode_camera_configs", {})
+        manager.set_episode_camera_configs(
+            {
+                env_id: configs[int(seed)]
+                for env_id, seed in enumerate(episode_seeds)
+            }
+        )
     door_handle_paths = [
         str(prim.GetPath())
         for prim in env.sim.stage.Traverse()
@@ -825,7 +932,7 @@ def _run_batched(args, *, controller_cls, stage_enum):
                 env_id=env_id,
                 shared_steady_model=shared_steady_model,
                 shared_robot_geometry=shared_robot_geometry,
-                target_noise_seed=base_seed + env_id,
+                target_noise_seed=episode_seeds[env_id],
                 target_noise_config=args.target_noise_config,
                 arm_retract_pose_local=args.arm_retract_pose_local,
                 arm_retract_position_noise_radius_m=(
@@ -877,40 +984,47 @@ def _run_batched(args, *, controller_cls, stage_enum):
     first_low_level_actions = np.full(
         (num_envs, env.num_actions), np.nan, dtype=np.float32
     )
-    standard_collector = None
-    standard_door_randomization = None
-    standard_door_asset_snapshot = None
+    standard_collectors = []
+    standard_door_randomizations = []
+    standard_door_asset_snapshots = []
     video_frames = {}
     video_timestamps = {}
-    if args.record_video and num_envs != 1:
-        raise ValueError("video regression uses the unified runner with batch size one")
     if args.standard_dataset_dir is not None:
-        if num_envs != 1:
-            raise ValueError(
-                "standard collection uses the unified runner with exactly one environment"
-            )
         from gr00t.rl.data_collection.auto_open_collector import (
             AutoOpenStandardEpisodeCollector,
         )
+        from gr00t.rl.data_collection.contact_audit import SubstepContactAudit
 
-        standard_collector = AutoOpenStandardEpisodeCollector(
-            runner,
-            controllers[0],
-            episode_index=0,
-            seed=base_seed,
-            video_staging_root=(
-                Path(args.standard_dataset_dir) / ".staging" / "episode_000000"
-            ),
-        )
-        door_prim = env.sim.stage.GetPrimAtPath(
-            _resolved_door_prim_path(env, 0)
-        )
-        standard_door_randomization = dict(
-            door_prim.GetMetadata("customData") or {}
-        )
-        standard_door_asset_snapshot = _door_asset_stage_snapshot(
-            env.sim.stage, door_prim
-        )
+        contact_audit = SubstepContactAudit.create(env)
+        contact_audit.attach()
+        for env_id, episode_seed in enumerate(episode_seeds):
+            shard_dir = (
+                Path(args.standard_dataset_dir) / f"episode-seed{episode_seed}"
+            )
+            standard_collectors.append(
+                AutoOpenStandardEpisodeCollector(
+                    runner,
+                    controllers[env_id],
+                    episode_index=0,
+                    seed=episode_seed,
+                    video_staging_root=(
+                        shard_dir / ".staging" / "episode_000000"
+                    ),
+                    capture_images=args.collection_camera_mode != "none",
+                    camera_mode=args.collection_camera_mode,
+                    env_id=env_id,
+                    contact_audit=contact_audit,
+                )
+            )
+            door_prim = env.sim.stage.GetPrimAtPath(
+                _resolved_door_prim_path(env, env_id)
+            )
+            standard_door_randomizations.append(
+                dict(door_prim.GetMetadata("customData") or {})
+            )
+            standard_door_asset_snapshots.append(
+                _door_asset_stage_snapshot(env.sim.stage, door_prim)
+            )
     print(
         "[doorman][batch-init] door_joint_position="
         f"{_as_np(full_state['door_joint_position']).round(5).tolist()} "
@@ -984,9 +1098,10 @@ def _run_batched(args, *, controller_cls, stage_enum):
         initial_policy_observations=initial_policy_observations,
         initial_gripper_positions=initial_gripper_positions,
         reference_buffers=reference_buffers,
-        standard_collector=standard_collector,
-        standard_door_randomization=standard_door_randomization,
-        standard_door_asset_snapshot=standard_door_asset_snapshot,
+        standard_collectors=standard_collectors,
+        standard_door_randomizations=standard_door_randomizations,
+        standard_door_asset_snapshots=standard_door_asset_snapshots,
+        episode_seeds=episode_seeds,
         video_frames=video_frames,
         video_timestamps=video_timestamps,
     )

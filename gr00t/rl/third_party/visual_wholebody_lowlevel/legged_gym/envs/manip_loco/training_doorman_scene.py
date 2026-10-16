@@ -44,13 +44,20 @@ def build_grouped_training_doorman_door_cfgs(
     seed: int,
     physics_only: bool = False,
     door_open_lr: str | None = None,
+    episode_seeds=None,
 ):
     """Build separate homogeneous articulation views for mirrored doors."""
     if num_envs < 1:
         raise ValueError("Grouped door configuration requires an environment")
     if door_open_lr is not None and door_open_lr not in ("left", "right"):
         raise ValueError(f"Unsupported door_open_lr={door_open_lr!r}")
-    episode_seeds = [int(seed) + env_id for env_id in range(num_envs)]
+    episode_seeds = (
+        [int(seed) + env_id for env_id in range(num_envs)]
+        if episode_seeds is None
+        else [int(value) for value in episode_seeds]
+    )
+    if len(episode_seeds) != int(num_envs):
+        raise ValueError("episode_seeds must contain exactly num_envs values")
     sides = [
         door_open_lr
         if door_open_lr is not None

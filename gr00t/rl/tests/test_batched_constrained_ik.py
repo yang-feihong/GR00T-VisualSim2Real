@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 import torch
 
 from gr00t.rl.third_party.visual_wholebody_lowlevel.legged_gym.utils.constrained_ik import (
@@ -75,3 +76,33 @@ def test_batch_size_one_uses_identical_tensor_semantics():
         0.05,
     )
     torch.testing.assert_close(single[0], repeated[0], rtol=0.0, atol=0.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_result_is_exactly_independent_of_batch_shape():
+    generator = torch.Generator(device="cuda").manual_seed(1702)
+    jacobian = torch.randn(
+        1, 6, 6, generator=generator, device="cuda", dtype=torch.float32
+    )
+    pose_error = torch.randn(
+        1, 6, generator=generator, device="cuda", dtype=torch.float32
+    )
+    positions = (
+        torch.rand(1, 6, generator=generator, device="cuda", dtype=torch.float32)
+        * 1.8
+        - 0.9
+    )
+    limits = torch.tensor([[-1.0, 1.0]] * 6, device="cuda", dtype=torch.float32)
+
+    single = batched_constrained_dls_delta(
+        jacobian, pose_error, positions, limits, 0.05
+    )
+    repeated = batched_constrained_dls_delta(
+        jacobian.repeat(7, 1, 1),
+        pose_error.repeat(7, 1),
+        positions.repeat(7, 1),
+        limits,
+        0.05,
+    )
+
+    assert torch.equal(single[0], repeated[0])

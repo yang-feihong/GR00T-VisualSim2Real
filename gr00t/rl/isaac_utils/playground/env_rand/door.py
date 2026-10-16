@@ -109,9 +109,9 @@ class DoorSpawnerCfg(sim_utils.RigidObjectSpawnerCfg):
     # common without collapsing the domain randomization to one narrow range.
     # Entries are: (weight, joint friction, drive damping, max damping torque).
     hinge_resistance_mixture: tuple = (
-        (0.70, (0.0002, 0.0012), (0.4, 1.6), (0.06, 0.2)),
-        (0.25, (0.0012, 0.0036), (1.6, 4.0), (0.2, 0.5)),
-        (0.05, (0.0036, 0.0080), (4.0, 8.0), (0.5, 0.8)),
+        (0.70, (0.0002, 0.0012), (0.2, 0.8), (0.06, 0.2)),
+        (0.25, (0.0012, 0.0036), (0.8, 2.0), (0.2, 0.5)),
+        (0.05, (0.0036, 0.0080), (2.0, 4.0), (0.5, 0.8)),
     )
 
     # deterministic generation

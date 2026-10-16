@@ -304,6 +304,9 @@ def _apply_cli_scene_args(cfg, args):
 
         cfg.enable_doorman_scene = True
         cfg.scene.replicate_physics = False
+        # Keep GPU contact-island ordering independent of the vector batch.
+        cfg.sim.physx.enable_enhanced_determinism = True
+        cfg.sim.physx.gpu_max_num_partitions = 1
         cfg.doorman_randomize_robot_init = bool(args.doorman_randomize_robot_init)
         cfg.doorman_robot_side = str(getattr(args, "robot_side", "positive_x"))
         if args.doorman_robot_init_height is not None:
@@ -323,6 +326,12 @@ def _apply_cli_scene_args(cfg, args):
             int(args.seed if args.seed is not None else 0),
             physics_only=bool(getattr(args, "disable_rgb_cameras", False)),
             door_open_lr=args.doorman_door_open_lr,
+            episode_seeds=getattr(args, "episode_seeds", None),
+        )
+        cfg.doorman_episode_seeds = (
+            None
+            if getattr(args, "episode_seeds", None) is None
+            else tuple(int(value) for value in args.episode_seeds)
         )
         print("[doorman] using the high-level training DoorSpawner configuration")
 

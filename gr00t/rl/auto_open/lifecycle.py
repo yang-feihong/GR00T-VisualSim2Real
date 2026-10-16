@@ -5,8 +5,9 @@ import math
 import numpy as np
 
 from gr00t.rl.auto_open.control import (
-    BASE_STATION_TOLERANCE_M,
+    APPROACH_ARRIVAL,
     ROBOT_TRUNK_REAR_X,
+    THROUGH_TARGET_LEAD_DISTANCE,
     THROUGH_TAIL_TARGET_DISTANCE,
     _effective_grasp_target,
     _quat_distance,
@@ -41,8 +42,9 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
     self.base_reversal_pending_sign = np.zeros(3, dtype=np.int8)
     self.base_reversal_pending_steps = np.zeros(3, dtype=np.int32)
     self.base_reversal_lock_steps = np.zeros(3, dtype=np.int32)
-    self.approach_settle_steps = 0
-    self.approach_stop_latched = False
+    self.base_arrival_settle_steps = 0
+    self.base_arrival_confirmed = False
+    self.base_arrival_profile = APPROACH_ARRIVAL
     self.pregrasp_settle_steps = 0
     self.handle_align_settle_steps = 0
     self.grasp_settle_steps = 0
@@ -113,7 +115,6 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
     self.defer_path_solve = False
     self.panel_contact_orientation = None
     self.panel_contact_settle_steps = 0
-    self.panel_station_settle_steps = 0
     self.panel_align_ee_goal_local = None
     self.panel_align_ee_orientation_local = None
     self.align_panel_arm_joint_target = None
@@ -261,15 +262,14 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
     # the pre-door station lies along +normal from the handle.
     # The locomotion policy has a repeatable stopping offset near the
     # frame.  Keep the
-    # geometric target here for logging, and use an explicit tolerance
-    # below rather than driving the base into the frame.
+    # geometric target here for logging; arrival tolerances are owned by
+    # the shared base-target tracker.
     # Keep the refined 0.20 m fixed jaw outside the handle while the arm
     # remains in its randomized middle preset.  At 0.65 m the moving jaw
     # reaches the lever during locomotion and invalidates the precomputed
     # closed-door trajectory; 0.77 m retains arm reach with 0.12 m more
     # clearance.
     self.approach_distance = 0.77
-    self.station_tolerance = BASE_STATION_TOLERANCE_M
     self.station_xy = self.grasp_center_pos[:2] + self.approach_distance * normal
     self.panel_station_xy = self.station_xy.copy()
     self.panel_station_xy += float(
@@ -287,7 +287,8 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
     )
     target_tail_xy = (
         door_root[:2]
-        + THROUGH_TAIL_TARGET_DISTANCE * self.door_forward[:2]
+        + (THROUGH_TAIL_TARGET_DISTANCE + THROUGH_TARGET_LEAD_DISTANCE)
+        * self.door_forward[:2]
     )
     self.through_station_xy = target_tail_xy - rear_offset_world
     self.initial_handle_pos = self.grasp_center_pos.copy()

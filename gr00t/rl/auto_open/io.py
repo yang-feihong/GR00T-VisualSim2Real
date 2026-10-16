@@ -28,6 +28,8 @@ def standard_simulation_provenance(args, runner, base_seed):
             return None
 
     def hashed(path):
+        if path is None:
+            return None
         path = Path(path)
         return {"path": str(path), "sha256": file_sha256(path)} if path.is_file() else None
 
@@ -52,10 +54,19 @@ def standard_simulation_provenance(args, runner, base_seed):
     rigid_props = robot_spawn.rigid_props
     sim_cfg = runner.env.cfg.sim
     physx_cfg = sim_cfg.physx
-    camera_path = Path(args.rgb_camera_config)
-    nominal_camera_path = Path(args.nominal_rgb_camera_config)
+    episode_camera_paths = getattr(args, "episode_camera_config_paths", {})
+    camera_value = episode_camera_paths.get(int(base_seed), args.rgb_camera_config)
+    camera_path = None if camera_value is None else Path(camera_value)
+    nominal_camera_value = getattr(args, "nominal_rgb_camera_config", None)
+    nominal_camera_path = (
+        None if nominal_camera_value is None else Path(nominal_camera_value)
+    )
     door_source = repo / "gr00t" / "rl" / "isaac_utils" / "playground" / "env_rand" / "door.py"
-    camera_configuration = json.loads(camera_path.read_text(encoding="utf-8"))
+    camera_configuration = (
+        {"audit_only": True}
+        if camera_path is None
+        else json.loads(camera_path.read_text(encoding="utf-8"))
+    )
     return {
         "collector": "auto_open_standard_sidecar",
         "repository_commit": git("rev-parse", "HEAD"),
@@ -76,8 +87,13 @@ def standard_simulation_provenance(args, runner, base_seed):
         "run_metadata": hashed(args.run_metadata_path),
         "camera_config": hashed(camera_path),
         "nominal_camera_config": hashed(nominal_camera_path),
-        "camera_calibration_id": file_sha256(camera_path),
-        "camera_mount_randomization": args.camera_mount_randomization,
+        "camera_calibration_id": (
+            None if camera_path is None else file_sha256(camera_path)
+        ),
+        "camera_mount_randomization": getattr(
+            args, "camera_mount_randomizations", {}
+        ).get(int(base_seed), args.camera_mount_randomization),
+        "camera_mode": args.collection_camera_mode,
         "camera_configuration": camera_configuration,
         "camera_rotation_convention": {
             "input": "roll_pitch_yaw_radians_relative_to_parent_body",
@@ -121,6 +137,7 @@ def standard_simulation_provenance(args, runner, base_seed):
                 "friction_correlation_distance",
                 "enable_stabilization",
                 "enable_enhanced_determinism",
+                "gpu_max_num_partitions",
                 "gpu_max_rigid_contact_count",
                 "gpu_max_rigid_patch_count",
                 "gpu_found_lost_pairs_capacity",
@@ -149,7 +166,11 @@ def standard_simulation_provenance(args, runner, base_seed):
         "seed_start": int(base_seed),
         "randomization": "DoorSpawner metadata recorded per episode",
         "control_backend": "B2Z1 low-level policy plus AutoOpen FSM",
-        "rendering": "RTX headless, two DATA_STANARD.md RGB sensors at 50 Hz",
+        "rendering": (
+            "disabled for audit-only collection"
+            if camera_path is None
+            else "RTX headless, two DATA_STANARD.md RGB sensors at 50 Hz"
+        ),
     }
 
 

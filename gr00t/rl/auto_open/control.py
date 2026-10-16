@@ -1,6 +1,7 @@
 """Shared base, Cartesian, orientation, and stability control primitives."""
 
 import math
+from dataclasses import dataclass
 
 import numpy as np
 import torch
@@ -29,12 +30,106 @@ BASE_REVERSAL_CONFIRM_FRAMES = 3
 BASE_REVERSAL_LOCK_FRAMES = 5
 BASE_REVERSAL_JUMP = 0.15
 BASE_REVERSAL_EPSILON = 1.0e-4
-BASE_STATION_TOLERANCE_M = 0.12
-BASE_YAW_TOLERANCE_RAD = 0.08
-THROUGH_STOP_DISTANCE_M = 0.08
-THROUGH_STOP_YAW_RAD = 0.05
 ROBOT_TRUNK_REAR_X = -0.284
 THROUGH_TAIL_TARGET_DISTANCE = 1.0
+THROUGH_TARGET_LEAD_DISTANCE = 0.05
+THROUGH_TAIL_RELEASE_DISTANCE = 0.95
+
+
+@dataclass(frozen=True)
+class BaseArrivalProfile:
+    """Stage-owned thresholds for the shared hysteretic arrival controller."""
+
+    inner_distance_m: float
+    outer_distance_m: float
+    inner_yaw_rad: float
+    outer_yaw_rad: float
+    settle_frames: int
+
+    def __post_init__(self):
+        if self.inner_distance_m > self.outer_distance_m:
+            raise ValueError("inner distance must not exceed outer distance")
+        if self.inner_yaw_rad > self.outer_yaw_rad:
+            raise ValueError("inner yaw must not exceed outer yaw")
+        if self.settle_frames <= 0:
+            raise ValueError("settle_frames must be positive")
+
+
+# These values are deliberately centralized and stage-specific.  The controller
+# architecture does not depend on them, so they can be tuned without changing
+# stage logic.
+APPROACH_ARRIVAL = BaseArrivalProfile(0.05, 0.15, 0.05, 0.10, 25)
+ALIGN_PANEL_ARRIVAL = BaseArrivalProfile(0.05, 0.15, 0.05, 0.10, 25)
+
+# Compatibility names for diagnostics and low-level command shaping.  They are
+# not the stage arrival contract.
+BASE_STATION_TOLERANCE_M = 0.12
+BASE_YAW_TOLERANCE_RAD = 0.08
+
+
+def update_base_target_arrival(
+    confirmed,
+    settle_steps,
+    inside_inner,
+    inside_outer,
+    *,
+    required_settle_frames,
+):
+    """Advance a zero-command arrival window with inner/outer hysteresis.
+
+    Entering the inner region starts dispatching exact zero commands.  During
+    that braking window the state may drift into the outer region without
+    restarting motion.  Leaving the outer region cancels the window.
+    """
+    values = (confirmed, settle_steps, inside_inner, inside_outer)
+    tensor = next((value for value in values if isinstance(value, torch.Tensor)), None)
+    if tensor is not None:
+        device = tensor.device
+        was_confirmed = torch.as_tensor(confirmed, device=device, dtype=torch.bool)
+        steps = torch.as_tensor(settle_steps, device=device)
+        required = torch.as_tensor(
+            required_settle_frames, device=device, dtype=steps.dtype
+        )
+        inner = torch.as_tensor(inside_inner, device=device, dtype=torch.bool)
+        outer = torch.as_tensor(inside_outer, device=device, dtype=torch.bool)
+        settling = steps > 0
+        zero_command = torch.where(was_confirmed | settling, outer, inner)
+        next_steps = torch.where(
+            zero_command,
+            torch.minimum(
+                steps + 1,
+                torch.ones_like(steps) * required,
+            ),
+            torch.zeros_like(steps),
+        )
+        next_confirmed = (was_confirmed & outer) | (
+            ~was_confirmed & (next_steps >= required)
+        )
+        return next_confirmed, next_steps, zero_command
+
+    inner = bool(inside_inner)
+    outer = bool(inside_outer)
+    zero_command = outer if bool(confirmed) or int(settle_steps) > 0 else inner
+    steps = min(int(settle_steps) + 1, int(required_settle_frames)) if zero_command else 0
+    now_confirmed = steps >= int(required_settle_frames)
+    return now_confirmed, steps, zero_command
+
+
+def base_pose_arrival_regions(distance_m, yaw_error_rad, profile):
+    """Return inner/outer membership for a point-target arrival profile."""
+    if isinstance(distance_m, torch.Tensor) or isinstance(yaw_error_rad, torch.Tensor):
+        distance = torch.as_tensor(distance_m)
+        yaw = torch.as_tensor(yaw_error_rad, device=distance.device).abs()
+        return (
+            (distance < profile.inner_distance_m) & (yaw < profile.inner_yaw_rad),
+            (distance < profile.outer_distance_m) & (yaw < profile.outer_yaw_rad),
+        )
+    distance = float(distance_m)
+    yaw = abs(float(yaw_error_rad))
+    return (
+        distance < profile.inner_distance_m and yaw < profile.inner_yaw_rad,
+        distance < profile.outer_distance_m and yaw < profile.outer_yaw_rad,
+    )
 
 
 def _arm_drive_stiffness(env):
@@ -176,20 +271,13 @@ def _base_commands_exact(
     command[:, 1] = 1.2 * local_y - local_vy
     command[:, 2] = 1.5 * yaw_error - 0.35 * roots[:, 12]
     command = _limit_base_commands(command)
-    command_distance = np.linalg.norm(error[:, :2], axis=1).astype(np.float32)
     planar_norm = np.linalg.norm(command[:, :2], axis=1).astype(np.float32)
-    deadzone = (
-        (command_distance > 0.08)
-        & (planar_norm > 1.0e-6)
-        & (planar_norm < 0.15)
-    )
+    deadzone = (planar_norm > 1.0e-6) & (planar_norm < 0.15)
     if minimum_speed_toward_target_only:
         deadzone &= (command[:, 0] * local_x + command[:, 1] * local_y) > 0.0
     command[deadzone, :2] *= (0.15 / planar_norm[deadzone])[:, None]
-    yaw_deadzone = (
-        (np.abs(yaw_error) > BASE_YAW_TOLERANCE_RAD)
-        & (np.abs(command[:, 2]) > 1.0e-6)
-        & (np.abs(command[:, 2]) < 0.2)
+    yaw_deadzone = (np.abs(command[:, 2]) > 1.0e-6) & (
+        np.abs(command[:, 2]) < 0.2
     )
     if minimum_speed_toward_target_only:
         yaw_deadzone &= (command[:, 2] * yaw_error) > 0.0
@@ -621,6 +709,7 @@ def _through_tail_clearance(self, state):
             self.door_forward[:2],
         )
     )
+
 
 def _base_advance_target(self, state):
     """Target the nearer of panel reachability and shoulder clearance."""

@@ -9,26 +9,25 @@
 - 主状态机：`gr00t/rl/scripts/doorman_auto_open.py`
 - 领域模块：`gr00t/rl/auto_open/`
 - 唯一实验入口：`gr00t/rl/scripts/run_auto_open.sh`
-- 当前 GPU FSM 相关测试：`28 passed`
+- 当前 AutoOpen 相关测试：`141 passed`
 
 `doorman_auto_open.py` 明确维护顶层阶段图；几何、规划、控制、生命周期、运行时和 I/O 分别由 `geometry.py`、`planning.py`、`control.py`、`lifecycle.py`、`runtime.py` 和 `io.py` 实现。单环境和多环境运行时共用 GPU 常驻的 `TensorDoorFSM`；`DoorController` 只在初始化和稀疏规划边界提供静态任务配置，不参与逐帧 `command/advance`。
 
 ## 固定运行入口
 
-所有能力回归、视频回归和数据采集必须通过：
+所有 AutoOpen 运行必须通过：
 
 ```bash
 bash gr00t/rl/scripts/run_auto_open.sh
 ```
 
-脚本不接受临时拼接的命令行参数，只允许通过 `AUTO_OPEN_WORKFLOW` 选择已维护流程：
+入口只有数据采集语义，不再维护能力回归、视频回归或标量采集等平行流程。`DATASET_ROOT` 必填；相机只是同一流程的配置：
 
-| workflow | 用途 | 必需输出变量 |
-|---|---|---|
-| `capability` | 无相机、多环境能力回归 | `OUTPUT_ROOT` |
-| `semantic_collection` | 带已验收语义目标随机化的能力回归 | `OUTPUT_ROOT` |
-| `video_regression` | 少量 seed 带相机视频回归 | `RUN_NAME` |
-| `standard_collection` | 按 `DATA_STANARD.md` 采集双相机数据 | `DATASET_ROOT` |
+| `CAMERA_MODE` | 采集内容 |
+|---|---|
+| `none` | 不创建 RGB 传感器，只记录状态、动作、接触与验收数据 |
+| `dual` | 记录训练使用的机身和腕部两路 RGB |
+| `six` | 记录腕部、机身及四路诊断 RGB |
 
 固定运行参数包括：
 
@@ -37,10 +36,14 @@ bash gr00t/rl/scripts/run_auto_open.sh
 - 门板间隙使用 GPU 后端；
 - CENTER_HANDLE 守卫回退使用 NumPy batch 后端；
 - 输出目录必须不存在，脚本拒绝覆盖；
-- 能力模式默认四卡，每卡 `250 env`；
-- 每个 episode seed 与 GPU、rank、batch size 和相机开关解耦。
+- 每张物理 GPU 恰好启动一个 Isaac Sim 进程；分配到该 GPU 的所有 seed 在同一进程中作为 vectorized env 运行；
+- 可用 `SEEDS` 指定任意 seed 集合，或用 `SEED_START`/`NUM_EPISODES` 生成连续集合；不存在每卡 250 个槽位的上限；
+- 每个 episode seed 与 GPU、rank、env 槽位、batch size 和相机模式解耦；
+- `dual`/`six` 为每个 env 创建独立的 render-only Camera，逐 seed 应用确定性挂载和标定随机化；相机不注册为 physics scene sensor，不参与 reset、控制或物理推进。
 
-同一个 seed 使用确定性的无界环境位置映射和固定 256 行策略计算块。因此改变并行数量、GPU 分配或是否创建相机，不应改变该 seed 的初始场景和首帧低层动作。
+同一个 seed 使用确定性的无界环境位置映射，不预留固定数量的空环境槽位。场景参数、机器人初态、任务目标、相机标定和策略输入行不依赖 GPU、rank、env 槽位或 batch size。相机模式不得改变控制或物理轨迹。
+
+逐帧控制链使用统一的 batch-invariant 数学接口。受约束 DLS 使用固定顺序正规方程和 Cholesky 求解；四元数四维归约使用与原单环境 CUDA 内核一致的配对顺序；其余原生归约经过 CUDA batch-shape 精确性测试后保留原数值语义。该实现没有阶段、seed 或接触状态特判。GPU PhysX 开启 enhanced determinism，并固定为一个 dynamics partition。当前完整接触 episode 已证明同一 seed 在不同 batch size、env 槽位和物理 GPU 下逐帧逐 bit 一致。
 
 ## 顶层阶段图
 
@@ -93,11 +96,13 @@ PUSH_OPEN -> PUSH_ARM_RETRACT -> BASE_ADVANCE -> CONTACT_PANEL
 
 - 平面速度上限：`0.4 m/s`；
 - yaw 角速度上限：`0.6 rad/s`；
-- 非零平移指令最低速度：`0.15 m/s`；
-- 非零 yaw 指令最低角速度：`0.2 rad/s`；
+- 控制器决定继续移动时，任何非零平移指令的模长至少为 `0.15 m/s`，不再另设距离启用阈值；
+- 控制器决定继续转动时，任何非零 yaw 指令的绝对值至少为 `0.2 rad/s`，不再另设角度启用阈值；
 - 反向命令需要连续确认，并经过零速锁定，避免短时正负翻转；
-- 常规站位容差：位置 `0.12 m`，yaw `0.08 rad`；
-- THROUGH 停车容差：位置 `0.08 m`，yaw `0.05 rad`。
+- `APPROACH` 和 `ALIGN_PANEL` 共用同一个到位状态机和阶段配置；
+- 首次进入阶段配置的内阈值后发布严格零速度，并开始累计静止窗口；
+- 静止期间允许漂移至外阈值以内；超过任一外阈值立即取消窗口并恢复目标追踪；
+- `BASE_ADVANCE` 的再接触/肩部安全和 `THROUGH` 的整机三维稳定/直立/门速要求是阶段附加条件，不改变统一到位语义。
 
 `BASE_ADVANCE` 每步根据当前门板几何更新目标站位：目标尽可能前移，使门板接触点进入 `0.4 m` 再接触半径，同时满足前肩安全约束；再接触释放阈值为 `0.45 m`，目标带 `0.05 m` 提前量。目标纵向位置只能前进，不能后退；横向基准固定在门框中心。
 
@@ -139,7 +144,7 @@ GRASP_HANDLE 始终向上层记录闭合命令 `0 rad`。接触后是否停止�
 4. 夹爪指定尖端保持在门板外 `30 mm`；
 5. 位置和姿态均从当前命令连续渐进，位置每周期最大变化 `3 mm`。
 
-PUSH_OPEN 在门板接触阶段限制相对接近速度、接触力和门铰链角速度。门板接触点超过机械臂舒适范围后，先收回机械臂，再让底盘前进，之后重新计算 CONTACT_PANEL 目标。
+PUSH_OPEN 以 `20 deg/s` 为门铰链目标角速度，动态门角提前量上限为 `2 deg`，EE 位置目标每帧最多移动 `3 mm`。门板接触点超过机械臂舒适范围后，先收回机械臂，再让底盘前进，之后重新计算 CONTACT_PANEL 目标。
 
 ### 收回目标随机化
 
@@ -162,146 +167,96 @@ RESTORE_GRIPPER 与 PUSH_ARM_RETRACT 共用中心目标，坐标为 B2Z1 goal-re
 
 ## 随机化
 
-### 能力模式
+场景、门、机器人初态和收回目标始终按 episode seed 确定性采样。机器人初始采样语义对应前端鱼眼相机的 x/y/yaw，再换算到底盘初态。
 
-`capability` 不启用额外语义目标噪声，但保留场景、门、机器人初态和收回目标的正式随机化。机器人初始采样语义对应前端鱼眼相机的 x/y/yaw，再换算到底盘初态。
+可选的 `SEMANTIC_TARGET_NOISE=1` 在轨迹规划前启用已审核的任务目标随机化：APPROACH 门法向/切向各 `+-3 cm`，推门高度 `+-5 cm`，THROUGH 横向 `+-8 cm`、yaw `+-0.06 rad`。接触敏感的抓取深度、闭合方向和抓取姿态不随机化；预计算轨迹只扰动终点后重新规划，不逐 waypoint 加独立噪声。
 
-### 语义采集模式
-
-`semantic_collection` 在轨迹规划前对任务目标做 episode 级随机化：
-
-| 变量 | 范围 |
-|---|---:|
-| APPROACH 门法向站位 | `+-3 cm` |
-| APPROACH 门切向站位 | `+-3 cm` |
-| 推门接触高度 | `+-5 cm` |
-| THROUGH 横向目标 | `+-8 cm` |
-| THROUGH yaw | `+-0.06 rad` |
-
-接触敏感的抓取深度、夹爪闭合方向和抓取姿态默认不随机化。对预计算轨迹，随机扰动只作用于轨迹终点，随后重新规划整条平滑轨迹，不对每个 waypoint 单独加噪。
-
-### 相机随机化
-
-标准数据采集对每个相机独立采样，并记录实际生效标定：
-
-- 安装位置：半径 `2 cm`；
-- 安装旋转：最大 `15 deg`；
-- fx/fy 共同尺度：`+-8%`；
-- principal point：半径 `5 px`；
-- fisheye k1-k4：相对 `+-10%`；
-- skew 固定为 Isaac Sim 实际支持的 `0`；
-- 标定文件记录渲染器实际采用的参数，而不是请求但未生效的参数。
-
-相机随机化只改变观测，不改变控制场景、物理初态或 seed 对应关系。
+`dual`/`six` 模式按 seed、按相机独立采样安装和标定误差：位置半径 `2 cm`、旋转最大 `15 deg`、fx/fy 共同尺度 `+-8%`、principal point 半径 `5 px`、fisheye k1-k4 相对 `+-10%`。Isaac Sim 不支持的 skew 固定记录为实际值 `0`。相机随机化只改变观测，不得改变控制或物理轨迹。
 
 ## 数据采集
 
-标准采集为被动观察者，不参与 AutoOpen 决策。物理阶段映射为：
+采集器是被动观察者，不参与 AutoOpen 决策。数据阶段唯一由逐帧 FSM 状态映射：`APPROACH` 为 `approach`，`PREGRASP` 至 `RESTORE_GRIPPER` 为 `handle_press`，`ALIGN_PANEL` 至 `THROUGH` 为 `traversal`；末尾连续 50 帧实际稳定状态为 `terminal_hold`。
 
-| 数据阶段 | AutoOpen 阶段 |
-|---|---|
-| `approach` | `APPROACH` |
-| `handle_press` | `PREGRASP` 至 `RESTORE_GRIPPER` |
-| `traversal` | `ALIGN_PANEL` 至 `THROUGH` |
-| `terminal_hold` | `THROUGH` 末尾、转入 `SUCCESS` 前的稳定终止段 |
+控制频率 `50 Hz`，物理频率 `200 Hz`。每个 shard 包含 58 维 observation、25 维 action、完整状态审计、PhysX substep 接触、门资产路径/hash、PhysX/碰撞参数、该 seed 的实际相机标定、机器可读验收报告和中文摘要；视频字段由 `CAMERA_MODE` 决定。
 
-控制频率为 `50 Hz`，物理频率为 `200 Hz`，每个控制帧包含 4 个物理 substep。标准输出包括双相机视频、58 维 observation、25 维 action、完整状态审计、原始接触、门资产路径/hash、PhysX/碰撞参数、实际相机标定、机器可读验收报告和中文验收摘要。
+状态与实采语义一致：B2 线/角速度使用 trunk 坐标系；EE 只使用机械链已有的 `0.100 m` 工具点，不重复偏移；数据集工具姿态去除 URDF gripper-link 固定网格旋转。Cartesian 控制记为 `inactive=0, reset=0`，保持当前关节角为 `inactive=1, reset=0`，运动回 middle preset 为 `inactive=0, reset=1`，到达后恢复 inactive。
 
-状态和 EE 坐标语义与实采数据保持一致：
-
-- 58 维 state 中 `b2_body_v*` 和 `b2_body_w*` 均为同帧 trunk 坐标系速度，不直接写世界系 root 速度；
-- 正式 FK 已包含机械链末端合计 `0.100 m` 的工具点位移，采集器不再二次增加工具偏移；
-- 数据集工具姿态不包含 URDF gripper-link 的固定 `-90 deg` x 轴网格坐标旋转；
-- 实际 EE state、关节目标重算的 control EE，以及 raw audit 的世界系 EE pose 共用同一工具坐标定义。
-
-机械臂监督模式：
-
-- Cartesian 或正常任务控制：`inactive=0, reset=0`；
-- 保持当前关节角：`inactive=1, reset=0`；
-- 正在回到 middle preset：`inactive=0, reset=1`；
-- 已到达 middle preset 并保持：`inactive=1, reset=0`。
-
-终止段的底盘指令必须连续 50 帧严格为零，同时实际系统必须稳定，不能只依赖命令归零。当前实际状态阈值为：底盘线速度 `<0.05 m/s`、底盘角速度 `<0.05 rad/s`、机械臂关节速度 `<0.08 rad/s`、夹爪速度 `<0.05 rad/s`、门速度 `<2 deg/s`。
-
-接触报告区分脚-地面、夹爪-把手、夹爪-门板、门内部接触和异常机器人-环境接触；力、冲量和穿透均来自 PhysX substep 数据。异常接触或超过分类阈值的穿透会进入隔离原因，不能自动判为合格。
-
-当前标准采集烟测位于：
-
-```text
-logs_rl/auto_open_standard_semantics_fixed_20261013
-```
-
-seed 1700 控制成功并通过数据自动验收：`2760` 帧、双相机 `50 Hz`、状态/动作时钟抖动 `0 ns`、非零把手接触 `1820` 行、短时底盘/机械臂目标往返均为 `0`、隔离原因和例外均为空。单 seed 整体采集及验收耗时 `475 s`。
-
-对全部 2760 帧使用正式 FK 和 raw audit 独立复算：control EE 两个兼容字段的最大绝对误差均为 `0`，实际 EE state 最大绝对误差为 `8.94e-8`，B2 机身系线速度和角速度最大绝对误差分别为 `2.89e-8`、`4.57e-8`。末 50 帧实际下发底盘命令为严格 `[0, 0, 0]`，对应机身位移 `6.48 mm`，且实际速度满足终止稳定阈值。
+终止段底盘命令必须连续 50 帧严格为零，且实际底盘、机械臂、夹爪和门速度均满足稳定阈值。接触按脚-地面、夹爪-把手、夹爪-门板、门内部和异常环境接触分类；异常接触或分类穿透超限直接隔离。数据验收不通过即该 episode 不成功，不维护第二套“控制成功率”。
 
 ## GPU 张量运行时
 
-AutoOpen 当前只有一套正式运行时：`TensorDoorFSM`。阶段、阶段步数、稳定窗口、控制状态和阶段间锁存量均为 GPU 常驻张量；每帧按 stage mask 批量生成底盘、Cartesian、关节和夹爪命令，并批量执行验收与阶段转换。
+AutoOpen 只有 `TensorDoorFSM` 一套运行时。阶段、计时、稳定窗口、控制状态和锁存量为 GPU 张量，每帧按 stage mask 批量生成命令并验收；不逐 env 调用 `DoorController.command()/advance()`。稀疏的精确 IK 和路径规划只在阶段边界批量请求。单环境和多环境、无相机和带相机均使用同一 FSM 和同一采集器。
 
-- 运行时不逐 env 调用 `DoorController.command()/advance()`；
-- 常规能力回归不再每帧把完整控制状态复制到 CPU；
-- stage mask 的几何行索引直接保留为 GPU 张量，不做 CPU list 往返；
-- PREGRASP、CENTER_HANDLE、释放/回撤路径、随机收回目标和 CONTACT_PANEL 精确逆映射只在阶段边界形成稀疏批量请求；
-- 单环境标准数据采集仍会将规范要求保存的 observation/action/contact 数据写回主机，这是数据输出，不参与控制决策；
-- 单环境、多环境、视频和数据采集共用同一个 FSM，不存在标量控制分支或引擎选择开关。
+控制、低层策略和 PhysX 物理保持在 GPU。严格数据采集不是纯 GPU 流程：GPU PhysX contact view 在每个 200 Hz 物理子步保存接触张量，控制周期末在 CPU 聚合真实接触并写 Parquet/JSON。当前实现采用以下固定性能约束：
 
-视频 workflow 已用 seed 1700 验证成功，六相机独立视频和 mosaic 均正常写出到 `logs_rl/tensor_fsm_single_runtime_smoke_20261013_seed1700_video`。
+- 整个 USD 场景只遍历一次，统一建立所有环境的 sensor/filter 索引；
+- 接触池容量按环境数配置为每环境 `256` 条，而不是按每个 sensor 重复分配；运行时记录峰值，容量触顶立即失败，不允许静默截断；
+- 每个物理子步只克隆 GPU tensor，不执行逐接触 `.item()`/`.tolist()` 同步；每个 50 Hz 控制周期结束后统一搬运并聚合；
+- 250 个环境的目标 FK 和 joint-mode 每帧只批量计算/读取一次，不逐环境重复执行 float64 FK 或搬运整批 mask；
+- dataset manifest 只引用各 shard 的验收报告，不嵌套复制完整报告。
 
-测试覆盖底盘跟踪张量公式、独立路径索引、推门物理参考点、BASE_ADVANCE 重接触状态传递、PUSH_ARM_RETRACT 姿态渐变、固定入口和阶段契约。当前相关检查为 `28 passed`，Python 编译和 Shell 语法检查通过。
+当前已验证：
 
-## 当前能力基线
+- 一次固定入口调用可将 4 个 seed 分配到 2 张 GPU；每卡只有一个 Isaac Sim 进程、进程内 2 个 vector env，最终聚合得到 4 个不重不漏的 shard；
+- 单进程 2 env 无相机采集能够独立写出两个严格 shard；
+- seed 1717 在 batch=1/env0、batch=2/env0、batch=2/env1 及 GPU0/GPU2/GPU3 上均为完整 `2426` 帧；raw audit 的 `45/45` 字段逐 bit 相同；
+- 当前单环境结果与修改前 partition1 单环境基线同为 `2426` 帧，raw audit 的 `45/45` 字段逐 bit 相同，证明确定性修复没有改变原单环境行为；
+- `none`、`dual`、`six` 的 seed 1717 均为完整 `2426` 帧，raw audit 的 `45/45` 字段逐 bit 相同，证明相机开关不改变控制和物理行为；
+- 2 env 双相机的四路图像均非黑屏，两个 env 的相机世界位姿分别对应各自场景，像素哈希不同；
+- 当前单 env 双相机两路、六相机六路视频均为 `2426` 帧；首帧均非黑屏，模式内像素哈希分别 `2/2`、`6/6` 唯一。
 
-固定口径：`capability`、无相机、四卡、每卡 `250 env`、seed `1700-2699`、每 episode 最多 `4000` 步。
+完整证据目录：
 
-结果目录：
+- batch=1/env0：`logs_rl/invariance_native_math_full_b1_20261015`；
+- batch=2/env0：`logs_rl/invariance_native_math_full_b2_20261015`；
+- batch=2/env1：`logs_rl/invariance_slot1_full_20261015`；
+- GPU3：`logs_rl/invariance_gpu3_full_20261015`；
+- dual/six：`logs_rl/invariance_current_dual_20261015`、`logs_rl/invariance_current_six_20261015`。
+
+## 基线状态
+
+当前无图像严格数据基线由唯一入口、四张 GPU、seed `1700–2699` 生成：
 
 ```text
-logs_rl/fsm_tensor_1000_slew_final_20261013
+CAMERA_MODE=none
+SEMANTIC_TARGET_NOISE=0
+NUM_EPISODES=1000
+MAX_STEPS=4000
 ```
 
-总体结果：
+结果目录：`logs_rl/auto_open_damping_half_1000_noimage_gpu_fixed_20261015`
 
-- 成功：`918/1000`；
-- 成功率：`91.8%`；
-- 总耗时：`1189 s`；
-- metadata：`1000/1000`，seed `1700-2699`，无缺失或重复；
-- 四个 rank：`231/250`、`229/250`、`230/250`、`228/250`。
-
-失败阶段分布：
-
-| 失败阶段 | 数量 |
+| 指标 | 结果 |
 |---|---:|
-| `CONTACT_PANEL` | 18 |
-| `PUSH_OPEN` | 18 |
-| `APPROACH` | 12 |
-| `GRASP_HANDLE` | 10 |
-| `BASE_ADVANCE` | 4 |
-| `PUSH_ARM_RETRACT` | 2 |
+| 请求/完成 | 1000/1000 |
+| 严格数据验收通过 | 696/1000（69.6%） |
+| 严格数据验收失败 | 304/1000 |
+| 墙钟耗时 | 2676 s（44.6 min） |
+| 四 rank 控制完成数 | 216 / 217 / 208 / 200 |
+| 总数据帧 | 2,451,850 |
+
+数据验收失败即失败。下表按每个失败 episode 的首个阻塞原因唯一归类，合计 304：
+
+| 首要失败类别 | 数量 |
+|---|---:|
+| 异常环境/阶段外接触 | 81 |
+| `TURN_HANDLE` | 50 |
+| 接触穿透超限 | 37 |
+| `PUSH_OPEN` | 24 |
+| 机械臂目标短时往返 | 23 |
+| `GRASP_HANDLE` | 22 |
+| 底盘命令短时往返 | 14 |
+| `APPROACH` | 11 |
+| `CONTACT_PANEL` | 10 |
+| handle_press 期间底盘移动 | 10 |
+| `PREGRASP` | 9 |
 | `OPEN_GRIPPER` | 4 |
-| `THROUGH` | 2 |
-| `PREGRASP` | 3 |
-| `TURN_HANDLE` | 3 |
-| `ALIGN_PANEL` | 2 |
-| `CENTER_HANDLE` | 2 |
-| `RESTORE_GRIPPER` | 2 |
+| `BASE_ADVANCE` | 3 |
+| Stage2 入口 q5 不连续 | 2 |
+| `OPEN_AND_CLEAR` | 2 |
+| `PUSH_ARM_RETRACT` | 1 |
+| 穿越前 q6 未回正 | 1 |
 
-同口径迁移前验收值为 `916/1000、1865 s`。当前成功率提高 `0.2` 个百分点；同 seed 中共同成功 `872`，迁移前独有成功 `44`，当前独有成功 `46`，净增 `2`。总耗时减少 `676 s`，即 `36.2%`。
+四个 rank 的最慢项范围为：严格接触/状态补全 `1069–1113 s`，阶段边界精确规划 `582–603 s`，GPU 策略与物理 `314–350 s`，逐帧采集准备 `256–266 s`，最终 shard 写盘 `154–156 s`。因此当前 44.6 分钟不能表述为“纯 GPU 耗时”：控制与物理是 GPU 张量化的，剩余主要成本来自完整严格接触审计、精确规划和数据落盘。
 
-## 当前性能
-
-四个 rank 的时间范围：
-
-| 分项 | 当前 Tensor FSM | 迁移前标量运行时 |
-|---|---:|---:|
-| `command` | `72.5-76.9 s` | `762.4-777.0 s` |
-| `advance` | `28.4-29.9 s` | `485.8-492.3 s` |
-| 每帧完整状态回传 | `0 s` | `60.8-63.0 s` |
-| policy + physics | `287.0-304.7 s` | `291.0-312.4 s` |
-| 稀疏规划 | `656.9-695.3 s` | 约 `252-262 s` |
-
-上层 FSM 的目标瓶颈已消除：`command/advance` 合计从每 rank 约 `1250 s` 降至约 `101-107 s`。当前最大耗时项转移为阶段边界的精确 IK/路径规划服务；它不在逐帧 FSM 内，但后续若继续提速，应针对该批量服务本身，不应修改控制阈值或物理语义。
-
-## 输出与验收边界
-
-能力回归每个 seed 写出 `metadata.json`，每个 rank 写出 `summary.json`，固定入口写出 `launcher_status.txt` 并检查 seed 缺失、重复及 rank 异常。任何后续控制语义修改都必须使用相同 seed、相同 4000 步预算和唯一固定入口重新验收。
+与同一代码语义下的未优化严格采集相比，控制结果和严格通过数保持不变，接触审计逐值等价；当前 manifest 为约 `200 KB`，不再把每个 shard 报告重复嵌套到数 GB。seed 1700 的完整 `raw_audit` 与 `raw_contacts` 已同优化前逐表逐值一致，1700–1703 的非接触状态/动作、帧数和控制结果逐值一致。

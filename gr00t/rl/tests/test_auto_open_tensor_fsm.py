@@ -2,12 +2,15 @@ import math
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 import torch
 
 from gr00t.rl.auto_open.tensor_fsm import (
     PaddedPathBank,
+    TensorCommandBuffers,
     TensorDoorFSM,
     _quat_distance,
+    _slew_quaternion,
     track_base_pose,
 )
 
@@ -42,18 +45,15 @@ def _numpy_reference(
     planar_norm = np.linalg.norm(command[:, :2], axis=-1, keepdims=True)
     command[:, :2] *= np.minimum(1.0, 0.4 / np.maximum(planar_norm, 1.0e-8))
     command[:, 2] = np.clip(command[:, 2], -0.6, 0.6)
-    command_distance = np.linalg.norm(error, axis=-1)
     planar_norm = np.linalg.norm(command[:, :2], axis=-1)
     deadzone = (
-        (command_distance > 0.08)
-        & (planar_norm > 1.0e-6)
+        (planar_norm > 1.0e-6)
         & (planar_norm < 0.15)
         & ((command[:, 0] * local_x + command[:, 1] * local_y) > 0.0)
     )
     command[deadzone, :2] *= (0.15 / planar_norm[deadzone])[:, None]
     yaw_deadzone = (
-        (np.abs(yaw_error) > 0.08)
-        & (np.abs(command[:, 2]) > 1.0e-6)
+        (np.abs(command[:, 2]) > 1.0e-6)
         & (np.abs(command[:, 2]) < 0.2)
         & ((command[:, 2] * yaw_error) > 0.0)
     )
@@ -98,6 +98,52 @@ def test_gpu_base_tracking_matches_reference_batch():
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_quaternion_and_base_control_are_exactly_independent_of_batch_shape():
+    generator = torch.Generator(device="cuda").manual_seed(941)
+    current = torch.randn((1, 4), generator=generator, device="cuda")
+    target = torch.randn((1, 4), generator=generator, device="cuda")
+    extra_current = torch.randn((7, 4), generator=generator, device="cuda")
+    extra_target = torch.randn((7, 4), generator=generator, device="cuda")
+    batch_current = torch.cat((current, extra_current), dim=0)
+    batch_target = torch.cat((target, extra_target), dim=0)
+
+    assert torch.equal(
+        _slew_quaternion(current, target)[0],
+        _slew_quaternion(batch_current, batch_target)[0],
+    )
+    assert torch.equal(
+        _quat_distance(current, target)[0],
+        _quat_distance(batch_current, batch_target)[0],
+    )
+
+    root = torch.randn((1, 13), generator=generator, device="cuda")
+    root[:, 3:7] = current
+    command_xy = torch.randn((1, 2), generator=generator, device="cuda")
+    command_yaw = torch.randn((1,), generator=generator, device="cuda")
+    acceptance_xy = torch.randn((1, 2), generator=generator, device="cuda")
+    acceptance_yaw = torch.randn((1,), generator=generator, device="cuda")
+    repeats = 8
+    single = track_base_pose(
+        root,
+        command_xy,
+        command_yaw,
+        acceptance_xy,
+        acceptance_yaw,
+        minimum_speed_toward_target_only=False,
+    )
+    batched = track_base_pose(
+        root.repeat(repeats, 1),
+        command_xy.repeat(repeats, 1),
+        command_yaw.repeat(repeats),
+        acceptance_xy.repeat(repeats, 1),
+        acceptance_yaw.repeat(repeats),
+        minimum_speed_toward_target_only=False,
+    )
+    for single_value, batched_value in zip(single, batched, strict=True):
+        assert torch.equal(single_value[0], batched_value[0])
+
+
 def test_padded_path_bank_advances_rows_independently():
     bank = PaddedPathBank(3, 8, "cpu")
     bank.install(
@@ -117,8 +163,42 @@ def test_padded_path_bank_advances_rows_independently():
     assert bank.complete(rows).tolist() == [True, True]
 
 
+def test_command_buffers_use_arm_mode_transition_api():
+    env = SimpleNamespace(
+        teleop_raw_commands=torch.zeros((3, 3)),
+        teleop_raw_ee_goal_cart=torch.zeros((3, 3)),
+        teleop_raw_ee_goal_orn_delta_rpy=torch.zeros((3, 3)),
+        gripper_pos_targets=torch.zeros((3, 1)),
+        teleop_world_ee_goal_orn_quat=torch.zeros((3, 4)),
+        teleop_world_ee_goal_orn_quat_enabled=torch.zeros(3, dtype=torch.bool),
+        teleop_arm_joint_pos_targets=torch.zeros((3, 6)),
+        teleop_arm_joint_control_mask=torch.tensor([True, False, True]),
+        _teleop_inputs_dirty=False,
+    )
+    transitions = []
+
+    def set_mode(mode, rows):
+        rows = torch.as_tensor(rows, dtype=torch.int64)
+        transitions.append((mode, rows.tolist()))
+        env.teleop_arm_joint_control_mask[rows] = mode == "joint"
+
+    env._set_teleop_arm_control_mode = set_mode
+    buffers = TensorCommandBuffers.from_env(env)
+    buffers.arm_joint_mode[:] = torch.tensor([False, True, True])
+    buffers.arm_joint[:] = 0.25
+
+    buffers.flush(env)
+
+    assert transitions == [("joint", [1]), ("ee", [0])]
+    assert env.teleop_arm_joint_control_mask.tolist() == [False, True, True]
+    torch.testing.assert_close(
+        env.teleop_arm_joint_pos_targets, torch.full((3, 6), 0.25)
+    )
+
+
 def test_push_arc_latches_physical_contact_not_inverse_command():
     fsm = TensorDoorFSM.__new__(TensorDoorFSM)
+    fsm.device = torch.device("cpu")
     fsm.Stage = SimpleNamespace(PUSH_OPEN=13)
     fsm.stage = torch.tensor([12], dtype=torch.int64)
     fsm.stage_steps = torch.zeros(1, dtype=torch.int32)
@@ -166,6 +246,14 @@ def test_base_advance_reentry_preserves_contact_seed_and_actual_ee_origin():
     fsm.stage = torch.tensor([15], dtype=torch.int64)
     fsm.stage_steps = torch.tensor([23], dtype=torch.int32)
     fsm.push_recovery_settle_steps = torch.tensor([10], dtype=torch.int32)
+    fsm.base_arrival_confirmed = torch.ones(1, dtype=torch.bool)
+    fsm.base_arrival_settle_steps = torch.full((1,), 25, dtype=torch.int32)
+    fsm.base_arrival_max_settle_steps = torch.full((1,), 25, dtype=torch.int32)
+    fsm.base_arrival_inner_distance = torch.zeros(1)
+    fsm.base_arrival_outer_distance = torch.zeros(1)
+    fsm.base_arrival_inner_yaw = torch.zeros(1)
+    fsm.base_arrival_outer_yaw = torch.zeros(1)
+    fsm.base_arrival_required_frames = torch.zeros(1, dtype=torch.int32)
     fsm.hinge_idx = 0
     fsm.hinge_axis_sign = torch.ones(1)
     fsm.push_start_hinge_angle = torch.zeros(1)
@@ -233,6 +321,7 @@ def test_push_retract_slews_orientation_instead_of_jumping_to_endpoint():
 
 def test_terminal_hold_dispatches_exact_zero_after_reversal_filter():
     fsm = TensorDoorFSM.__new__(TensorDoorFSM)
+    fsm.device = torch.device("cpu")
     fsm.Stage = SimpleNamespace(THROUGH=16, SUCCESS=17)
     fsm.stage = torch.tensor([16], dtype=torch.int64)
     fsm.through_command_xy = torch.zeros((1, 2))
@@ -240,6 +329,16 @@ def test_terminal_hold_dispatches_exact_zero_after_reversal_filter():
     fsm.through_station_xy = torch.zeros((1, 2))
     fsm.through_station_yaw = torch.zeros(1)
     fsm.through_stop_latched = torch.zeros(1, dtype=torch.bool)
+    fsm.base_arrival_confirmed = torch.ones(1, dtype=torch.bool)
+    fsm.base_arrival_settle_steps = torch.full((1,), 25, dtype=torch.int32)
+    fsm.base_arrival_max_settle_steps = torch.zeros(1, dtype=torch.int32)
+    fsm.base_arrival_required_frames = torch.full((1,), 25, dtype=torch.int32)
+    fsm.base_arrival_inner_distance = torch.full((1,), 0.08)
+    fsm.base_arrival_outer_distance = torch.full((1,), 0.30)
+    fsm.base_arrival_inner_yaw = torch.full((1,), 0.08)
+    fsm.base_arrival_outer_yaw = torch.full((1,), 0.20)
+    fsm.initial_door_root = torch.tensor([[-1.284, 0.0, 0.0]])
+    fsm.door_forward = torch.tensor([[1.0, 0.0, 0.0]])
     fsm.through_motion_ready = torch.ones(1, dtype=torch.bool)
     fsm.base_command_previous = torch.tensor([[0.2, -0.2, 0.2]])
     fsm.base_reversal_pending_sign = torch.zeros((1, 3), dtype=torch.int8)

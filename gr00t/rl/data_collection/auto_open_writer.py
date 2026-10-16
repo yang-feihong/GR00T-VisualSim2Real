@@ -27,6 +27,7 @@ from .auto_open_standard import (
     TERMINAL_GRIPPER_SPEED_RAD_S,
     TERMINAL_STABILITY_FRAMES,
     derive_stage_boundaries,
+    camera_streams_for_mode,
 )
 
 
@@ -62,6 +63,25 @@ DATASET_IMAGE_TRANSFORMS = {
         ],
     },
 }
+
+
+def _camera_layout(camera_mode: str):
+    streams = camera_streams_for_mode(camera_mode)
+    keys = tuple(stream["key"] for stream in streams.values())
+    shapes = {stream["key"]: tuple(stream["shape"]) for stream in streams.values()}
+    transforms = {
+        stream["key"]: {
+            "source_camera_name": source_name,
+            "source_shape_hwc": list(stream["source_shape"]),
+            "dataset_shape_hwc": list(stream["shape"]),
+            "operation": stream["transform"],
+            "source_to_dataset_pixel_homography": [
+                list(row) for row in stream["source_to_dataset_pixel_homography"]
+            ],
+        }
+        for source_name, stream in streams.items()
+    }
+    return keys, shapes, transforms
 
 ROUND_TRIP_WINDOW_FRAMES = 5
 BASE_ROUND_TRIP_JUMP = 0.15
@@ -552,16 +572,17 @@ def _physical_acceptance_reasons(episode, boundary):
     sim_time_ns = np.asarray(audit["sim_time_ns"], dtype=np.int64)
     if sim_time_ns.shape != (frames,) or not np.array_equal(sim_time_ns, expected_ns):
         reasons.append("invalid_50hz_sim_timestamps")
-    base_camera_ns = np.asarray(audit["base_image_capture_time_ns"], dtype=np.int64)
-    wrist_camera_ns = np.asarray(audit["wrist_image_capture_time_ns"], dtype=np.int64)
-    if (
-        base_camera_ns.shape != (frames,)
-        or wrist_camera_ns.shape != (frames,)
-        or np.any(np.abs(base_camera_ns - expected_ns) > 10_000_000)
-        or np.any(np.abs(wrist_camera_ns - expected_ns) > 10_000_000)
-        or np.any(np.abs(base_camera_ns - wrist_camera_ns) > 10_000_000)
-    ):
-        reasons.append("camera_timestamps_outside_10ms_tolerance")
+    if bool(episode.provenance.get("images_enabled", True)):
+        base_camera_ns = np.asarray(audit["base_image_capture_time_ns"], dtype=np.int64)
+        wrist_camera_ns = np.asarray(audit["wrist_image_capture_time_ns"], dtype=np.int64)
+        if (
+            base_camera_ns.shape != (frames,)
+            or wrist_camera_ns.shape != (frames,)
+            or np.any(np.abs(base_camera_ns - expected_ns) > 10_000_000)
+            or np.any(np.abs(wrist_camera_ns - expected_ns) > 10_000_000)
+            or np.any(np.abs(base_camera_ns - wrist_camera_ns) > 10_000_000)
+        ):
+            reasons.append("camera_timestamps_outside_10ms_tolerance")
 
     action = np.asarray(episode.action, dtype=np.float32)
     stages = np.asarray(audit["autoopen_stage"], dtype=str)
@@ -975,7 +996,7 @@ def _episode_acceptance_metrics(episode, boundary, reasons):
 
 
 class AutoOpenDatasetWriter:
-    """Write independently collected episodes without touching AutoOpen control."""
+    """Write collected episodes without touching AutoOpen control."""
 
     def __init__(self, root: Path, *, camera_calibration, simulation_provenance):
         self.root = Path(root)
@@ -989,9 +1010,11 @@ class AutoOpenDatasetWriter:
             self.simulation_provenance["renderer_runtime_camera_config_id"] = str(
                 renderer_config_id
             )
-        self.camera_calibration["dataset_image_transforms"] = (
-            DATASET_IMAGE_TRANSFORMS
+        self.camera_mode = str(self.simulation_provenance.get("camera_mode", "dual"))
+        self.camera_keys, self.camera_shapes, image_transforms = _camera_layout(
+            self.camera_mode
         )
+        self.camera_calibration["dataset_image_transforms"] = image_transforms
         calibration_payload = json.dumps(
             self.camera_calibration,
             ensure_ascii=True,
@@ -1060,7 +1083,14 @@ class AutoOpenDatasetWriter:
             if not np.array_equal(action[:, 5:14], action[:, 16:25]):
                 reasons.append("control_ee_alias_mismatch")
         use_staged_videos = bool(episode.staged_videos)
-        for key in CAMERA_KEYS:
+        images_enabled = bool(episode.provenance.get("images_enabled", True))
+        camera_mode = str(episode.provenance.get("camera_mode", self.camera_mode))
+        camera_keys, camera_shapes, _ = _camera_layout(camera_mode)
+        if camera_mode != self.camera_mode:
+            reasons.append(
+                f"camera_mode_mismatch:{camera_mode}:{self.camera_mode}"
+            )
+        for key in camera_keys if images_enabled else ():
             if use_staged_videos:
                 count = int(episode.image_frame_counts.get(key, -1))
                 path = episode.staged_videos.get(key)
@@ -1070,7 +1100,7 @@ class AutoOpenDatasetWriter:
                     reasons.append(f"camera_frame_count:{key}:{count}:{frames}")
                 else:
                     try:
-                        _verify_video(Path(path), CAMERA_SHAPES[key], frames)
+                        _verify_video(Path(path), camera_shapes[key], frames)
                     except (RuntimeError, ValueError) as exc:
                         reasons.append(f"camera_video_invalid:{key}:{exc}")
             elif key not in episode.images:
@@ -1099,6 +1129,9 @@ class AutoOpenDatasetWriter:
                 & (np.abs(hinge_velocity) < TERMINAL_DOOR_SPEED_RAD_S)
             )
             boundary = derive_stage_boundaries(
+                autoopen_stages=np.asarray(
+                    episode.raw_audit.get("autoopen_stage", ()), dtype=object
+                ),
                 base_commands=action[:, :3],
                 arm_teleop_inactive=action[:, 3].astype(bool),
                 arm_reset=action[:, 4].astype(bool),
@@ -1132,7 +1165,7 @@ class AutoOpenDatasetWriter:
             raw_root / "raw_contacts" / chunk_name / f"{episode_name}.parquet",
             episode.raw_contacts,
         )
-        for key in CAMERA_KEYS:
+        for key in camera_keys if images_enabled else ():
             destination = raw_root / "videos" / key / chunk_name / f"{episode_name}.mp4"
             destination.parent.mkdir(parents=True, exist_ok=True)
             if use_staged_videos:
@@ -1143,7 +1176,7 @@ class AutoOpenDatasetWriter:
                 _encode_and_verify_video(
                     destination,
                     episode.images[key],
-                    CAMERA_SHAPES[key],
+                    camera_shapes[key],
                 )
         if reasons:
             self.quarantined.append(
@@ -1230,9 +1263,14 @@ class AutoOpenDatasetWriter:
                 "shape": [25],
                 "names": list(ACTION_NAMES),
             },
-            CAMERA_KEYS[0]: {"dtype": "video", "shape": [640, 480, 3]},
-            CAMERA_KEYS[1]: {"dtype": "video", "shape": [480, 640, 3]},
         }
+        if self.camera_mode != "none":
+            features.update(
+                {
+                    key: {"dtype": "video", "shape": list(shape)}
+                    for key, shape in self.camera_shapes.items()
+                }
+            )
         _json_dump(
             meta / "info.json",
             {
@@ -1324,7 +1362,7 @@ def aggregate_standard_shards(
     camera_principal_point_noise_px: float = 0.0,
     camera_distortion_noise_fraction: float = 0.0,
 ):
-    """Write dataset-level delivery reports for independently collected shards."""
+    """Write dataset-level delivery reports for per-episode shards."""
     root = Path(root)
     shard_rows = []
     episode_rows = []
@@ -1342,7 +1380,12 @@ def aggregate_standard_shards(
         if len(episodes) != 1 or int(episodes[0].get("seed", -1)) != int(seed):
             raise ValueError(f"shard report does not uniquely describe seed {seed}")
         shard_rows.append(
-            {"name": name, "path": f"shards/{name}", "acceptance": report}
+            {
+                "name": name,
+                "path": f"shards/{name}",
+                "acceptance_report": f"shards/{name}/meta/acceptance_report.json",
+                "accepted": bool(episodes[0].get("accepted")),
+            }
         )
         episode_rows.extend(episodes)
         quarantine.extend(report.get("quarantine", []))

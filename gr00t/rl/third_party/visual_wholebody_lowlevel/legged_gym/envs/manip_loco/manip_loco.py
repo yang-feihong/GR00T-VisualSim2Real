@@ -8,6 +8,11 @@ from .gripper_control import advance_gripper_actuator_targets
 from typing import Tuple
 from legged_gym.utils.math import orientation_error
 from legged_gym.utils.constrained_ik import batched_constrained_dls_delta
+from legged_gym.utils.batch_invariant_math import (
+    fixed_mean,
+    fixed_norm,
+    fixed_normalize,
+)
 from legged_gym.utils.isaaclab_math import (
     quat_rotate_inverse,
     quat_apply,
@@ -59,7 +64,7 @@ def sphere2cart(sphere: torch.Tensor) -> torch.Tensor:
 def cart2sphere(cart: torch.Tensor) -> torch.Tensor:
     """ManipLoco cartesian convention: [x, y, z] -> [radius, pitch, yaw]."""
     x, y, z = cart.unbind(-1)
-    radius = torch.linalg.norm(cart, dim=-1).clamp_min(1e-8)
+    radius = fixed_norm(cart).clamp_min(1e-8)
     pitch = torch.asin(torch.clamp(z / radius, -1.0, 1.0))
     yaw = torch.atan2(y, x)
     return torch.stack([radius, pitch, yaw], dim=-1)
@@ -657,7 +662,7 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
                 raise ValueError(
                     f"ee_goal_orn_quat_world must have shape {expected}, got {tuple(quat.shape)}"
                 )
-            quat = quat / torch.linalg.vector_norm(quat, dim=-1, keepdim=True).clamp_min(1.0e-8)
+            quat = fixed_normalize(quat, eps=1.0e-8)
             self.teleop_world_ee_goal_orn_quat.copy_(quat)
             if ee_goal_orn_quat_world_enabled is None:
                 self.teleop_world_ee_goal_orn_quat_enabled[:] = True
@@ -689,9 +694,7 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
                 force_matrix = getattr(sensor.data, "force_matrix_w", None)
                 if force_matrix is None or force_matrix.shape[1:3] != (1, 1):
                     break
-                finger_forces[:, finger_idx] = torch.linalg.vector_norm(
-                    force_matrix[:, 0, 0], dim=-1
-                )
+                finger_forces[:, finger_idx] = fixed_norm(force_matrix[:, 0, 0])
         self.gripper_actuator_targets, self.gripper_contact_hold_active = (
             advance_gripper_actuator_targets(
                 self.gripper_pos_targets,
@@ -745,7 +748,7 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
             valid_contact_body_ids = [idx for idx in contact_body_ids if idx < contact_forces_w.shape[1]]
             if valid_contact_body_ids:
                 candidates = contact_forces_w[:, valid_contact_body_ids, :]
-                best = torch.linalg.vector_norm(candidates, dim=-1).argmax(dim=1)
+                best = fixed_norm(candidates).argmax(dim=1)
                 gripper_contact_force_w = candidates[
                     torch.arange(self.num_envs, device=self.device), best
                 ]
@@ -802,12 +805,14 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
             ).detach().clone(),
             "applied_torque": self.torques.detach().clone(),
             "ee_jacobian_arm": None if self.ee_j_eef is None else self.ee_j_eef.detach().clone(),
-            "gripper_position": self.dof_pos[:, self.gripper_joint_ids].mean(
-                dim=1, keepdim=True
+            "gripper_position": fixed_mean(
+                self.dof_pos[:, self.gripper_joint_ids], dim=1, keepdim=True
             ).detach().clone(),
-            "gripper_command": self.gripper_pos_targets.mean(dim=1, keepdim=True).detach().clone(),
-            "gripper_actuator_target": self.gripper_actuator_targets.mean(
-                dim=1, keepdim=True
+            "gripper_command": fixed_mean(
+                self.gripper_pos_targets, dim=1, keepdim=True
+            ).detach().clone(),
+            "gripper_actuator_target": fixed_mean(
+                self.gripper_actuator_targets, dim=1, keepdim=True
             ).detach().clone(),
             # Net contact force on the robot bodies.  The scripted DoorMan
             # controller uses this as physical evidence before turning the
@@ -976,9 +981,7 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         goal_ref_origin = self.get_goal_reference_origin()[env_ids]
         goal_ref_quat = self.get_goal_reference_quat()[env_ids]
         goal_center_offset = self.get_goal_center_offset_local()[env_ids]
-        ee_orn_normalized = self.ee_orn[env_ids] / torch.norm(
-            self.ee_orn[env_ids], dim=-1, keepdim=True
-        ).clamp_min(1e-8)
+        ee_orn_normalized = fixed_normalize(self.ee_orn[env_ids], eps=1e-8)
 
         ee_goal_local_with_center = quat_rotate_inverse(
             goal_ref_quat, self.ee_pos[env_ids] - goal_ref_origin
@@ -1506,7 +1509,7 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
             return self.target_pos[:, self.arm_joint_ids]
 
         dpos = self.curr_ee_goal_cart_world - self.ee_pos
-        ee_orn_norm = self.ee_orn / torch.norm(self.ee_orn, dim=-1, keepdim=True).clamp_min(1e-8)
+        ee_orn_norm = fixed_normalize(self.ee_orn, eps=1e-8)
         drot = orientation_error(self.ee_goal_orn_quat, ee_orn_norm)
         if self.teleop_mode:
             orientation_gain = float(
@@ -1836,12 +1839,19 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         images_by_name = {}
         selected_names = set(rig_names) if rig_names is not None else None
 
+        for rig_name, rig in self._rgb_camera_rigs.items():
+            if selected_names is None or rig_name in selected_names:
+                self._activate_rgb_camera_env(rig, env_id)
+
         if update:
             for rig_name, rig in self._rgb_camera_rigs.items():
                 if selected_names is not None and rig_name not in selected_names:
                     continue
                 if bool(rig.get("pose_update", True)):
                     self._update_rgb_camera_world_poses(rig, env_id)
+            # Camera rigs are render-only sidecars outside the vectorized
+            # scene.  Flush their USD xforms into Fabric before RTX renders.
+            self.sim.forward()
             self.sim.render()
             self.sim.render()
 
@@ -1868,12 +1878,12 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
                         self._apply_rgb_camera_valid_circle_mask(eye_images["right"], rig),
                     ]
             elif rig["mode"] == "mono":
-                mono_rgb = self._camera_rgb_to_numpy(cameras["mono"], env_id, update=update)
+                mono_rgb = self._camera_rgb_to_numpy(cameras["mono"], 0, update=update)
                 if mono_rgb is not None:
                     images_by_name[rig_name] = [self._apply_rgb_camera_valid_circle_mask(mono_rgb, rig)]
             else:
-                left_rgb = self._camera_rgb_to_numpy(cameras["left"], env_id, update=update)
-                right_rgb = self._camera_rgb_to_numpy(cameras["right"], env_id, update=update)
+                left_rgb = self._camera_rgb_to_numpy(cameras["left"], 0, update=update)
+                right_rgb = self._camera_rgb_to_numpy(cameras["right"], 0, update=update)
                 if left_rgb is not None and right_rgb is not None:
                     images_by_name[rig_name] = [
                         self._apply_rgb_camera_valid_circle_mask(left_rgb, rig),

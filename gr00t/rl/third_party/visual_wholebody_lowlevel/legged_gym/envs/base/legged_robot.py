@@ -15,7 +15,11 @@ from legged_gym.utils.door_diagnostic_camera import (
     closed_leaf_pose,
     infer_push_side_leaf,
 )
-from legged_gym.utils.episode_rng import canonical_env_origins, episode_uniform_rows
+from legged_gym.utils.episode_rng import (
+    canonical_env_origins,
+    canonical_env_origins_for_seeds,
+    episode_uniform_rows,
+)
 from .legged_robot_config import LeggedRobotIsaacLabCfg
 import numpy as np
 
@@ -534,13 +538,22 @@ class LeggedRobotIsaacLab(DirectRLEnv):
 
         from pxr import Gf, UsdGeom
 
-        origins = canonical_env_origins(
-            int(getattr(self.cfg, "seed", 0) or 0),
-            self.scene.cfg.num_envs,
-            self.scene.cfg.env_spacing,
-            device=self.device,
-            dtype=torch.float32,
-        )
+        episode_seeds = getattr(self.cfg, "doorman_episode_seeds", None)
+        if episode_seeds is None:
+            origins = canonical_env_origins(
+                int(getattr(self.cfg, "seed", 0) or 0),
+                self.scene.cfg.num_envs,
+                self.scene.cfg.env_spacing,
+                device=self.device,
+                dtype=torch.float32,
+            )
+        else:
+            origins = canonical_env_origins_for_seeds(
+                episode_seeds,
+                self.scene.cfg.env_spacing,
+                device=self.device,
+                dtype=torch.float32,
+            )
         stage = sim_utils.get_current_stage()
         for env_id, origin in enumerate(origins.cpu().tolist()):
             prim_path = self.scene.env_prim_paths[env_id]
@@ -882,7 +895,8 @@ class LeggedRobotIsaacLab(DirectRLEnv):
             ),
         )
         tiled_camera = tiled_camera_cls(tiled_camera_cfg)
-        self.scene.sensors["rgb_cameras_tiled"] = tiled_camera
+        # This is a shared render sidecar, not a vectorized scene sensor.  It
+        # is updated explicitly by render_stereo_rgb_camera_rigs().
 
         sensor_index = 0
         for mount_name, camera_mode, body_name, eye_defs, valid_circle_mask in rig_defs:
@@ -950,44 +964,65 @@ class LeggedRobotIsaacLab(DirectRLEnv):
 
             camera_spawn_cfg = self._rgb_camera_spawn_config(spec, horizontal_aperture, focal_length)
 
-            rig_cameras = {}
-            for eye_def in eye_defs:
-                camera_cfg = CameraCfg(
-                    prim_path=f"/World/RGBCameras/{eye_def['sensor_name']}",
-                    update_period=float(self.cfg.rgb_camera_update_period_s),
-                    height=int(spec["height"]),
-                    width=int(spec["width"]),
-                    data_types=["rgb"],
-                    update_latest_camera_pose=True,
-                    spawn=camera_spawn_cfg,
-                    offset=CameraCfg.OffsetCfg(
-                        pos=eye_def["local_pos"],
-                        rot=eye_def["local_quat"],
-                        convention="world",
-                    ),
-                )
-                camera = Camera(camera_cfg)
-                effective_calibration = self._apply_rgb_camera_lens_calibration(
-                    camera_cfg.prim_path, spec
-                )
-                diagnostic = spec.get("door_diagnostic")
-                if diagnostic and float(diagnostic["fill_light_intensity"]) > 0.0:
-                    light_cfg = sim_utils.SphereLightCfg(
-                        intensity=float(diagnostic["fill_light_intensity"]),
-                        radius=float(diagnostic["fill_light_radius_m"]),
-                        color=(1.0, 0.96, 0.90),
+            cameras_by_env = []
+            eyes_by_env = []
+            effective_calibration = None
+            for env_id in range(int(self.num_envs)):
+                rig_cameras = {}
+                rig_eyes = []
+                for index, eye_def in enumerate(eye_defs):
+                    prim_path = (
+                        f"/World/RGBCameras/env_{env_id}/"
+                        f"{eye_def['sensor_name']}"
                     )
-                    light_cfg.func(
-                        f"{camera_cfg.prim_path}/FillLight",
-                        light_cfg,
-                        translation=(
-                            0.0,
-                            float(diagnostic["fill_light_right_offset_m"]),
-                            float(diagnostic["fill_light_up_offset_m"]),
+                    camera_cfg = CameraCfg(
+                        prim_path=prim_path,
+                        update_period=float(self.cfg.rgb_camera_update_period_s),
+                        height=int(spec["height"]),
+                        width=int(spec["width"]),
+                        data_types=["rgb"],
+                        update_latest_camera_pose=True,
+                        spawn=camera_spawn_cfg,
+                        offset=CameraCfg.OffsetCfg(
+                            pos=eye_def["local_pos"],
+                            rot=eye_def["local_quat"],
+                            convention="world",
                         ),
                     )
-                self.scene.sensors[eye_def["sensor_name"]] = camera
-                rig_cameras[eye_def["eye_name"]] = camera
+                    camera = Camera(camera_cfg)
+                    effective_calibration = self._apply_rgb_camera_lens_calibration(
+                        camera_cfg.prim_path, spec
+                    )
+                    diagnostic = spec.get("door_diagnostic")
+                    if diagnostic and float(diagnostic["fill_light_intensity"]) > 0.0:
+                        light_cfg = sim_utils.SphereLightCfg(
+                            intensity=float(diagnostic["fill_light_intensity"]),
+                            radius=float(diagnostic["fill_light_radius_m"]),
+                            color=(1.0, 0.96, 0.90),
+                        )
+                        light_cfg.func(
+                            f"{camera_cfg.prim_path}/FillLight",
+                            light_cfg,
+                            translation=(
+                                0.0,
+                                float(diagnostic["fill_light_right_offset_m"]),
+                                float(diagnostic["fill_light_up_offset_m"]),
+                            ),
+                        )
+                    rig_cameras[eye_def["eye_name"]] = camera
+                    rig_eyes.append(
+                        {
+                            "name": eye_def["eye_name"],
+                            "local_pos": eye_def["local_pos"],
+                            "local_quat": eye_def["local_quat"],
+                            "local_pos_np": np.asarray(eye_def["local_pos"], dtype=np.float32),
+                            "local_quat_np": np.asarray(eye_def["local_quat"], dtype=np.float32),
+                            "sensor_index": index,
+                            "prim_path": prim_path,
+                        }
+                    )
+                cameras_by_env.append(rig_cameras)
+                eyes_by_env.append(rig_eyes)
             resolved_backend = "camera"
 
             self._rgb_camera_rigs[mount_name] = {
@@ -998,24 +1033,65 @@ class LeggedRobotIsaacLab(DirectRLEnv):
                 "pose_update": True,
                 "door_diagnostic": spec.get("door_diagnostic"),
                 "valid_circle_mask": spec.get("valid_circle_mask"),
-                "cameras": rig_cameras,
+                "cameras": cameras_by_env[0],
+                "cameras_by_env": cameras_by_env,
                 "effective_calibration": effective_calibration,
-                "eyes": [
-                    {
-                        "name": eye_def["eye_name"],
-                        "local_pos": eye_def["local_pos"],
-                        "local_quat": eye_def["local_quat"],
-                        "local_pos_np": np.asarray(eye_def["local_pos"], dtype=np.float32),
-                        "local_quat_np": np.asarray(eye_def["local_quat"], dtype=np.float32),
-                        "sensor_index": index,
-                    }
-                    for index, eye_def in enumerate(eye_defs)
-                ],
+                "eyes": eyes_by_env[0],
+                "eyes_by_env": eyes_by_env,
             }
             print(
                 f"[rgb_camera] registered {camera_mode} rig {mount_name!r} "
                 f"on body {body_name!r} backend={resolved_backend} sensors={len(eye_defs)}"
             )
+
+    def configure_rgb_camera_specs(self, specs, env_id=0):
+        """Apply one episode's calibration to its render-only rigs."""
+        specs = list(specs)
+        env_id = int(env_id)
+        expected = set(self._rgb_camera_rigs)
+        actual = {str(spec["name"]) for spec in specs}
+        if actual != expected:
+            raise ValueError(
+                "runtime camera names differ from spawned cameras: "
+                f"expected={sorted(expected)} actual={sorted(actual)}"
+            )
+        horizontal_aperture = 20.955
+        for spec in specs:
+            name = str(spec["name"])
+            rig = self._rgb_camera_rigs[name]
+            _, mode, body_name, _, eye_defs = self._rgb_camera_spec_to_eye_defs(
+                spec, horizontal_aperture
+            )
+            if mode != rig["mode"] or body_name != rig["body_name"]:
+                raise ValueError(f"camera {name!r} changed mode or parent body")
+            eyes = rig["eyes_by_env"][env_id]
+            if len(eye_defs) != len(eyes):
+                raise ValueError(f"camera {name!r} changed eye count")
+            rig["pose_reference"] = str(spec.get("pose_reference", "body"))
+            rig["door_diagnostic"] = spec.get("door_diagnostic")
+            rig["valid_circle_mask"] = spec.get("valid_circle_mask")
+            for cache_key in (
+                "valid_circle_mask_cache_key",
+                "valid_circle_mask_alpha",
+                "_door_local_pose",
+                "_door_world_pose",
+            ):
+                rig.pop(cache_key, None)
+            for eye, eye_def in zip(eyes, eye_defs):
+                eye["local_pos"] = eye_def["local_pos"]
+                eye["local_quat"] = eye_def["local_quat"]
+                eye["local_pos_np"] = np.asarray(eye_def["local_pos"], dtype=np.float32)
+                eye["local_quat_np"] = np.asarray(eye_def["local_quat"], dtype=np.float32)
+                if rig.get("backend") == "camera":
+                    self._apply_rgb_camera_lens_calibration(eye["prim_path"], spec)
+
+    @staticmethod
+    def _activate_rgb_camera_env(rig, env_id):
+        if rig.get("backend") != "camera":
+            return
+        env_id = int(env_id)
+        rig["cameras"] = rig["cameras_by_env"][env_id]
+        rig["eyes"] = rig["eyes_by_env"][env_id]
 
 
     def _get_rgb_camera_body_state_w(self, body_name: str, env_ids: torch.Tensor):
@@ -2988,6 +3064,7 @@ class LeggedRobotIsaacLab(DirectRLEnv):
                         "robot_arm_init",
                         device=self.device,
                         dtype=joint_pos.dtype,
+                        episode_seeds=getattr(self.cfg, "doorman_episode_seeds", None),
                     )
                     joint_pos[:, self.arm_joint_ids] = lower + (upper - lower) * arm_uniform
         if self.cfg.enable_doorman_scene and self.cfg.doorman_gripper_joint_init is not None:
@@ -3025,6 +3102,7 @@ class LeggedRobotIsaacLab(DirectRLEnv):
                 "robot_camera_init",
                 device=self.device,
                 dtype=root_state.dtype,
+                episode_seeds=getattr(self.cfg, "doorman_episode_seeds", None),
             )
             camera_x = self.scene.env_origins[env_ids, 0:1] + side_sign * (
                 x_min + (x_max - x_min) * camera_uniform[:, 0:1]

@@ -137,6 +137,21 @@ def test_auto_open_has_one_experiment_launcher():
     assert launchers == ["run_auto_open.sh"]
 
 
+def test_auto_open_uses_batch_invariant_physx_partitioning():
+    source = (
+        REPO_ROOT
+        / "gr00t"
+        / "rl"
+        / "third_party"
+        / "visual_wholebody_lowlevel"
+        / "legged_gym"
+        / "utils"
+        / "helpers.py"
+    ).read_text(encoding="utf-8")
+    assert "cfg.sim.physx.enable_enhanced_determinism = True" in source
+    assert "cfg.sim.physx.gpu_max_num_partitions = 1" in source
+
+
 def test_scripts_contains_no_auto_open_domain_modules():
     assert sorted(path.name for path in SCRIPTS.glob("auto_open_*.py")) == []
     assert (AUTO_OPEN / "__init__.py").is_file()
@@ -255,11 +270,9 @@ def test_one_vectorized_episode_runner_handles_batch_size_one_and_many():
 
 def test_every_fixed_workflow_supplies_vectorized_environment_count():
     launcher = (SCRIPTS / "run_auto_open.sh").read_text(encoding="utf-8")
-    python_invocations = [
-        block for block in launcher.split("run_auto_open_python")[2:]
-    ]
-    assert python_invocations
-    assert all("--batched_envs" in block.split(">", 1)[0] for block in python_invocations)
+    assert launcher.count('python "${ENTRY}"') == 1
+    assert '--batched_envs "${#rank_seeds[@]}"' in launcher
+    assert '--episode_seeds "${rank_seeds[@]}"' in launcher
 
 
 def test_fixed_launcher_has_one_python_invocation_and_one_common_contract():
@@ -277,8 +290,19 @@ def test_fixed_launcher_has_one_python_invocation_and_one_common_contract():
         assert launcher.count(option) == 1
 
 
-def test_standard_collection_uses_bounded_reviewed_workers_per_gpu():
+def test_standard_collection_uses_one_vectorized_process_per_gpu():
     launcher = (SCRIPTS / "run_auto_open.sh").read_text(encoding="utf-8")
-    assert 'STANDARD_WORKERS_PER_GPU:-4' in launcher
-    assert '[[ ! "${workers_per_gpu}" =~ ^[1-4]$ ]]' in launcher
-    assert "worker_count=$((gpu_count * workers_per_gpu))" in launcher
+    assert 'rank_count="${gpu_count}"' in launcher
+    assert '--episode_seeds "${rank_seeds[@]}"' in launcher
+    assert '--batched_envs "${#rank_seeds[@]}"' in launcher
+    assert "STANDARD_WORKERS_PER_GPU" not in launcher
+    assert "for ((worker_index=" not in launcher
+
+
+def test_collection_camera_mode_is_configuration_not_a_workflow():
+    launcher = (SCRIPTS / "run_auto_open.sh").read_text(encoding="utf-8")
+    assert 'CAMERA_MODE="${CAMERA_MODE:-none}"' in launcher
+    assert 'CAMERA_MODE}" != none' in launcher
+    assert 'CAMERA_MODE}" != dual' in launcher
+    assert 'CAMERA_MODE}" != six' in launcher
+    assert "AUTO_OPEN_WORKFLOW" not in launcher

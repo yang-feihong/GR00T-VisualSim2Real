@@ -14,6 +14,8 @@ from gr00t.rl.data_collection.auto_open_standard import (
     pack_action,
     pack_observation_state,
     transform_dataset_images,
+    camera_streams_for_mode,
+    transform_collection_images,
 )
 from gr00t.rl.data_collection.auto_open_writer import (
     AutoOpenEpisodeData,
@@ -26,7 +28,11 @@ from gr00t.rl.data_collection.auto_open_writer import (
     aggregate_standard_shards,
     _verify_video,
 )
-from gr00t.rl.data_collection.auto_open_collector import _door_edge_gap_m
+from gr00t.rl.data_collection.auto_open_collector import (
+    _door_edge_gap_m,
+    AutoOpenStandardEpisodeCollector,
+    batched_target_height_invariant_poses,
+)
 from gr00t.rl.data_collection.contact_audit import (
     ContactPairMaximum,
     aggregate_contact_pair_maxima,
@@ -37,6 +43,13 @@ def _yaw_quaternion(yaw):
     return np.asarray((math.cos(yaw / 2), 0.0, 0.0, math.sin(yaw / 2)))
 
 
+def _fsm_stage_names(frames, stage2_start, stage3_start):
+    stages = np.full(frames, "APPROACH", dtype=object)
+    stages[stage2_start:stage3_start] = "PREGRASP"
+    stages[stage3_start:] = "ALIGN_PANEL"
+    return stages
+
+
 def _yaw_matrix(yaw):
     c, s = math.cos(yaw), math.sin(yaw)
     return np.asarray(((c, -s, 0.0), (s, c, 0.0), (0.0, 0.0, 1.0)))
@@ -45,6 +58,28 @@ def _yaw_matrix(yaw):
 def _roll_matrix(roll):
     c, s = math.cos(roll), math.sin(roll)
     return np.asarray(((1.0, 0.0, 0.0), (0.0, c, -s), (0.0, s, c)))
+
+
+def test_camera_modes_share_one_dynamic_image_contract():
+    assert camera_streams_for_mode("none") == {}
+    dual = camera_streams_for_mode("dual")
+    six = camera_streams_for_mode("six")
+    assert set(dual) == {"base_0_rgb", "left_wrist_0_rgb"}
+    assert len(six) == 6
+    source = {
+        name: np.full(stream["source_shape"], index, dtype=np.uint8)
+        for index, (name, stream) in enumerate(six.items())
+    }
+    transformed = transform_collection_images(source, "six")
+    assert set(transformed) == {stream["key"] for stream in six.values()}
+    assert all(image.shape == (480, 640, 3) for image in transformed.values())
+
+
+def test_camera_mode_rejects_missing_or_extra_streams():
+    with pytest.raises(ValueError):
+        transform_collection_images({}, "dual")
+    with pytest.raises(ValueError):
+        camera_streams_for_mode("legacy")
 
 
 def test_dataset_tool_pose_uses_single_offset_and_no_fixed_mesh_axis_roll():
@@ -143,6 +178,31 @@ def test_height_invariant_pose_removes_global_xy_and_yaw_only():
     np.testing.assert_allclose(transformed, reference, atol=1.0e-6, rtol=0.0)
 
 
+def test_batched_target_pose_matches_scalar_collector_semantics():
+    roots = np.asarray(
+        (
+            (1.2, -0.4, 0.51, 0.98, 0.01, -0.03, 0.19),
+            (-0.8, 1.1, 0.47, 0.91, -0.04, 0.08, -0.39),
+        ),
+        dtype=np.float64,
+    )
+    roots[:, 3:7] /= np.linalg.norm(roots[:, 3:7], axis=1, keepdims=True)
+    arms = np.asarray(
+        ((0.1, -0.7, 0.8, -0.4, 0.3, -0.2), (-0.2, -0.5, 0.6, 0.1, -0.4, 0.2)),
+        dtype=np.float64,
+    )
+    batched = batched_target_height_invariant_poses(roots, arms)
+    scalar = []
+    collector = object.__new__(AutoOpenStandardEpisodeCollector)
+    for root, arm in zip(roots, arms):
+        scalar.append(
+            collector._target_height_invariant_pose(
+                {"root": root}, arm
+            )
+        )
+    np.testing.assert_array_equal(batched, np.asarray(scalar))
+
+
 def test_observation_packer_is_finite_58_vector():
     state = pack_observation_state(
         arm_position=np.arange(6) * 0.1,
@@ -201,6 +261,7 @@ def test_three_stage_boundaries_are_half_open_and_terminal_hold_is_retained():
     robot_clear[90:] = True
 
     result = derive_stage_boundaries(
+        autoopen_stages=_fsm_stage_names(frames, 65, 90),
         base_commands=base,
         arm_teleop_inactive=inactive,
         arm_reset=reset,
@@ -208,7 +269,7 @@ def test_three_stage_boundaries_are_half_open_and_terminal_hold_is_retained():
         terminal_robot_clear=robot_clear,
     )
     assert result.quarantine_reasons == ()
-    assert result.boundaries["approach"].start_frame == 10
+    assert result.boundaries["approach"].start_frame == 0
     assert result.boundaries["approach"].stop_frame == 65
     assert result.boundaries["handle_press"].start_frame == 65
     assert result.boundaries["handle_press"].stop_frame == 90
@@ -227,6 +288,7 @@ def test_terminal_boundary_requires_actual_stability_not_only_zero_command():
     stable = np.ones(frames, dtype=bool)
     stable[:96] = False
     result = derive_stage_boundaries(
+        autoopen_stages=_fsm_stage_names(frames, 65, 90),
         base_commands=base,
         arm_teleop_inactive=inactive,
         arm_reset=np.zeros(frames, dtype=bool),
@@ -252,6 +314,7 @@ def test_boundary_validator_quarantines_missing_approach_stop():
     inactive = np.ones(frames, dtype=bool)
     inactive[40:60] = False
     result = derive_stage_boundaries(
+        autoopen_stages=_fsm_stage_names(frames, 40, 60),
         base_commands=base,
         arm_teleop_inactive=inactive,
         arm_reset=np.zeros(frames, dtype=bool),
@@ -259,6 +322,27 @@ def test_boundary_validator_quarantines_missing_approach_stop():
         terminal_robot_clear=np.ones(frames, dtype=bool),
     )
     assert "approach_missing_25_frame_stop" in result.quarantine_reasons
+
+
+def test_stage2_base_motion_is_rejected_without_moving_the_fsm_boundary():
+    frames = 145
+    base = np.zeros((frames, 3), dtype=np.float32)
+    base[10:40, 0] = 0.2
+    base[75:80, 1] = 0.15
+    base[90:95, 0] = 0.2
+
+    result = derive_stage_boundaries(
+        autoopen_stages=_fsm_stage_names(frames, 65, 90),
+        base_commands=base,
+        arm_teleop_inactive=np.ones(frames, dtype=bool),
+        arm_reset=np.zeros(frames, dtype=bool),
+        gripper_targets=np.zeros(frames),
+        terminal_robot_clear=np.arange(frames) >= 90,
+    )
+
+    assert "base_moved_during_handle_press" in result.quarantine_reasons
+    assert result.boundaries["handle_press"].stop_frame == 90
+    assert result.boundaries["traversal"].start_frame == 90
 
 
 def test_short_round_trip_audit_detects_a_jump_returning_within_100ms():
@@ -350,6 +434,7 @@ def test_physical_validator_requires_standard_full_open_target():
     robot_clear = np.zeros(frames, dtype=bool)
     robot_clear[90:] = True
     boundary = derive_stage_boundaries(
+        autoopen_stages=_fsm_stage_names(frames, 65, 90),
         base_commands=base,
         arm_teleop_inactive=inactive,
         arm_reset=np.zeros(frames, dtype=bool),
