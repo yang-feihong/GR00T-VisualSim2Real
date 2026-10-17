@@ -8,6 +8,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPTS = REPO_ROOT / "gr00t" / "rl" / "scripts"
 AUTO_OPEN = REPO_ROOT / "gr00t" / "rl" / "auto_open"
+MANIP_LOCO = (
+    REPO_ROOT
+    / "gr00t/rl/third_party/visual_wholebody_lowlevel/legged_gym/envs/manip_loco/manip_loco.py"
+)
 
 
 def test_all_auto_open_modules_resolve_their_runtime_imports():
@@ -278,7 +282,7 @@ def test_every_fixed_workflow_supplies_vectorized_environment_count():
 def test_fixed_launcher_has_one_python_invocation_and_one_common_contract():
     launcher = (SCRIPTS / "run_auto_open.sh").read_text(encoding="utf-8")
     assert launcher.count('python "${ENTRY}"') == 1
-    assert launcher.count("COMMON_RUNTIME_ARGS=(") == 1
+    assert launcher.count("common_args=(") == 1
     for option in (
         "--headless",
         "--device cuda:0",
@@ -292,17 +296,71 @@ def test_fixed_launcher_has_one_python_invocation_and_one_common_contract():
 
 def test_standard_collection_uses_one_vectorized_process_per_gpu():
     launcher = (SCRIPTS / "run_auto_open.sh").read_text(encoding="utf-8")
-    assert 'rank_count="${gpu_count}"' in launcher
+    assert 'rank_count="${#GPU_IDS_ARRAY[@]}"' in launcher
     assert '--episode_seeds "${rank_seeds[@]}"' in launcher
     assert '--batched_envs "${#rank_seeds[@]}"' in launcher
     assert "STANDARD_WORKERS_PER_GPU" not in launcher
     assert "for ((worker_index=" not in launcher
 
 
-def test_collection_camera_mode_is_configuration_not_a_workflow():
+def test_fixed_launcher_owns_the_complete_official_two_phase_workflow():
     launcher = (SCRIPTS / "run_auto_open.sh").read_text(encoding="utf-8")
-    assert 'CAMERA_MODE="${CAMERA_MODE:-none}"' in launcher
-    assert 'CAMERA_MODE}" != none' in launcher
-    assert 'CAMERA_MODE}" != dual' in launcher
-    assert 'CAMERA_MODE}" != six' in launcher
-    assert "AUTO_OPEN_WORKFLOW" not in launcher
+    assert 'run_phase "${canonical_root}" none "" ALL_SEEDS' in launcher
+    assert 'run_phase "${pending_root}" dual "${canonical_root}" ACCEPTED_SEEDS' in launcher
+    assert 'if bool(row.get("accepted"))' in launcher
+    assert 'report.get("quarantined_episodes") != 0' in launcher
+    assert "ln -sfn" not in launcher
+
+
+def test_fixed_launcher_exposes_only_range_and_two_workflow_modes():
+    launcher = (SCRIPTS / "run_auto_open.sh").read_text(encoding="utf-8")
+    assert 'SEED_START and SEED_END' in launcher
+    assert 'for ((seed=SEED_START; seed<=SEED_END; seed++))' in launcher
+    assert 'AUTO_OPEN_MODE="${AUTO_OPEN_MODE:-official}"' in launcher
+    assert 'AUTO_OPEN_MODE}" != official' in launcher
+    assert 'AUTO_OPEN_MODE}" != debug' in launcher
+    for removed_assignment in (
+        "DATASET_ROOT=",
+        "CAMERA_MODE=",
+        "REPLAY_SOURCE_DATASET_ROOT=",
+        "NUM_EPISODES=",
+    ):
+        assert removed_assignment not in launcher
+    assert "SEMANTIC_TARGET_NOISE" not in launcher
+
+
+def test_debug_workflow_runs_six_camera_collection_then_strict_selection():
+    launcher = (SCRIPTS / "run_auto_open.sh").read_text(encoding="utf-8")
+    assert 'if [[ "${AUTO_OPEN_MODE}" == debug ]]' in launcher
+    assert 'run_phase "${debug_pending_root}" six "" ALL_SEEDS' in launcher
+    assert 'if bool(row.get("accepted"))' in launcher
+    assert '"${FORMAL_DATA_ROOT}/debug/${debug_name}"' in launcher
+    assert "latest" not in launcher
+
+
+def test_official_release_name_contains_range_count_camera_and_date():
+    launcher = (SCRIPTS / "run_auto_open.sh").read_text(encoding="utf-8")
+    assert 'range_tag="seeds${SEED_START}-${SEED_END}"' in launcher
+    assert 'episodes${accepted_count}_dual_camera_${RELEASE_STAMP}' in launcher
+    assert 'canonical_no_camera_${RELEASE_STAMP}' in launcher
+    assert 'FORMAL_DATA_ROOT="${REPO_ROOT}/datasets/auto_open"' in launcher
+
+
+def test_every_official_run_is_an_independent_timestamped_dataset():
+    launcher = (SCRIPTS / "run_auto_open.sh").read_text(encoding="utf-8")
+    assert 'canonical_no_camera_${RELEASE_STAMP}' in launcher
+    assert "reusing complete canonical" not in launcher
+    assert "official release already complete" not in launcher
+    assert '"source_fingerprint_sha256": sys.argv[7]' in launcher
+
+
+def test_forced_camera_refresh_advances_the_sensor_clock():
+    source = MANIP_LOCO.read_text(encoding="utf-8")
+    refresh = "update(float(self.dt), force_recompute=True)"
+    assert source.count(refresh) == 3
+    assert "def render_stereo_rgb_camera_rigs_batch" in source
+    assert "update(0.0, force_recompute=True)" not in source[
+        source.index("def _camera_rgb_to_numpy") : source.index(
+            "def render_stereo_rgb_camera_rigs"
+        ) + 2500
+    ]

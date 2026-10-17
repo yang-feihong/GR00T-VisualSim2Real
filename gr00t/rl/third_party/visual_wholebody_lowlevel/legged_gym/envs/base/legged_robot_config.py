@@ -234,4 +234,6 @@ class LeggedRobotIsaacLabCfg(DirectRLEnvCfg):
     rgb_camera_specs: list = field(default_factory=list)
     rgb_camera_draw_in_viewer: bool = False
     rgb_camera_backend: str = "auto"
+    rgb_camera_shared_sidecar: bool = False
+    rgb_camera_sidecar_pool_size: int = 1
     rgb_camera_update_period_s: float = 0.1

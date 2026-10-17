@@ -45,6 +45,7 @@ def build_grouped_training_doorman_door_cfgs(
     physics_only: bool = False,
     door_open_lr: str | None = None,
     episode_seeds=None,
+    source_asset_snapshots=None,
 ):
     """Build separate homogeneous articulation views for mirrored doors."""
     if num_envs < 1:
@@ -58,6 +59,16 @@ def build_grouped_training_doorman_door_cfgs(
     )
     if len(episode_seeds) != int(num_envs):
         raise ValueError("episode_seeds must contain exactly num_envs values")
+    if source_asset_snapshots is not None and len(source_asset_snapshots) != int(
+        num_envs
+    ):
+        raise ValueError("source_asset_snapshots must contain exactly num_envs values")
+    if source_asset_snapshots is not None:
+        print(
+            f"[doorman][source-scenes] restoring {len(source_asset_snapshots)} "
+            "door asset snapshots",
+            flush=True,
+        )
     sides = [
         door_open_lr
         if door_open_lr is not None
@@ -81,6 +92,16 @@ def build_grouped_training_doorman_door_cfgs(
                 ),
                 visual_random_seed=stream_seed(
                     episode_seeds[env_id], "door_visual"
+                ),
+                source_asset_snapshot=(
+                    None
+                    if source_asset_snapshots is None
+                    else source_asset_snapshots[env_id]
+                ),
+                source_asset_inherited_snapshot=(
+                    None
+                    if source_asset_snapshots is None or side != sides[0]
+                    else source_asset_snapshots[0]
                 ),
             )
             for asset_cfg, env_id in zip(

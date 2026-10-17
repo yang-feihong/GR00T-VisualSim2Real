@@ -131,6 +131,21 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--replay_source_dataset_dir",
+        type=Path,
+        default=None,
+        help=(
+            "Render cameras from canonical accepted trajectories without "
+            "advancing physics or running AutoOpen control."
+        ),
+    )
+    parser.add_argument(
+        "--replay_render_batch_size",
+        type=int,
+        default=8,
+        help="Maximum replay episodes rendered concurrently per GPU process.",
+    )
+    parser.add_argument(
         "--collection_camera_mode",
         choices=("none", "dual", "six"),
         default="none",

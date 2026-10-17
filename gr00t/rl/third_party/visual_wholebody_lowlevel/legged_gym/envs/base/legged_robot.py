@@ -402,11 +402,14 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         self._configure_canonical_doorman_env_origins()
         self._setup_imported_scene()
 
+        generated_door_snapshots = {}
+
         self.robot = Articulation(self.cfg.robot)
         self.scene.articulations["robot"] = self.robot
 
         if self.cfg.enable_doorman_scene:
             if self.cfg.doorman_door_groups:
+                from gr00t.rl.auto_open.io import door_asset_stage_snapshot
                 from legged_gym.envs.manip_loco.grouped_articulation import (
                     GroupedArticulation,
                 )
@@ -434,8 +437,19 @@ class LeggedRobotIsaacLab(DirectRLEnv):
                             value = getattr(multi_spawn, attribute, None)
                             if value is not None and hasattr(asset_cfg, attribute):
                                 setattr(asset_cfg, attribute, value)
-                        asset_cfg.func(
-                            f"/World/envs/env_{env_id}/door_{side}", asset_cfg
+                        door_path = f"/World/envs/env_{env_id}/door_{side}"
+                        asset_cfg.func(door_path, asset_cfg)
+                        # Environment cloning happens after all per-seed doors
+                        # are authored. Preserve each generated subtree before
+                        # env_0 composition can introduce optional children or
+                        # stronger attribute opinions from another episode.
+                        generated_stage = sim_utils.get_current_stage()
+                        generated_door_snapshots[int(env_id)] = (
+                            door_path,
+                            door_asset_stage_snapshot(
+                                generated_stage,
+                                generated_stage.GetPrimAtPath(door_path),
+                            ),
                         )
                     door_cfg.spawn = None
                     grouped_assets.append(Articulation(door_cfg))
@@ -510,6 +524,16 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         self.scene.clone_environments(copy_from_source=False)
         if self.cfg.doorman_door_groups:
             grouped_stage = sim_utils.get_current_stage()
+            from gr00t.rl.isaac_utils.playground.env_rand.door import (
+                _restore_source_asset_snapshot,
+            )
+
+            for env_id, (door_path, snapshot) in generated_door_snapshots.items():
+                _restore_source_asset_snapshot(
+                    grouped_stage,
+                    door_path,
+                    snapshot,
+                )
             expected_side_by_env = {}
             for door_cfg, env_ids in self.cfg.doorman_door_groups:
                 side = door_cfg.prim_path.rsplit("/door_", 1)[1]
@@ -956,6 +980,10 @@ class LeggedRobotIsaacLab(DirectRLEnv):
             self._setup_tiled_rgb_cameras(specs, TiledCamera, TiledCameraCfg, horizontal_aperture)
             return
 
+        shared_sidecar = bool(
+            getattr(self.cfg, "rgb_camera_shared_sidecar", False)
+        )
+
         for spec in specs:
             mount_name, camera_mode, body_name, focal_length, eye_defs = self._rgb_camera_spec_to_eye_defs(
                 spec,
@@ -967,7 +995,15 @@ class LeggedRobotIsaacLab(DirectRLEnv):
             cameras_by_env = []
             eyes_by_env = []
             effective_calibration = None
-            for env_id in range(int(self.num_envs)):
+            camera_env_count = (
+                min(
+                    int(self.num_envs),
+                    max(1, int(getattr(self.cfg, "rgb_camera_sidecar_pool_size", 1))),
+                )
+                if shared_sidecar
+                else int(self.num_envs)
+            )
+            for env_id in range(camera_env_count):
                 rig_cameras = {}
                 rig_eyes = []
                 for index, eye_def in enumerate(eye_defs):
@@ -1023,6 +1059,17 @@ class LeggedRobotIsaacLab(DirectRLEnv):
                     )
                 cameras_by_env.append(rig_cameras)
                 eyes_by_env.append(rig_eyes)
+            if shared_sidecar:
+                camera_pool = list(cameras_by_env)
+                eye_pool = list(eyes_by_env)
+                cameras_by_env = [
+                    camera_pool[env_id % camera_env_count]
+                    for env_id in range(int(self.num_envs))
+                ]
+                eyes_by_env = [
+                    [dict(eye) for eye in eye_pool[env_id % camera_env_count]]
+                    for env_id in range(int(self.num_envs))
+                ]
             resolved_backend = "camera"
 
             self._rgb_camera_rigs[mount_name] = {
@@ -1030,6 +1077,8 @@ class LeggedRobotIsaacLab(DirectRLEnv):
                 "body_name": body_name,
                 "pose_reference": str(spec.get("pose_reference", "body")),
                 "backend": resolved_backend,
+                "shared_sidecar": shared_sidecar,
+                "sidecar_pool_size": camera_env_count,
                 "pose_update": True,
                 "door_diagnostic": spec.get("door_diagnostic"),
                 "valid_circle_mask": spec.get("valid_circle_mask"),
@@ -1041,7 +1090,9 @@ class LeggedRobotIsaacLab(DirectRLEnv):
             }
             print(
                 f"[rgb_camera] registered {camera_mode} rig {mount_name!r} "
-                f"on body {body_name!r} backend={resolved_backend} sensors={len(eye_defs)}"
+                f"on body {body_name!r} backend={resolved_backend} "
+                f"sensors={len(eye_defs)} shared_sidecar={shared_sidecar} "
+                f"sidecar_pool_size={camera_env_count}"
             )
 
     def configure_rgb_camera_specs(self, specs, env_id=0):

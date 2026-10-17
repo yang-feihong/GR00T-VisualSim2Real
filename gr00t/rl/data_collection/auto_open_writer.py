@@ -238,7 +238,7 @@ def _write_raw_contacts(path: Path, rows: Sequence[Mapping[str, Any]]):
 class StreamingVideoEncoder:
     """Bounded-memory H.264 writer for one 50 Hz camera stream."""
 
-    def __init__(self, path: Path, expected_shape):
+    def __init__(self, path: Path, expected_shape, *, codec_options=None):
         try:
             import av
         except ImportError as exc:
@@ -257,7 +257,9 @@ class StreamingVideoEncoder:
         self.stream.width = width
         self.stream.height = height
         self.stream.pix_fmt = "yuv420p"
-        self.stream.options = {"crf": "23"}
+        self.stream.options = dict(
+            codec_options or {"crf": "23", "threads": "2"}
+        )
         self.frame_count = 0
         self.closed = False
         self.encode_wall_s = 0.0

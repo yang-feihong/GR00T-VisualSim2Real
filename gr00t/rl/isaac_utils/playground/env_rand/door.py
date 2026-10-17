@@ -15,7 +15,7 @@ import omni.usd
 from isaaclab.sim import schemas
 from isaaclab.sim.utils import bind_visual_material, clone
 from isaaclab.utils import configclass
-from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics
+from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics, Vt
 
 def _get_material_randomization():
     """Lazy import to avoid loading omni.kit.scripting before SimulationApp is ready."""
@@ -70,10 +70,121 @@ def _episode_seeded_spawn(function):
     return wrapped
 
 
+def _source_usd_attribute_value(attribute, value):
+    type_name = str(attribute.GetTypeName())
+    if isinstance(value, dict) and set(value) == {"real", "imaginary"}:
+        imaginary = value["imaginary"]
+        if type_name == "quatf":
+            return Gf.Quatf(float(value["real"]), Gf.Vec3f(*imaginary))
+        return Gf.Quatd(float(value["real"]), Gf.Vec3d(*imaginary))
+    if isinstance(value, list):
+        if type_name in {"float2", "texCoord2f"}:
+            return Gf.Vec2f(*value)
+        if type_name == "double2":
+            return Gf.Vec2d(*value)
+        if type_name in {
+            "float3",
+            "color3f",
+            "point3f",
+            "vector3f",
+            "normal3f",
+        }:
+            return Gf.Vec3f(*value)
+        if type_name == "double3":
+            return Gf.Vec3d(*value)
+        if type_name in {"float3[]", "point3f[]", "vector3f[]"}:
+            return Vt.Vec3fArray([Gf.Vec3f(*item) for item in value])
+        if type_name == "double3[]":
+            return Vt.Vec3dArray([Gf.Vec3d(*item) for item in value])
+        if type_name == "token[]":
+            return Vt.TokenArray(value)
+    return value
+
+
+def _source_usd_type(value):
+    if isinstance(value, bool):
+        return Sdf.ValueTypeNames.Bool
+    if isinstance(value, int):
+        return Sdf.ValueTypeNames.Int
+    if isinstance(value, float):
+        return Sdf.ValueTypeNames.Double
+    if isinstance(value, str):
+        return Sdf.ValueTypeNames.Token
+    if isinstance(value, dict):
+        return Sdf.ValueTypeNames.Quatd
+    if isinstance(value, list) and value and isinstance(value[0], list):
+        return Sdf.ValueTypeNames.Float3Array
+    if isinstance(value, list) and len(value) == 3:
+        return Sdf.ValueTypeNames.Double3
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return Sdf.ValueTypeNames.TokenArray
+    raise TypeError(f"cannot infer USD type for {value!r}")
+
+
+def _restore_source_asset_snapshot(stage, prim_path, snapshot, inherited_snapshot=None):
+    source_root = str(snapshot["stage_prim_path"])
+
+    def destination_path(source_path, *, preserve_external=False):
+        source_path = str(source_path)
+        if not source_path.startswith(source_root):
+            if preserve_external:
+                return source_path
+            raise RuntimeError(f"door snapshot path escapes its root: {source_path}")
+        return prim_path + source_path[len(source_root) :]
+
+    expected_by_path = {
+        destination_path(item["path"]): item for item in snapshot["prims"]
+    }
+    root_prim = stage.GetPrimAtPath(prim_path)
+    actual_paths = {
+        str(prim.GetPath())
+        for prim in Usd.PrimRange(root_prim, Usd.TraverseInstanceProxies())
+    }
+    inherited_paths = set()
+    if inherited_snapshot is not None:
+        inherited_root = str(inherited_snapshot["stage_prim_path"])
+        inherited_paths = {
+            prim_path + str(item["path"])[len(inherited_root) :]
+            for item in inherited_snapshot["prims"]
+        }
+    print(
+        f"[door][source-restore] prim={prim_path} "
+        f"actual_prims={len(actual_paths)} expected_prims={len(expected_by_path)}",
+        flush=True,
+    )
+    for path in sorted(
+        (actual_paths | inherited_paths) - set(expected_by_path), reverse=True
+    ):
+        # The environment clone may compose env_0 children only after this
+        # spawner returns.  Author an inactive override now so those deferred
+        # inherited children cannot alter this episode's scene.
+        stage.OverridePrim(path).SetActive(False)
+
+    for path, expected in expected_by_path.items():
+        prim = stage.GetPrimAtPath(path)
+        if not prim.IsValid() or not prim.IsActive():
+            prim = stage.DefinePrim(path, expected["type"])
+            prim.SetActive(True)
+        for name, value in expected["attributes"].items():
+            attribute = prim.GetAttribute(name)
+            if not attribute.IsValid():
+                attribute = prim.CreateAttribute(name, _source_usd_type(value))
+            attribute.Set(_source_usd_attribute_value(attribute, value))
+        for name, targets in expected["relationships"].items():
+            prim.CreateRelationship(name).SetTargets(
+                [
+                    destination_path(target, preserve_external=True)
+                    for target in targets
+                ]
+            )
+
+
 @configclass
 class DoorSpawnerCfg(sim_utils.RigidObjectSpawnerCfg):
     random_seed: Optional[int] = None
     visual_random_seed: Optional[int] = None
+    source_asset_snapshot: Optional[dict] = None
+    source_asset_inherited_snapshot: Optional[dict] = None
     articulation_props: sim_utils.ArticulationRootPropertiesCfg = None
     articulation_root_name: str = "root"
     door_width: tuple[float, float] = (0.8, 1.1)
@@ -1159,6 +1270,13 @@ def spawn_door(
         rotation=Rotation(*orientation).to_euler_xyz(degrees=True),
         scale=(1.0, 1.0, 1.0),
     )
+    if cfg.source_asset_snapshot is not None:
+        _restore_source_asset_snapshot(
+            stage,
+            prim_path,
+            cfg.source_asset_snapshot,
+            cfg.source_asset_inherited_snapshot,
+        )
 
     return prim_utils.get_prim_at_path(root_prim_path)
 

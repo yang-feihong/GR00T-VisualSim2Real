@@ -352,7 +352,7 @@ class SimRgbCameraManager:
         self.preview_window_name = "RGB Cameras"
         self._cv2 = None
         self._episode_specs = {}
-        self._configured_env_id = None
+        self._configured_env_by_slot = {}
 
         config = load_rgb_camera_config(config_path)
         if config is None:
@@ -370,7 +370,28 @@ class SimRgbCameraManager:
                 raise ValueError("episode camera configuration must be enabled")
             parsed[int(env_id)] = value["cameras"]
         self._episode_specs = parsed
-        self._configured_env_id = None
+        self._configured_env_by_slot = {}
+
+    def _configure_episode_camera(self, env_id):
+        if not self._episode_specs:
+            return
+        env_id = int(env_id)
+        if env_id not in self._episode_specs:
+            raise KeyError(f"missing camera configuration for environment {env_id}")
+        rigs = self.env._rgb_camera_rigs
+        pool_sizes = {
+            int(rig.get("sidecar_pool_size", self.env.num_envs))
+            for rig in rigs.values()
+        }
+        if len(pool_sizes) != 1:
+            raise RuntimeError(f"RGB camera rigs use inconsistent pool sizes: {pool_sizes}")
+        slot = env_id % next(iter(pool_sizes))
+        if self._configured_env_by_slot.get(slot) == env_id:
+            return
+        self.env.configure_rgb_camera_specs(
+            self._episode_specs[env_id], env_id=env_id
+        )
+        self._configured_env_by_slot[slot] = env_id
 
     def _create_rigs_from_config(self, config):
         parsed = rgb_camera_specs_from_config(config)
@@ -439,17 +460,21 @@ class SimRgbCameraManager:
         if not self.enabled:
             return {}
         env_id = int(env_id)
-        if self._episode_specs and self._configured_env_id != env_id:
-            if env_id not in self._episode_specs:
-                raise KeyError(f"missing camera configuration for environment {env_id}")
-            self.env.configure_rgb_camera_specs(
-                self._episode_specs[env_id], env_id=env_id
-            )
-            self._configured_env_id = env_id
+        self._configure_episode_camera(env_id)
         return self.env.render_stereo_rgb_camera_rigs(
             env_id=env_id,
             rig_names=rig_names,
             update=update,
+        )
+
+    def render_images_batch(self, env_ids, rig_names=None):
+        if not self.enabled:
+            return {}
+        env_ids = [int(env_id) for env_id in env_ids]
+        for env_id in env_ids:
+            self._configure_episode_camera(env_id)
+        return self.env.render_stereo_rgb_camera_rigs_batch(
+            env_ids=env_ids, rig_names=rig_names
         )
 
     def due_rigs(self, now_wall):

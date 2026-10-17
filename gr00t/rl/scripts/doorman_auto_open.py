@@ -3053,6 +3053,16 @@ def main():
             )
         if len(set(args.episode_seeds)) != len(args.episode_seeds):
             raise SystemExit("--episode_seeds must not contain duplicates")
+    if args.replay_source_dataset_dir is not None:
+        if args.standard_dataset_dir is None:
+            raise SystemExit("trajectory replay requires --standard_dataset_dir")
+        if args.collection_camera_mode != "dual" or args.disable_rgb_cameras:
+            raise SystemExit("trajectory replay requires dual camera mode")
+        if not (args.replay_source_dataset_dir / "manifest.json").is_file():
+            raise SystemExit(
+                "trajectory replay source must contain manifest.json: "
+                f"{args.replay_source_dataset_dir}"
+            )
     camera_mount_noise_enabled = bool(
         args.camera_mount_position_noise_m > 0.0
         or args.camera_mount_rotation_noise_deg > 0.0
@@ -3072,6 +3082,11 @@ def main():
         ) from exc
     simulation_app = launch_app(args)
     try:
+        if args.replay_source_dataset_dir is not None:
+            from gr00t.rl.auto_open.replay import run_trajectory_replay
+
+            run_trajectory_replay(args)
+            return
         from gr00t.rl.auto_open.runtime import _run_batched
 
         _run_batched(args, controller_cls=DoorController, stage_enum=Stage)

@@ -9,7 +9,7 @@
 - 主状态机：`gr00t/rl/scripts/doorman_auto_open.py`
 - 领域模块：`gr00t/rl/auto_open/`
 - 唯一实验入口：`gr00t/rl/scripts/run_auto_open.sh`
-- 当前 AutoOpen 相关测试：`141 passed`
+- 当前 AutoOpen 相关测试：`162 passed`
 
 `doorman_auto_open.py` 明确维护顶层阶段图；几何、规划、控制、生命周期、运行时和 I/O 分别由 `geometry.py`、`planning.py`、`control.py`、`lifecycle.py`、`runtime.py` 和 `io.py` 实现。单环境和多环境运行时共用 GPU 常驻的 `TensorDoorFSM`；`DoorController` 只在初始化和稀疏规划边界提供静态任务配置，不参与逐帧 `command/advance`。
 
@@ -18,16 +18,19 @@
 所有 AutoOpen 运行必须通过：
 
 ```bash
+SEED_START=1700 SEED_END=2699 \
 bash gr00t/rl/scripts/run_auto_open.sh
 ```
 
-入口只有数据采集语义，不再维护能力回归、视频回归或标量采集等平行流程。`DATASET_ROOT` 必填；相机只是同一流程的配置：
+默认 `AUTO_OPEN_MODE=official`，用户只配置闭区间 `SEED_START`/`SEED_END`：先对完整 seed 区间进行无相机控制采集和严格验收，再自动提取通过 seed，通过逐帧恢复规范轨迹补采机身与腕部两路相机，最后再次严格验收并发布到 `datasets/auto_open/releases/`。图像阶段不重新运行策略、FSM 或 PhysX。各次采集是并列的独立数据集，不维护“最新版本”指针。
 
-| `CAMERA_MODE` | 采集内容 |
-|---|---|
-| `none` | 不创建 RGB 传感器，只记录状态、动作、接触与验收数据 |
-| `dual` | 记录训练使用的机身和腕部两路 RGB |
-| `six` | 记录腕部、机身及四路诊断 RGB |
+少量 seed 的诊断使用同一入口的 `AUTO_OPEN_MODE=debug`：六相机直接跑完整区间，然后执行同一套严格验收和通过 seed 筛选，结果写入 `datasets/auto_open/debug/`，不补图、不发布为正式 release。
+
+无相机规范源保存在 `datasets/auto_open/canonical/`，其中保留所有通过和失败 shard 以供审计；只有补图后全部通过严格验收的数据才能进入 `releases/`。正式名称固定为：
+
+```text
+auto_open_v1_seeds<start>-<end>_episodes<accepted>_dual_camera_<YYYYMMDD>
+```
 
 固定运行参数包括：
 
@@ -35,9 +38,9 @@ bash gr00t/rl/scripts/run_auto_open.sh
 - 精确路径和 CONTACT_PANEL 逆解使用 worker 后端；
 - 门板间隙使用 GPU 后端；
 - CENTER_HANDLE 守卫回退使用 NumPy batch 后端；
-- 输出目录必须不存在，脚本拒绝覆盖；
+- 同日重复相同区间时，只有 seed 区间和控制/采集源码指纹均一致才复用完整规范源；正式 release 已存在时校验后直接返回；
 - 每张物理 GPU 恰好启动一个 Isaac Sim 进程；分配到该 GPU 的所有 seed 在同一进程中作为 vectorized env 运行；
-- 可用 `SEEDS` 指定任意 seed 集合，或用 `SEED_START`/`NUM_EPISODES` 生成连续集合；不存在每卡 250 个槽位的上限；
+- `SEED_START`/`SEED_END` 生成连续 seed 集合；不存在每卡 250 个槽位的上限；
 - 每个 episode seed 与 GPU、rank、env 槽位、batch size 和相机模式解耦；
 - `dual`/`six` 为每个 env 创建独立的 render-only Camera，逐 seed 应用确定性挂载和标定随机化；相机不注册为 physics scene sensor，不参与 reset、控制或物理推进。
 
@@ -169,15 +172,13 @@ RESTORE_GRIPPER 与 PUSH_ARM_RETRACT 共用中心目标，坐标为 B2Z1 goal-re
 
 场景、门、机器人初态和收回目标始终按 episode seed 确定性采样。机器人初始采样语义对应前端鱼眼相机的 x/y/yaw，再换算到底盘初态。
 
-可选的 `SEMANTIC_TARGET_NOISE=1` 在轨迹规划前启用已审核的任务目标随机化：APPROACH 门法向/切向各 `+-3 cm`，推门高度 `+-5 cm`，THROUGH 横向 `+-8 cm`、yaw `+-0.06 rad`。接触敏感的抓取深度、闭合方向和抓取姿态不随机化；预计算轨迹只扰动终点后重新规划，不逐 waypoint 加独立噪声。
-
 `dual`/`six` 模式按 seed、按相机独立采样安装和标定误差：位置半径 `2 cm`、旋转最大 `15 deg`、fx/fy 共同尺度 `+-8%`、principal point 半径 `5 px`、fisheye k1-k4 相对 `+-10%`。Isaac Sim 不支持的 skew 固定记录为实际值 `0`。相机随机化只改变观测，不得改变控制或物理轨迹。
 
 ## 数据采集
 
 采集器是被动观察者，不参与 AutoOpen 决策。数据阶段唯一由逐帧 FSM 状态映射：`APPROACH` 为 `approach`，`PREGRASP` 至 `RESTORE_GRIPPER` 为 `handle_press`，`ALIGN_PANEL` 至 `THROUGH` 为 `traversal`；末尾连续 50 帧实际稳定状态为 `terminal_hold`。
 
-控制频率 `50 Hz`，物理频率 `200 Hz`。每个 shard 包含 58 维 observation、25 维 action、完整状态审计、PhysX substep 接触、门资产路径/hash、PhysX/碰撞参数、该 seed 的实际相机标定、机器可读验收报告和中文摘要；视频字段由 `CAMERA_MODE` 决定。
+控制频率 `50 Hz`，物理频率 `200 Hz`。每个 shard 包含 58 维 observation、25 维 action、完整状态审计、PhysX substep 接触、门资产路径/hash、PhysX/碰撞参数、该 seed 的实际相机标定、机器可读验收报告和中文摘要；正式发布包含双相机，debug 数据包含六相机。
 
 状态与实采语义一致：B2 线/角速度使用 trunk 坐标系；EE 只使用机械链已有的 `0.100 m` 工具点，不重复偏移；数据集工具姿态去除 URDF gripper-link 固定网格旋转。Cartesian 控制记为 `inactive=0, reset=0`，保持当前关节角为 `inactive=1, reset=0`，运动回 middle preset 为 `inactive=0, reset=1`，到达后恢复 inactive。
 
@@ -205,6 +206,18 @@ AutoOpen 只有 `TensorDoorFSM` 一套运行时。阶段、计时、稳定窗口
 - 2 env 双相机的四路图像均非黑屏，两个 env 的相机世界位姿分别对应各自场景，像素哈希不同；
 - 当前单 env 双相机两路、六相机六路视频均为 `2426` 帧；首帧均非黑屏，模式内像素哈希分别 `2/2`、`6/6` 唯一。
 
+### 正式两阶段入口验收（2026-10-17）
+
+固定入口对 seed `1724–1731` 的完整 official 流程结果：无相机严格验收 `7/8`，通过的 7 条全部完成双相机轨迹回放，双相机 release 严格验收 `7/7`。seed 1724 因机械臂目标短时往返被严格隔离。
+
+- canonical：`datasets/auto_open/canonical/auto_open_v1_seeds1724-1731_canonical_no_camera_20261017T085501`
+- release：`datasets/auto_open/releases/auto_open_v1_seeds1724-1731_episodes7_dual_camera_20261017T085501`
+- 7 条 episode 的 `data`、`raw_audit`、`raw_contacts` 在补图前后逐表完全相等；
+- 八个 seed 的机器人初态、关节初态、门物理随机化参数和全部碰撞/关节 USD 属性均与原 696 条数据中的同 seed 一致；
+- 修复了 USD 环境克隆将源环境可选子节点继承到其他 seed 的问题。seed 1728 的 `spawnHook=false` 与实际无 hook 碰撞体已经一致；
+- 同一物理场景下，由 GPU PhysX 浮点归约差异经闭环控制放大的轨迹差异允许存在；任何几何、碰撞属性、随机化参数或初态差异均不按该规则放行。
+- 每次 official/debug 调用均创建带完整时间戳的独立数据集，不维护 `latest`，不替换或隐式复用旧数据。
+
 完整证据目录：
 
 - batch=1/env0：`logs_rl/invariance_native_math_full_b1_20261015`；
@@ -215,12 +228,11 @@ AutoOpen 只有 `TensorDoorFSM` 一套运行时。阶段、计时、稳定窗口
 
 ## 基线状态
 
-当前无图像严格数据基线由唯一入口、四张 GPU、seed `1700–2699` 生成：
+当前无图像严格数据基线对应唯一正式流程第一阶段、四张 GPU、seed `1700–2699`：
 
 ```text
-CAMERA_MODE=none
-SEMANTIC_TARGET_NOISE=0
-NUM_EPISODES=1000
+SEED_START=1700
+SEED_END=2699
 MAX_STEPS=4000
 ```
 

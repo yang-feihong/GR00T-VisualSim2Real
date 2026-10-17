@@ -1793,7 +1793,7 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
 
     def _camera_rgb_to_numpy(self, camera, env_id, update=False):
         if update:
-            camera.update(0.0, force_recompute=True)
+            camera.update(float(self.dt), force_recompute=True)
         rgb = camera.data.output.get("rgb")
         if rgb is None:
             return None
@@ -1864,7 +1864,7 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
                 tiled_camera = cameras["tiled"]
                 camera_key = id(tiled_camera)
                 if update and camera_key not in updated_tiled_cameras:
-                    tiled_camera.update(0.0, force_recompute=True)
+                    tiled_camera.update(float(self.dt), force_recompute=True)
                     updated_tiled_cameras.add(camera_key)
                 eye_images = {
                     eye["name"]: self._tiled_camera_rgb_to_numpy(tiled_camera, eye["sensor_index"])
@@ -1890,3 +1890,39 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
                         self._apply_rgb_camera_valid_circle_mask(right_rgb, rig),
                     ]
         return images_by_name
+
+    def render_stereo_rgb_camera_rigs_batch(self, env_ids, rig_names=None):
+        env_ids = [int(env_id) for env_id in env_ids]
+        selected_names = set(rig_names) if rig_names is not None else None
+
+        for env_id in env_ids:
+            for rig_name, rig in self._rgb_camera_rigs.items():
+                if selected_names is not None and rig_name not in selected_names:
+                    continue
+                self._activate_rgb_camera_env(rig, env_id)
+                if bool(rig.get("pose_update", True)):
+                    self._update_rgb_camera_world_poses(rig, env_id)
+
+        self.sim.forward()
+        self.sim.render()
+        self.sim.render()
+
+        updated_cameras = set()
+        for env_id in env_ids:
+            for rig_name, rig in self._rgb_camera_rigs.items():
+                if selected_names is not None and rig_name not in selected_names:
+                    continue
+                self._activate_rgb_camera_env(rig, env_id)
+                for camera in rig["cameras"].values():
+                    camera_key = id(camera)
+                    if camera_key in updated_cameras:
+                        continue
+                    camera.update(float(self.dt), force_recompute=True)
+                    updated_cameras.add(camera_key)
+
+        return {
+            env_id: self.render_stereo_rgb_camera_rigs(
+                env_id=env_id, rig_names=rig_names, update=False
+            )
+            for env_id in env_ids
+        }

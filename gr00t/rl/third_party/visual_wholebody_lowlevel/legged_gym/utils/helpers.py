@@ -327,6 +327,9 @@ def _apply_cli_scene_args(cfg, args):
             physics_only=bool(getattr(args, "disable_rgb_cameras", False)),
             door_open_lr=args.doorman_door_open_lr,
             episode_seeds=getattr(args, "episode_seeds", None),
+            source_asset_snapshots=getattr(
+                args, "doorman_source_asset_snapshots", None
+            ),
         )
         cfg.doorman_episode_seeds = (
             None
@@ -394,6 +397,12 @@ def _apply_cli_reward_args(cfg, args, apply_reward_scale_preset):
 def _apply_cli_rgb_camera_args(cfg, args):
     rgb_camera_config = isaaclab_app.load_rgb_camera_specs(args.rgb_camera_config)
     cfg.rgb_camera_backend = args.rgb_camera_backend
+    cfg.rgb_camera_shared_sidecar = bool(
+        getattr(args, "rgb_camera_shared_sidecar", False)
+    )
+    cfg.rgb_camera_sidecar_pool_size = int(
+        getattr(args, "rgb_camera_sidecar_pool_size", 1)
+    )
     if rgb_camera_config is None:
         return
 

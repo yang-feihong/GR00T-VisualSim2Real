@@ -1,25 +1,61 @@
-# AutoOpen Collection
+# AutoOpen Official Collection
 
-`run_auto_open.sh` is the only supported AutoOpen execution entry. It always
-runs the vectorized controller and strict data collector. Each physical GPU
-owns one Isaac Sim process; all seeds assigned to that GPU are environments in
-that process.
+`run_auto_open.sh` is the only supported AutoOpen execution entry. A single
+invocation runs one of two maintained workflows.
+
+## Official mode
+
+This is the default. It performs:
+
+1. Run every seed without cameras using one vectorized Isaac Sim process per
+   physical GPU.
+2. Apply strict per-episode data acceptance and select only accepted seeds.
+3. Replay each accepted canonical trajectory without advancing physics or
+   invoking the policy/FSM, adding the two training cameras.
+4. Re-run strict acceptance, publish the completed dataset under
+   `datasets/auto_open/releases/`.
+
+Only the inclusive seed range is required:
 
 ```bash
-DATASET_ROOT=/workspace/GR00T-VisualSim2Real/logs_rl/example \
-CAMERA_MODE=none \
-SEED_START=1700 NUM_EPISODES=1000 \
+SEED_START=1700 SEED_END=2699 \
 bash gr00t/rl/scripts/run_auto_open.sh
 ```
 
-`DATASET_ROOT` is required. `CAMERA_MODE` is `none`, `dual`, or `six` and
-changes only recorded image modalities. `SEEDS=1700,1701,...` may replace
-`SEED_START` and `NUM_EPISODES`; `GPU_IDS` defaults to `0,1,2,3`.
+`GPU_IDS` defaults to `0,1,2,3`. It is an execution-resource setting, not a
+dataset behavior switch. The official data semantics are fixed: 4000 maximum
+control steps, no cameras in the canonical control run, dual cameras in the
+published release, deterministic per-seed camera randomization, and strict
+acceptance before and after image generation.
 
-The launcher rejects command-line arguments, duplicate seeds, existing output
-directories, and direct Python invocation. Scene sampling, initialization,
-targets, policy rows, camera calibration, stage sequence, and strict result are
-seed-based rather than rank- or slot-based. Camera mode is observational and
-must not alter the trajectory. GPU PhysX does not promise bitwise-identical
-contact impulses when the vector batch changes, so post-contact physical state
-is not claimed to be byte-identical across different batch sizes.
+The no-camera source, including rejected shards and their audit reports, is
+retained under `datasets/auto_open/canonical/`. A failed camera phase remains
+under `datasets/auto_open/work/` and is never linked as an official release.
+Completed releases use this naming contract:
+
+```text
+auto_open_v1_seeds<start>-<end>_episodes<accepted>_dual_camera_<YYYYMMDDTHHMMSS>
+```
+
+Every invocation creates an independent timestamped canonical source and
+release. Datasets are additive records; the workflow does not maintain a
+`latest` alias and never replaces or implicitly reuses an older collection.
+
+## Debug mode
+
+Debug mode runs the complete seed range directly with all six diagnostic
+cameras and then applies the same strict acceptance suite:
+
+```bash
+AUTO_OPEN_MODE=debug SEED_START=1700 SEED_END=1703 \
+bash gr00t/rl/scripts/run_auto_open.sh
+```
+
+Debug outputs are stored under `datasets/auto_open/debug/`. They include an
+`accepted_seeds.txt` selection but are never published under `releases/` and
+remain independent of every official dataset.
+
+The launcher accepts no command-line arguments. The maintained configuration
+surface is `SEED_START`, `SEED_END`, and optional `AUTO_OPEN_MODE`; `GPU_IDS` is
+only an execution-resource setting. Direct Python invocation is rejected, and
+there are no separate no-camera, camera, scalar, video, or replay launchers.
