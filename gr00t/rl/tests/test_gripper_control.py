@@ -1,5 +1,3 @@
-import math
-
 import torch
 
 from gr00t.rl.third_party.visual_wholebody_lowlevel.legged_gym.envs.manip_loco.gripper_control import (
@@ -55,19 +53,18 @@ def test_contact_loss_resumes_gradual_closure():
     assert hold.tolist() == [False]
 
 
-def test_overload_releases_actuator_without_changing_semantic_command():
+def test_high_contact_force_keeps_latched_actuator_target():
     semantic = torch.zeros(1, 1)
     target, hold = advance_gripper_actuator_targets(
         semantic,
-        torch.tensor([[-0.24]]),
+        torch.tensor([[-0.23]]),
         torch.tensor([[-0.24]]),
         torch.tensor([True]),
-        torch.tensor([[51.0, 4.0]]),
+        torch.tensor([[500.0, 400.0]]),
     )
-    torch.testing.assert_close(target[:, 0], torch.tensor([-0.241]))
+    torch.testing.assert_close(target[:, 0], torch.tensor([-0.24]))
     torch.testing.assert_close(semantic, torch.zeros_like(semantic))
     assert hold.tolist() == [True]
-    assert target.item() >= -math.pi / 3.0
 
 
 def test_rows_transition_independently_in_one_batch():

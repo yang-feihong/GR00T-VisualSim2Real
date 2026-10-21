@@ -14,6 +14,23 @@ MANIP_LOCO = (
 )
 
 
+def test_default_arm_presets_match_requested_joint_angles():
+    config = ast.parse((MANIP_LOCO.parent / "b2z1_config.py").read_text())
+    xr = next(n for n in ast.walk(config) if isinstance(n, ast.ClassDef) and n.name == "xr_teleop")
+    presets = {
+        n.targets[0].id: ast.literal_eval(n.value)
+        for n in xr.body if isinstance(n, ast.Assign)
+    }
+    assert presets["front_preset_q"] == "-1.57,2.6,-1.5,0.4,0,0"
+    assert presets["back_preset_q"] == "1.57,1.57,-1.3,1.1,0,0"
+    cli = ast.parse((AUTO_OPEN / "cli.py").read_text())
+    middle = next(
+        k.value for n in ast.walk(cli) if isinstance(n, ast.Call)
+        for k in n.keywords if k.arg == "doorman_arm_joint_init_center"
+    )
+    assert ast.literal_eval(middle) == (-1.57, 1.75, -0.785, -0.93, 0.0, 0.0)
+
+
 def test_all_auto_open_modules_resolve_their_runtime_imports():
     module_names = (
         "cli",
@@ -138,7 +155,20 @@ def test_domain_modules_do_not_call_removed_controller_methods():
 
 def test_auto_open_has_one_experiment_launcher():
     launchers = sorted(path.name for path in SCRIPTS.glob("run_auto_open*.sh"))
-    assert launchers == ["run_auto_open.sh"]
+    assert launchers == ["run_auto_open.sh", "run_auto_open_pitch_probe.sh"]
+
+
+def test_debug_workflow_always_publishes_six_camera_mosaics():
+    launcher = (SCRIPTS / "run_auto_open.sh").read_text(encoding="utf-8")
+    assert "write_six_camera_mosaics" in launcher
+    assert 'if [[ "${AUTO_OPEN_MODE}" == debug ]]' in launcher
+    assert "common_args+=(--debug_trace)" in launcher
+
+
+def test_canonical_mode_reuses_official_no_camera_phase_without_replay():
+    launcher = (SCRIPTS / "run_auto_open.sh").read_text(encoding="utf-8")
+    assert 'AUTO_OPEN_MODE}" == canonical' in launcher
+    assert "canonical validation completed" in launcher
 
 
 def test_auto_open_uses_batch_invariant_physx_partitioning():
@@ -208,7 +238,7 @@ def test_domain_package_dependency_graph_is_acyclic():
 
 def test_direct_python_entry_requires_the_fixed_launcher_identity():
     source = (SCRIPTS / "doorman_auto_open.py").read_text(encoding="utf-8")
-    assert 'AUTO_OPEN_FIXED_ENTRY") != "run_auto_open.sh"' in source
+    assert '"run_auto_open.sh", "run_auto_open_pitch_probe.sh"' in source
     assert "run_auto_open_*.sh" not in source
 
 
@@ -223,8 +253,9 @@ def test_no_alternate_python_script_wraps_the_auto_open_entry():
     assert wrappers == []
 
 
-def test_one_door_controller_class_owns_scalar_and_batch_state_machine():
+def test_tensor_fsm_is_the_only_auto_open_execution_path():
     source = (SCRIPTS / "doorman_auto_open.py").read_text(encoding="utf-8")
+    runtime_source = (AUTO_OPEN / "runtime.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     controller_classes = [
         node
@@ -237,7 +268,12 @@ def test_one_door_controller_class_owns_scalar_and_batch_state_machine():
         for node in controller_classes[0].body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
-    assert {"command", "advance"} <= methods
+    assert "command" not in methods
+    assert "advance" not in methods
+    assert "fsm.command(" in runtime_source
+    assert "fsm.advance(" in runtime_source
+    assert "controller.command(" not in runtime_source
+    assert "controller.advance(" not in runtime_source
     assert "ScalarDoorController" not in source
     assert "BatchedDoorController" not in source
 

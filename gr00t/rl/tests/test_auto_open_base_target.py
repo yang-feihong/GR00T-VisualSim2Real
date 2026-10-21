@@ -3,9 +3,6 @@ import inspect
 import numpy as np
 import torch
 
-from gr00t.rl.scripts.doorman_auto_open import (
-    DoorController,
-)
 from gr00t.rl.auto_open.control import (
     ALIGN_PANEL_ARRIVAL,
     APPROACH_ARRIVAL,
@@ -151,24 +148,11 @@ def test_approach_large_reversal_crosses_zero_for_one_frame():
     assert np.allclose(second, [-0.014, 0.04, -0.02])
 
 
-def test_base_stabilizer_runs_once_at_the_final_dispatch_boundary():
-    approach_source = inspect.getsource(DoorController._command_approach)
-    command_source = inspect.getsource(DoorController.command)
-    assert approach_source.count("_zero_cross_base_reversal(") == 1
-    assert command_source.count("_stabilize_base_command(") == 1
-    assert "return self._command_approach(state)" in command_source
-
-
 def test_point_target_stages_use_the_shared_arrival_interface():
-    assert "_update_base_arrival(" in inspect.getsource(
-        DoorController._command_approach
-    )
-    assert "_update_base_arrival(" in inspect.getsource(DoorController.command)
-    for method_name in (
-        "command_approach",
-        "_base_hold_command",
-        "command_align_panel",
-    ):
+    for method_name in ("command_approach", "command_align_panel"):
+        source = inspect.getsource(getattr(TensorDoorFSM, method_name))
+        assert "_track_station" in source
+    for method_name in ("_track_station", "_base_hold_command"):
         source = inspect.getsource(getattr(TensorDoorFSM, method_name))
         assert "_update_base_arrival" in source
 
@@ -182,12 +166,6 @@ def test_base_target_remains_a_stateless_feedback_controller():
     assert distance[0] < 0.12
     assert yaw_error[0] == 0.0
     assert np.linalg.norm(command[0, :2]) > 0.0
-
-
-def test_terminal_hold_overrides_reversal_filter_with_exact_zero():
-    command_source = inspect.getsource(DoorController.command)
-    assert "if stop_for_arrival:" in command_source
-    assert "base_cmd[:] = 0.0" in command_source
 
 
 def test_base_arrival_requires_continuous_zero_command_window():

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 
 import torch
 
@@ -16,6 +17,13 @@ _ARM_JOINT_ORIGINS = (
     (0.0492, 0.0, 0.0),
 )
 _ARM_JOINT_AXES = (2, 1, 1, 1, 2, 0)
+
+
+@lru_cache(maxsize=16)
+def _arm_offset_tensors(dtype, device):
+    offsets = ((0.22, 0.0, 0.17), *_ARM_JOINT_ORIGINS,
+               (0.051, 0.0, 0.0), (0.049, 0.0, 0.0))
+    return tuple(torch.tensor(offset, dtype=dtype, device=device) for offset in offsets)
 
 # The union of the refined fixed and moving gripper collision hulls at the
 # closed reset position, expressed in gripper_link coordinates. These bounds
@@ -64,6 +72,31 @@ def _axis_rotation(
     return torch.stack(values, dim=-1).reshape(angle.shape + (3, 3)).to(dtype=dtype)
 
 
+def _fixed_matmul_3x3(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
+    return torch.stack(
+        [
+            left[..., row, 0] * right[..., 0, column]
+            + left[..., row, 1] * right[..., 1, column]
+            + left[..., row, 2] * right[..., 2, column]
+            for row in range(3)
+            for column in range(3)
+        ],
+        dim=-1,
+    ).reshape(left.shape[:-2] + (3, 3))
+
+
+def _fixed_matvec_3(rotation: torch.Tensor, vector: torch.Tensor) -> torch.Tensor:
+    return torch.stack(
+        [
+            rotation[..., row, 0] * vector[..., 0]
+            + rotation[..., row, 1] * vector[..., 1]
+            + rotation[..., row, 2] * vector[..., 2]
+            for row in range(3)
+        ],
+        dim=-1,
+    )
+
+
 def b2z1_gripper_pose_and_jacobian(
     root_position: torch.Tensor,
     root_quaternion_xyzw: torch.Tensor,
@@ -82,12 +115,13 @@ def b2z1_gripper_pose_and_jacobian(
     dtype = root_position.dtype
     device = root_position.device
 
-    mount_offset = torch.tensor((0.22, 0.0, 0.17), dtype=dtype, device=device)
-    position = position + torch.einsum("...ij,j->...i", rotation, mount_offset)
+    offsets = _arm_offset_tensors(dtype, device)
+    mount_offset = offsets[0]
+    position = position + _fixed_matvec_3(rotation, mount_offset)
     mount_yaw = torch.full(
         arm_joint_position.shape[:-1], math.pi / 2.0, dtype=dtype, device=device
     )
-    rotation = rotation @ _axis_rotation(mount_yaw, 2, dtype)
+    rotation = _fixed_matmul_3x3(rotation, _axis_rotation(mount_yaw, 2, dtype))
 
     joint_origins = []
     joint_axes = []
@@ -95,22 +129,23 @@ def b2z1_gripper_pose_and_jacobian(
     for joint_index, (origin, axis) in enumerate(
         zip(_ARM_JOINT_ORIGINS, _ARM_JOINT_AXES)
     ):
-        offset = torch.tensor(origin, dtype=dtype, device=device)
-        position = position + torch.einsum("...ij,j->...i", rotation, offset)
+        offset = offsets[joint_index + 1]
+        position = position + _fixed_matvec_3(rotation, offset)
         joint_origins.append(position)
         joint_axes.append(rotation[..., :, axis])
-        rotation = rotation @ _axis_rotation(
-            arm_joint_position[..., joint_index], axis, dtype
+        rotation = _fixed_matmul_3x3(
+            rotation,
+            _axis_rotation(arm_joint_position[..., joint_index], axis, dtype),
         )
 
-    stator_offset = torch.tensor((0.051, 0.0, 0.0), dtype=dtype, device=device)
-    position = position + torch.einsum("...ij,j->...i", rotation, stator_offset)
+    stator_offset = offsets[7]
+    position = position + _fixed_matvec_3(rotation, stator_offset)
     stator_roll = torch.full(
         arm_joint_position.shape[:-1], -math.pi / 2.0, dtype=dtype, device=device
     )
-    rotation = rotation @ _axis_rotation(stator_roll, 0, dtype)
-    ee_offset = torch.tensor((0.049, 0.0, 0.0), dtype=dtype, device=device)
-    position = position + torch.einsum("...ij,j->...i", rotation, ee_offset)
+    rotation = _fixed_matmul_3x3(rotation, _axis_rotation(stator_roll, 0, dtype))
+    ee_offset = offsets[8]
+    position = position + _fixed_matvec_3(rotation, ee_offset)
 
     origins = torch.stack(joint_origins, dim=-2)
     axes = torch.stack(joint_axes, dim=-1)
@@ -132,6 +167,7 @@ def solve_b2z1_arm_ik(
     *,
     iterations: int = 80,
     damping: float = 0.03,
+    error_status: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Solve batched six-DoF gripper poses with damped least-squares IK."""
     joint_position = initial_joint_position.clone()
@@ -149,11 +185,15 @@ def solve_b2z1_arm_ik(
             + torch.cross(rotation[..., :, 2], target_rotation[..., :, 2], dim=-1)
         )
         error = torch.cat((position_error, orientation_error), dim=-1)
-        delta = torch.linalg.solve(
-            jacobian.transpose(-1, -2) @ jacobian
-            + (damping * damping) * identity,
-            (jacobian.transpose(-1, -2) @ error.unsqueeze(-1)),
-        ).squeeze(-1)
+        matrix = jacobian.transpose(-1, -2) @ jacobian + (damping * damping) * identity
+        rhs = jacobian.transpose(-1, -2) @ error.unsqueeze(-1)
+        if error_status is None:
+            solution = torch.linalg.solve(matrix, rhs)
+        else:
+            # Graph replay defers the same LAPACK error check until its end.
+            solution, info = torch.linalg.solve_ex(matrix, rhs, check_errors=False)
+            error_status.logical_or_(torch.any(info != 0))
+        delta = solution.squeeze(-1)
         joint_position += delta.clamp(-0.15, 0.15)
         joint_position.clamp_(joint_lower, joint_upper)
 

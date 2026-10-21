@@ -7,8 +7,6 @@ from gr00t.rl.scripts.doorman_auto_open import (
     _solve_center_vertical_shift,
 )
 from gr00t.rl.auto_open.geometry import (
-    HANDLE_AXLE_MARGIN_MIN_M,
-    HANDLE_FREE_MARGIN_MIN_M,
     _axial_end_margins,
     _axial_target_correction,
     _center_handle_axial_overlap,
@@ -68,25 +66,6 @@ def test_axial_target_correction_applies_stricter_post_noise_margin():
         free_margin=0.015,
     )
     assert math.isclose(correction, 0.016742, abs_tol=1.0e-12)
-
-
-def test_center_capture_requires_axle_and_free_end_margins():
-    controller = _controller()
-    metrics = {
-        "valid": True,
-        "pocket_normal_error": 0.0,
-        "channel_vertical_error": 0.0,
-        "grasp_depth": 0.020,
-        "panel_clearance": 0.010,
-        "handle_axle_margin": HANDLE_AXLE_MARGIN_MIN_M,
-        "handle_free_margin": HANDLE_FREE_MARGIN_MIN_M,
-    }
-    assert controller._center_capture_ready(metrics)
-    metrics["handle_axle_margin"] -= 1.0e-6
-    assert not controller._center_capture_ready(metrics)
-    metrics["handle_axle_margin"] = HANDLE_AXLE_MARGIN_MIN_M
-    metrics["handle_free_margin"] -= 1.0e-6
-    assert not controller._center_capture_ready(metrics)
 
 
 def test_opposed_grasp_does_not_reject_axially_offset_contact_points():

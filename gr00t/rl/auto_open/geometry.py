@@ -19,6 +19,17 @@ HANDLE_FREE_MARGIN_MIN_M = 0.010
 HANDLE_AXLE_TARGET_MARGIN_M = 0.025
 HANDLE_FREE_TARGET_MARGIN_M = 0.015
 
+# Fingertip geometry anchors grasp targets; contact classification needs the
+# complete rigid-body collision surface, including the pocket backstop.
+ROBOT_COLLIDER_SPECS = (
+    ("link06", "wrist", ("link06/collisions/mesh_0",)),
+    ("link06", "fixed_finger", ("fixed_convex_023", "fixed_convex_024")),
+    ("gripperMover", "moving_finger", ("moving_convex_000",)),
+    ("link06", "fixed_contact_surfaces", ("link06/collisions/",)),
+    ("gripperMover", "moving_contact_surfaces", ("grippermover/collisions/",)),
+    ("gripper_link", "tcp", ("gripper_link/collisions",)),
+)
+
 
 def _axial_end_margins(axial_min, axial_max, outer_half_length):
     """Return jaw clearance from the axle-side and free-end handle tips."""
@@ -210,11 +221,15 @@ class ColliderGeometry:
     the final contact response.
     """
 
-    def __init__(self, name, body_name, points_body, source_paths):
+    def __init__(self, name, body_name, points_body, source_paths, triangles_body=None):
         self.name = name
         self.body_name = body_name
         self.points_body = np.asarray(points_body, dtype=np.float32)
         self.source_paths = list(source_paths)
+        self.triangles_body = (
+            np.empty((0, 3, 3), dtype=np.float32)
+            if triangles_body is None else np.asarray(triangles_body, dtype=np.float32)
+        )
         if self.points_body.ndim != 2 or self.points_body.shape[1] != 3 or not len(self.points_body):
             raise RuntimeError(f"empty collision geometry for {name}: {source_paths}")
 
@@ -245,6 +260,7 @@ def _read_collider_points(stage, body_prim, tokens):
     inv_body_xf = body_xf.GetInverse()
     points = []
     paths = []
+    triangles = []
     for prim in Usd.PrimRange(body_prim, Usd.TraverseInstanceProxies()):
         path_text = str(prim.GetPath())
         low = path_text.lower()
@@ -270,13 +286,30 @@ def _read_collider_points(stage, body_prim, tokens):
         if local_points:
             xf = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(Usd.TimeCode.Default())
             transformed = [inv_body_xf.Transform(xf.Transform(p)) for p in local_points]
+            if prim.IsA(UsdGeom.Mesh):
+                mesh = UsdGeom.Mesh(prim)
+                indices = list(mesh.GetFaceVertexIndicesAttr().Get() or [])
+                counts = list(mesh.GetFaceVertexCountsAttr().Get() or [])
+                vertices = np.asarray(transformed, dtype=np.float32)
+                center = vertices.mean(axis=0)
+                offset = 0
+                for count in counts:
+                    face = indices[offset:offset + count]
+                    for index in range(1, count - 1):
+                        triangle = vertices[[face[0], face[index], face[index + 1]]].copy()
+                        normal = np.cross(triangle[1] - triangle[0], triangle[2] - triangle[0])
+                        if np.dot(normal, triangle.mean(axis=0) - center) < 0:
+                            triangle = triangle[[0, 2, 1]]
+                        if np.dot(normal, normal) > 1e-16:
+                            triangles.append(triangle)
+                    offset += count
             # Large jaw meshes are reduced to a deterministic hull sample.
             stride = max(1, len(transformed) // 1024)
             points.extend(np.asarray(transformed[::stride], dtype=np.float32))
             paths.append(path_text)
     if not points:
         return None
-    return ColliderGeometry("", body_prim.GetName(), np.asarray(points), paths)
+    return ColliderGeometry("", body_prim.GetName(), np.asarray(points), paths, triangles)
 
 def _quat_rotate_points_torch(quaternion_wxyz, points):
     """Rotate one point cloud per quaternion with float32 Isaac semantics."""
@@ -794,19 +827,7 @@ def _introspect_robot_colliders(self, state):
     if root is None:
         raise RuntimeError("Unable to find robot root in the loaded USD stage")
     found = {}
-    # The decomposed gripper meshes also contain the palm and linkage.
-    # Only these distal hulls form the opposing fingertips.  The names
-    # are inherited directly from the lab30 B2Z1 URDF decomposition.
-    for body_name, key, tokens in (
-        ("link06", "wrist", ("link06/collisions/mesh_0",)),
-        (
-            "link06",
-            "fixed_finger",
-            ("fixed_convex_023", "fixed_convex_024"),
-        ),
-        ("gripperMover", "moving_finger", ("moving_convex_000",)),
-        ("gripper_link", "tcp", ("gripper_link/collisions",)),
-    ):
+    for body_name, key, tokens in ROBOT_COLLIDER_SPECS:
         body = None
         for prim in Usd.PrimRange(root, Usd.TraverseInstanceProxies()):
             if prim.GetName().lower() == body_name.lower() and prim.IsValid():

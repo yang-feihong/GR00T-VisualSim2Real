@@ -11,13 +11,10 @@ def advance_gripper_actuator_targets(
     finger_forces: torch.Tensor,
     *,
     contact_force_threshold: float = 1.0,
-    overload_force_threshold: float = 50.0,
     free_close_step: float = 0.016,
     free_command_lead: float = 0.080,
     contact_close_step: float = 0.008,
     contact_command_lead: float = 0.024,
-    overload_release_step: float = 0.001,
-    fully_open_position: float = -torch.pi / 3.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Advance physical jaw targets while preserving semantic commands.
 
@@ -67,14 +64,5 @@ def advance_gripper_actuator_targets(
         advanced = torch.minimum(next_targets + step, actual_positions + lead)
         advanced = torch.minimum(advanced, semantic_targets)
         next_targets[free_closing] = advanced[free_closing]
-
-    peak_force = torch.max(finger_forces, dim=1).values
-    overloaded = closing & next_hold & (peak_force > overload_force_threshold)
-    if torch.any(overloaded):
-        released = next_targets[overloaded] - overload_release_step
-        next_targets[overloaded] = torch.maximum(
-            released,
-            torch.full_like(released, fully_open_position),
-        )
 
     return next_targets, next_hold

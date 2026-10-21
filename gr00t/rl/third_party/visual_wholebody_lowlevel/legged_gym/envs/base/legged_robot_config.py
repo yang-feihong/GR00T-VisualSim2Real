@@ -82,8 +82,8 @@ class LeggedRobotIsaacLabCfg(DirectRLEnvCfg):
         gravity=(0.0, 0.0, -9.81),
         physx=PhysxCfg(
             solver_type=1,
-            max_position_iteration_count=4,
-            max_velocity_iteration_count=0,
+            max_position_iteration_count=16,
+            max_velocity_iteration_count=2,
         ),
     )
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=1, env_spacing=3.0, replicate_physics=True)
@@ -116,8 +116,8 @@ class LeggedRobotIsaacLabCfg(DirectRLEnvCfg):
             ),
             articulation_props=sim_utils.ArticulationRootPropertiesCfg(
                 enabled_self_collisions=True,
-                solver_position_iteration_count=4,
-                solver_velocity_iteration_count=0,
+                solver_position_iteration_count=16,
+                solver_velocity_iteration_count=2,
             ),
         ),
         init_state=ArticulationCfg.InitialStateCfg(pos=(0.0, 0.0, 0.55), rot=(1.0, 0.0, 0.0, 0.0), joint_pos={}),
@@ -138,6 +138,7 @@ class LeggedRobotIsaacLabCfg(DirectRLEnvCfg):
                 },
                 stiffness=0,
                 damping=0,
+                armature=0.1,  # Reflected leg motor inertia used during policy training.
             ),            
             # "legs": ImplicitActuatorCfg(
             #     joint_names_expr=[".*hip_joint", ".*thigh_joint", ".*calf_joint"],

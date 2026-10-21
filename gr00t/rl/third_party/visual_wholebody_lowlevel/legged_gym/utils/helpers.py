@@ -124,6 +124,7 @@ def build_common_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--scene_position", type=float, nargs=3, default=None)
     parser.add_argument("--enable_doorman_scene", action="store_true")
     parser.add_argument("--doorman_door_open_lr", type=str, choices=["left", "right"], default=None)
+    parser.add_argument("--doorman_door_open_io", type=str, choices=["in", "out"], default="in")
     parser.add_argument("--doorman_randomize_robot_init", type=str_to_bool, nargs="?", const=True, default=True)
     parser.add_argument("--doorman_robot_init_height", type=float, default=None)
     parser.add_argument("--doorman_arm_joint_init_center", type=float, nargs=6, default=None)
@@ -326,6 +327,7 @@ def _apply_cli_scene_args(cfg, args):
             int(args.seed if args.seed is not None else 0),
             physics_only=bool(getattr(args, "disable_rgb_cameras", False)),
             door_open_lr=args.doorman_door_open_lr,
+            door_open_io=args.doorman_door_open_io,
             episode_seeds=getattr(args, "episode_seeds", None),
             source_asset_snapshots=getattr(
                 args, "doorman_source_asset_snapshots", None

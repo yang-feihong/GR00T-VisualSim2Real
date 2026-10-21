@@ -45,6 +45,8 @@ class BaseArrivalProfile:
     inner_yaw_rad: float
     outer_yaw_rad: float
     settle_frames: int
+    max_linear_speed_m_s: float
+    max_angular_speed_rad_s: float
 
     def __post_init__(self):
         if self.inner_distance_m > self.outer_distance_m:
@@ -53,13 +55,17 @@ class BaseArrivalProfile:
             raise ValueError("inner yaw must not exceed outer yaw")
         if self.settle_frames <= 0:
             raise ValueError("settle_frames must be positive")
+        if self.max_linear_speed_m_s <= 0.0:
+            raise ValueError("maximum linear speed must be positive")
+        if self.max_angular_speed_rad_s <= 0.0:
+            raise ValueError("maximum angular speed must be positive")
 
 
 # These values are deliberately centralized and stage-specific.  The controller
 # architecture does not depend on them, so they can be tuned without changing
 # stage logic.
-APPROACH_ARRIVAL = BaseArrivalProfile(0.05, 0.15, 0.05, 0.10, 25)
-ALIGN_PANEL_ARRIVAL = BaseArrivalProfile(0.05, 0.15, 0.05, 0.10, 25)
+APPROACH_ARRIVAL = BaseArrivalProfile(0.05, 0.15, 0.05, 0.10, 25, 0.02, 0.05)
+ALIGN_PANEL_ARRIVAL = BaseArrivalProfile(0.05, 0.15, 0.05, 0.10, 25, 0.02, 0.05)
 
 # Compatibility names for diagnostics and low-level command shaping.  They are
 # not the stage arrival contract.

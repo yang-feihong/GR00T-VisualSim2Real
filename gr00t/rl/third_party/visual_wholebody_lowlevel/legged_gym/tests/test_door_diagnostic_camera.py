@@ -5,25 +5,25 @@ import numpy as np
 from legged_gym.utils.door_diagnostic_camera import (
     axis_angle_to_matrix,
     closed_leaf_pose,
-    infer_push_side_leaf,
+    panel_normal_toward_reference,
 )
 
 
-def test_push_side_is_opposite_the_opening_motion_for_mirrored_doors():
-    hinge_axis = np.asarray([0.0, 0.0, 1.0])
-    hinge_pivot = np.zeros(3)
-    handle_pivot = np.asarray([1.0, 0.0, 0.0])
-
+def test_panel_normal_points_toward_actual_robot_side():
+    panel_normal = np.asarray([1.0, 0.0, 0.0])
+    panel_point = np.asarray([2.0, 3.0, 1.0])
     np.testing.assert_allclose(
-        infer_push_side_leaf(hinge_axis, 1.0, hinge_pivot, handle_pivot),
-        [0.0, -1.0, 0.0],
+        panel_normal_toward_reference(
+            panel_normal, panel_point, np.asarray([4.0, 8.0, 0.0])
+        ),
+        [1.0, 0.0, 0.0],
     )
     np.testing.assert_allclose(
-        infer_push_side_leaf(hinge_axis, -1.0, hinge_pivot, handle_pivot),
-        [0.0, 1.0, 0.0],
+        panel_normal_toward_reference(
+            panel_normal, panel_point, np.asarray([0.0, -2.0, 2.0])
+        ),
+        [-1.0, 0.0, 0.0],
     )
-
-
 def test_closed_leaf_pose_undoes_current_hinge_rotation_about_world_pivot():
     angle = math.radians(20.0)
     current_rotation = axis_angle_to_matrix(np.asarray([0.0, 0.0, 1.0]), angle)

@@ -115,7 +115,7 @@ def rgb_camera_specs_from_config(config):
                 f"Door diagnostic camera '{camera_name}' has unsupported "
                 f"target_reference={target_reference!r}."
             )
-        if view_axis_reference not in ("handle_body", "door_leaf", "push_side"):
+        if view_axis_reference not in ("handle_body", "door_leaf", "robot_side"):
             raise ValueError(
                 f"Door diagnostic camera '{camera_name}' has unsupported "
                 f"view_axis_reference={view_axis_reference!r}."
@@ -148,8 +148,8 @@ def rgb_camera_specs_from_config(config):
             "mount_frame": mount_frame,
             "view_axis_direction_mode": direction_mode,
             "view_axis_direction_sign": direction_sign,
-            "minimum_push_side_offset_m": float(
-                section.get("minimum_push_side_offset_m", 0.05)
+            "minimum_robot_side_offset_m": float(
+                section.get("minimum_robot_side_offset_m", 0.05)
             ),
             "fill_light_up_offset_m": float(section.get("fill_light_up_offset_m", 0.0)),
             "fill_light_right_offset_m": float(section.get("fill_light_right_offset_m", 0.0)),

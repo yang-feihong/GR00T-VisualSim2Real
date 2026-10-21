@@ -117,6 +117,35 @@ def test_each_camera_owns_an_independent_seeded_stream():
     )
 
 
+def test_diagnostic_camera_is_excluded_from_collection_randomization():
+    config = copy.deepcopy(NOMINAL)
+    diagnostic = {
+        "name": "robot_top_diagnostic",
+        "enabled": True,
+        "randomize_for_collection": False,
+        "body_name": "base_link",
+        "position": [0.0, 0.0, 3.0],
+        "rotation": [0.0, math.pi / 2.0, 0.0],
+        "projection_type": "pinhole",
+        "horizontal_fov": 70.0,
+    }
+    config["cameras"].append(diagnostic)
+
+    actual, metadata = randomize_camera_mounts(
+        config,
+        seed=1700,
+        position_radius_m=0.02,
+        rotation_angle_deg=15.0,
+        focal_scale_fraction=0.08,
+        principal_point_radius_px=5.0,
+        distortion_relative_fraction=0.10,
+    )
+
+    assert actual["cameras"][-1] == diagnostic
+    assert "robot_top_diagnostic" not in metadata["samples"]
+    assert metadata["excluded_cameras"] == ["robot_top_diagnostic"]
+
+
 def test_zero_bounds_preserve_mount_values_exactly():
     actual, metadata = randomize_camera_mounts(
         NOMINAL, seed=1700, position_radius_m=0.0, rotation_angle_deg=0.0

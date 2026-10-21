@@ -240,8 +240,8 @@ class B2Z1IsaacLabCfg(LeggedRobotIsaacLabCfg):
         min_arm_z = -0.7
         max_arm_z = 0.85
         arm_joint_motion_timeout_s = 7.0
-        front_preset_q = ""
-        back_preset_q = ""
+        front_preset_q = "-1.57,2.6,-1.5,0.4,0,0"
+        back_preset_q = "1.57,1.57,-1.3,1.1,0,0"
         right_controller_pose_offset_xyz = "0,0.03,-0.015"
         right_controller_pose_offset_rpy_deg = "-35,-6,8"
 

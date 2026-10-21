@@ -46,66 +46,10 @@ def solve_steady_path_request(request):
     joint_positions = {name: float(values[index]) for index, name in enumerate(names)}
     root = np.asarray(request["root_state"], dtype=np.float64)
 
-    pregrasp_selection = None
-    candidates = request.get("pregrasp_candidates")
-    if candidates:
-        selected = None
-        best = None
-        diagnostics = []
-        for candidate in candidates:
-            candidate_end = np.asarray(candidate["end_position"], dtype=np.float64)
-            candidate_orientation = np.asarray(
-                candidate["orientation"], dtype=np.float64
-            )
-            result = model.inverse(
-                candidate_end,
-                candidate_orientation,
-                base_position_world=root[:3],
-                base_orientation_world_wxyz=root[3:7],
-                joint_positions=joint_positions,
-                position_tolerance_m=float("inf"),
-                orientation_tolerance=float("inf"),
-            )
-            position_error = float(np.linalg.norm(result.position_error))
-            orientation_error = float(np.linalg.norm(result.orientation_error))
-            diagnostics.append(
-                {
-                    "pitch_deg": float(candidate["pitch_deg"]),
-                    "position_error_m": position_error,
-                    "orientation_error": orientation_error,
-                }
-            )
-            score = position_error + orientation_error
-            if best is None or score < best[0]:
-                best = (score, candidate)
-            if position_error <= 1.0e-4 and orientation_error <= 1.0e-4:
-                selected = candidate
-                break
-        exact = selected is not None
-        if selected is None:
-            selected = best[1]
-        end = np.asarray(selected["end_position"], dtype=np.float64)
-        end_orientation = np.asarray(selected["orientation"], dtype=np.float64)
-        pregrasp_selection = {
-            "pitch_deg": float(selected["pitch_deg"]),
-            "orientation": end_orientation.astype(np.float32),
-            "end_position": end.astype(np.float32),
-            "nominal_orientation": np.asarray(
-                selected.get("nominal_orientation", selected["orientation"]),
-                dtype=np.float32,
-            ),
-            "nominal_end_position": np.asarray(
-                selected.get("nominal_end_position", selected["end_position"]),
-                dtype=np.float32,
-            ),
-            "exact": exact,
-            "diagnostics": diagnostics,
-        }
-    else:
-        end = np.asarray(request["end_position_world"], dtype=np.float64)
-        end_orientation = np.asarray(
-            request["end_orientation_world_wxyz"], dtype=np.float64
-        )
+    end = np.asarray(request["end_position_world"], dtype=np.float64)
+    end_orientation = np.asarray(
+        request["end_orientation_world_wxyz"], dtype=np.float64
+    )
     orientation_distance = 2.0 * math.acos(
         float(np.clip(abs(np.dot(start_orientation, end_orientation)), 0.0, 1.0))
     )
@@ -147,7 +91,6 @@ def solve_steady_path_request(request):
         np.asarray(command_positions),
         np.asarray(command_orientations),
         model.consume_tolerance_warning_stats(),
-        pregrasp_selection,
     )
 
 
@@ -223,12 +166,7 @@ def solve_deferred_path_request(request):
     """Dispatch one exact path request without aborting the rest of a batch."""
     try:
         if request["path_kind"] == "steady":
-            (
-                positions,
-                orientations,
-                warning_stats,
-                pregrasp_selection,
-            ) = solve_steady_path_request(
+            positions, orientations, warning_stats = solve_steady_path_request(
                 request
             )
             return {
@@ -236,7 +174,6 @@ def solve_deferred_path_request(request):
                 "positions": positions,
                 "orientations": orientations,
                 "warning_stats": warning_stats,
-                "pregrasp_selection": pregrasp_selection,
             }
         if request["path_kind"] == "release":
             result = solve_release_path_request(request)

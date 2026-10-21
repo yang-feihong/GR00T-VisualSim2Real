@@ -7,9 +7,8 @@ import math
 import numpy as np
 import torch
 
-from legged_gym.utils.steady_path_worker import (
-    solve_deferred_path_request,
-    solve_steady_inverse_request,
+from legged_gym.utils.ee_steady_inverse_gpu import (
+    batched_steady_ee_inverse_no_gravity,
 )
 from gr00t.rl.auto_open.control import (
     _ee_world_orientation_target,
@@ -22,13 +21,17 @@ from gr00t.rl.auto_open.geometry import (
 )
 from gr00t.rl.auto_open.planning import (
     DeferredSteadyInverse,
+    _attach_pregrasp_reachability,
     _apply_pregrasp_candidate,
     _prepare_panel_contact_command,
     _pregrasp_pitch_candidates,
+    _quat_nlerp,
     _release_path_request,
     _sample_reachable_arm_retract_pose,
-    _steady_inverse_worker_request,
     _steady_path_request,
+)
+from gr00t.rl.auto_open.pregrasp_reachability import (
+    select_pregrasp_candidate_from_errors,
 )
 
 
@@ -74,14 +77,64 @@ class TensorPlanningCoordinator:
     def _run_paths(self, pending):
         if not pending:
             return []
-        if self.executor is None:
-            raise RuntimeError("tensor FSM sparse paths require the exact worker backend")
-        results = list(
-            self.executor.map(
-                solve_deferred_path_request,
-                [item[2] for item in pending],
-            )
+        specs = [self._gpu_path_spec(env_id, request) for _, env_id, request in pending]
+        flat = [
+            (spec_index, sample_index, float(fraction))
+            for spec_index, spec in enumerate(specs)
+            for sample_index, fraction in enumerate(spec["fractions"])
+        ]
+        roots = np.stack([specs[index]["root"] for index, _, _ in flat])
+        arms = torch.stack([specs[index]["arm"] for index, _, _ in flat])
+        positions = np.asarray(
+            [
+                (1.0 - fraction) * specs[index]["start"]
+                + fraction * specs[index]["end"]
+                for index, _, fraction in flat
+            ]
         )
+        orientations = np.asarray(
+            [
+                _quat_nlerp(
+                    specs[index]["start_q"], specs[index]["end_q"], fraction
+                )
+                for index, _, fraction in flat
+            ]
+        )
+        result = self._inverse_gpu_batch(
+            [specs[index]["env_id"] for index, _, _ in flat],
+            roots,
+            arms,
+            positions,
+            orientations,
+            [specs[index]["tolerance"] for index, _, _ in flat],
+        )
+        for batch_index, (index, _, _) in enumerate(flat):
+            specs[index]["positions"].append(
+                result.command_position_world[batch_index].detach().cpu().numpy()
+            )
+            specs[index]["orientations"].append(
+                result.command_orientation_world_wxyz[batch_index]
+                .detach()
+                .cpu()
+                .numpy()
+            )
+        results = []
+        for spec in specs:
+            positions = np.asarray(spec["positions"], dtype=np.float32)
+            desired = np.asarray(
+                [(1.0 - value) * spec["start"] + value * spec["end"] for value in spec["fractions"]]
+            )
+            results.append(
+                {
+                    "error": None,
+                    "positions": positions,
+                    "orientations": np.asarray(spec["orientations"], dtype=np.float32),
+                    "max_prediction_error_m": float(
+                        np.linalg.norm(positions - desired, axis=1).max(initial=0.0)
+                    ),
+                    "warning_stats": {},
+                }
+            )
         self.stats["batches"] += 1
         self.stats["requests"] += len(pending)
         for label, _, _ in pending:
@@ -89,18 +142,125 @@ class TensorPlanningCoordinator:
             labels[label] = labels.get(label, 0) + 1
         return results
 
+    def _inverse_gpu_batch(self, env_ids, roots, arms, positions, orientations, tolerances):
+        controller = self.controllers[env_ids[0]]
+        limits = torch.stack(
+            [
+                self.controllers[env_id].env.dof_pos_limits[
+                    self.controllers[env_id].env.arm_joint_ids
+                ]
+                for env_id in env_ids
+            ]
+        )
+        return batched_steady_ee_inverse_no_gravity(
+            torch.as_tensor(positions, device=limits.device, dtype=limits.dtype),
+            torch.as_tensor(orientations, device=limits.device, dtype=limits.dtype),
+            base_position_world=torch.as_tensor(roots[:, :3], device=limits.device, dtype=limits.dtype),
+            base_orientation_world_xyzw=torch.as_tensor(roots[:, [4, 5, 6, 3]], device=limits.device, dtype=limits.dtype),
+            initial_arm_joint_positions=arms,
+            joint_limits=limits,
+            position_tolerance_m=float(max(tolerances)),
+            orientation_tolerance=1.0e-4,
+        )
+
+    def plan_turn_path(self, fsm, device_state, rows):
+        """Resolve a complete press/push-pull/return path once at stage entry."""
+        env_ids = self._ids(rows)
+        if not env_ids:
+            return
+        row_tensor = torch.as_tensor(env_ids, dtype=torch.int64, device=fsm.device)
+        lengths = fsm.turn_path.length[row_tensor].clone()
+        max_samples = int(lengths.max().item())
+        desired_positions = fsm.turn_path.positions[
+            row_tensor, :max_samples
+        ].clone()
+        desired_orientations = fsm.turn_path.orientations[
+            row_tensor, :max_samples
+        ].clone()
+        solved_positions = desired_positions.clone()
+        solved_orientations = desired_orientations.clone()
+        arm_ids = self.controllers[env_ids[0]].env.arm_joint_ids.to(
+            device=fsm.device, dtype=torch.int64
+        )
+        arms = device_state["dof_pos"][row_tensor][:, arm_ids].clone()
+        roots = device_state["root_states"][row_tensor]
+        limits = torch.stack(
+            [
+                self.controllers[env_id].env.dof_pos_limits[
+                    self.controllers[env_id].env.arm_joint_ids
+                ]
+                for env_id in env_ids
+            ]
+        )
+        env_index, sample_index = torch.where(
+            torch.arange(max_samples, device=fsm.device)[None, :]
+            < lengths[:, None]
+        )
+        result = batched_steady_ee_inverse_no_gravity(
+            desired_positions[env_index, sample_index],
+            desired_orientations[env_index, sample_index],
+            base_position_world=roots[env_index, :3],
+            base_orientation_world_xyzw=roots[env_index][:, [4, 5, 6, 3]],
+            initial_arm_joint_positions=arms[env_index],
+            joint_limits=limits[env_index],
+        )
+        solved_positions[env_index, sample_index] = result.command_position_world
+        solved_orientations[env_index, sample_index] = (
+            result.command_orientation_world_wxyz
+        )
+        fsm.turn_path.positions[row_tensor, :max_samples] = solved_positions
+        fsm.turn_path.orientations[row_tensor, :max_samples] = solved_orientations
+        self.stats["batches"] += 1
+        self.stats["requests"] += len(env_ids)
+        labels = self.stats["labels"]
+        labels["turn_stage_path"] = labels.get("turn_stage_path", 0) + len(env_ids)
+
+    def _gpu_path_spec(self, env_id, request):
+        start = np.asarray(request["start_position_world"], dtype=np.float64)
+        end = np.asarray(request["end_position_world"], dtype=np.float64)
+        start_q = np.asarray(request["start_orientation_world_wxyz"], dtype=np.float64)
+        end_q = np.asarray(request["end_orientation_world_wxyz"], dtype=np.float64)
+        if request["path_kind"] == "release":
+            count = int(request["steps"])
+            fractions = np.linspace(0.0, 1.0, count + 1)
+            tolerance = float(request["position_tolerance_m"])
+        else:
+            orientation_distance = 2.0 * math.acos(
+                float(np.clip(abs(np.dot(start_q, end_q)), 0.0, 1.0))
+            )
+            count = max(
+                1,
+                int(math.ceil(float(np.linalg.norm(end - start)) / 0.002)),
+                int(math.ceil(orientation_distance / 0.03)),
+            )
+            fractions = np.linspace(1.0 / count, 1.0, count)
+            tolerance = 5.0e-3
+        names = list(request["dof_names"])
+        values = np.asarray(request["dof_positions"], dtype=np.float32)
+        arm_ids = [names.index(f"joint{index}") for index in range(1, 7)]
+        controller = self.controllers[env_id]
+        device = controller.env.device
+        arm = torch.as_tensor(values[arm_ids], device=device, dtype=torch.float32)
+        root = np.asarray(request["root_state"], dtype=np.float32)
+        return {
+            "env_id": env_id,
+            "start": start,
+            "end": end,
+            "start_q": start_q,
+            "end_q": end_q,
+            "fractions": fractions,
+            "tolerance": tolerance,
+            "root": root,
+            "arm": arm,
+            "positions": [],
+            "orientations": [],
+        }
+
     def plan_pregrasp(self, fsm, device_state, rows):
-        pending = []
+        entries = []
         for env_id in self._ids(rows):
             controller = self.controllers[env_id]
             state = self._state(device_state, env_id)
-            request = _steady_path_request(
-                state,
-                state["ee_pos"][0],
-                controller.center_standoff_ee_world,
-                controller.grasp_orientation_quat,
-                start_orientation_world_wxyz=state["ee_orn"][0],
-            )
             candidates = []
             for candidate in _pregrasp_pitch_candidates(controller):
                 position, orientation = _perturb_ee_target(
@@ -110,17 +270,57 @@ class TensorPlanningCoordinator:
                     candidate["orientation"],
                 )
                 candidates.append(
-                    {
-                        "pitch_deg": candidate["pitch_deg"],
-                        "orientation": orientation.astype(float).tolist(),
-                        "end_position": position.astype(float).tolist(),
-                        "nominal_orientation": candidate["orientation"].astype(float).tolist(),
-                        "nominal_end_position": candidate["end_position"].astype(float).tolist(),
-                    }
+                    _attach_pregrasp_reachability(
+                        controller,
+                        {
+                            "pitch_deg": candidate["pitch_deg"],
+                            "orientation": orientation.astype(float).tolist(),
+                            "end_position": position.astype(float).tolist(),
+                            "nominal_orientation": candidate[
+                                "orientation"
+                            ].astype(float).tolist(),
+                            "nominal_end_position": candidate[
+                                "end_position"
+                            ].astype(float).tolist(),
+                        },
+                        position,
+                        state,
+                    )
                 )
-            request["pregrasp_candidates"] = candidates
+            entries.append((env_id, controller, state, candidates))
+
+        selections = self._select_pregrasp_gpu_batch(entries)
+        pending = []
+        metadata = {}
+        for (env_id, controller, state, _), selection_result in zip(
+            entries, selections, strict=True
+        ):
+            selection, exact, diagnostics = selection_result
+            controller.pregrasp_pitch_diagnostics = diagnostics
+            if not exact:
+                print(
+                    f"[doorman][pregrasp-pitch][error] env={env_id} "
+                    f"no reachable pitch; candidates={diagnostics}",
+                    flush=True,
+                )
+                fsm.fail(torch.as_tensor([env_id], device=fsm.device), 47)
+                continue
+            print(
+                "[doorman][pregrasp-pitch] "
+                f"env={env_id} selected={selection['pitch_deg']:.0f}deg "
+                f"candidates={diagnostics}",
+                flush=True,
+            )
+            request = _steady_path_request(
+                state,
+                state["ee_pos"][0],
+                selection["end_position"],
+                selection["orientation"],
+                start_orientation_world_wxyz=state["ee_orn"][0],
+            )
             request["path_kind"] = "steady"
             pending.append(("arm_align_path", env_id, request))
+            metadata[env_id] = selection
         results = self._run_paths(pending)
         ids, positions, orientations, targets = [], [], [], []
         for (_, env_id, _), result in zip(pending, results, strict=True):
@@ -128,7 +328,7 @@ class TensorPlanningCoordinator:
                 self.stats["errors"] += 1
                 fsm.fail(torch.as_tensor([env_id], device=fsm.device), 40)
                 continue
-            selection = result["pregrasp_selection"]
+            selection = metadata[env_id]
             controller = self.controllers[env_id]
             _apply_pregrasp_candidate(
                 controller,
@@ -147,6 +347,78 @@ class TensorPlanningCoordinator:
             targets.append(selection["end_position"])
         if ids:
             fsm.install_pregrasp_plan(ids, positions, orientations, targets)
+
+    def _select_pregrasp_gpu_batch(self, entries):
+        if not entries:
+            return []
+        flat = []
+        for entry_index, (env_id, _, state, candidates) in enumerate(entries):
+            names = list(state["dof_names"])
+            values = np.asarray(state["dof_pos"])[0]
+            arm_ids = [names.index(f"joint{index}") for index in range(1, 7)]
+            root = np.asarray(state["root_states"])[0]
+            for candidate_index, candidate in enumerate(candidates):
+                flat.append((entry_index, env_id, candidate_index, candidate, root, values[arm_ids]))
+        device = self.controllers[flat[0][1]].env.device
+        sample_counts = [len(item[3]["reachability_positions"]) for item in flat]
+        sample_rows = np.repeat(np.arange(len(flat)), sample_counts)
+        initial_arms = torch.as_tensor(
+            np.asarray([item[5] for item in flat]), device=device, dtype=torch.float32
+        )
+        positions = np.concatenate([item[3]["reachability_positions"] for item in flat])
+        orientations = np.concatenate([item[3]["reachability_orientations"] for item in flat])
+        roots = np.asarray([item[4] for item in flat])[sample_rows]
+        device_sample_rows = torch.as_tensor(sample_rows, device=device, dtype=torch.int64)
+        limits = torch.stack(
+            [
+                self.controllers[item[1]].env.dof_pos_limits[
+                    self.controllers[item[1]].env.arm_joint_ids
+                ]
+                for item in flat
+            ]
+        )
+        result = batched_steady_ee_inverse_no_gravity(
+            torch.as_tensor(positions, device=device, dtype=torch.float32),
+            torch.as_tensor(orientations, device=device, dtype=torch.float32),
+            base_position_world=torch.as_tensor(
+                roots[:, :3], device=device, dtype=torch.float32
+            ),
+            base_orientation_world_xyzw=torch.as_tensor(
+                roots[:, [4, 5, 6, 3]], device=device, dtype=torch.float32
+            ),
+            initial_arm_joint_positions=initial_arms[device_sample_rows],
+            joint_limits=limits[device_sample_rows],
+            position_tolerance_m=float("inf"),
+            orientation_tolerance=float("inf"),
+        )
+        position_errors = (
+            torch.linalg.vector_norm(result.position_error, dim=-1)
+            .detach()
+            .cpu()
+            .numpy()
+        )
+        orientation_errors = (
+            torch.linalg.vector_norm(result.orientation_error, dim=-1)
+            .detach()
+            .cpu()
+            .numpy()
+        )
+        selections = []
+        boundaries = np.cumsum(sample_counts)[:-1]
+        position_errors = np.split(position_errors, boundaries)
+        orientation_errors = np.split(orientation_errors, boundaries)
+        offset = 0
+        for _, _, _, candidates in entries:
+            count = len(candidates)
+            selections.append(
+                select_pregrasp_candidate_from_errors(
+                    candidates,
+                    position_errors[offset : offset + count],
+                    orientation_errors[offset : offset + count],
+                )
+            )
+            offset += count
+        return selections
 
     def plan_center(self, fsm, device_state, rows):
         pending = []
@@ -356,25 +628,53 @@ class TensorPlanningCoordinator:
             finally:
                 controller.defer_steady_inverse = False
         if pending:
-            if self.executor is None:
-                raise RuntimeError("tensor FSM contact IK requires exact workers")
-            results = list(
-                self.executor.map(
-                    solve_steady_inverse_request,
-                    [_steady_inverse_worker_request(request) for _, request in pending],
+            roots, arms, positions, target_orientations, tolerances = [], [], [], [], []
+            for env_id, request in pending:
+                request_state = request.state
+                names = list(request_state["dof_names"])
+                values = np.asarray(request_state["dof_pos"])[0]
+                arm_ids = [names.index(f"joint{index}") for index in range(1, 7)]
+                roots.append(np.asarray(request_state["root_states"])[0])
+                arms.append(torch.as_tensor(values[arm_ids], device=fsm.device, dtype=torch.float32))
+                positions.append(request.desired_position_world)
+                target_orientations.append(request.desired_orientation_world)
+                tolerances.append(
+                        5.0e-3
+                        if request.position_tolerance_m is None
+                        else request.position_tolerance_m
                 )
+            result = self._inverse_gpu_batch(
+                [env_id for env_id, _ in pending],
+                np.asarray(roots),
+                torch.stack(arms),
+                np.asarray(positions),
+                np.asarray(target_orientations),
+                tolerances,
             )
-            for (env_id, request), result in zip(pending, results, strict=True):
-                if result["error"] is not None:
+            position_error = torch.linalg.vector_norm(result.position_error, dim=-1)
+            orientation_error = torch.linalg.vector_norm(result.orientation_error, dim=-1)
+            for batch_index, (env_id, request) in enumerate(pending):
+                controller = self.controllers[env_id]
+                exact = (
+                    float(position_error[batch_index].item()) <= tolerances[batch_index]
+                    and float(orientation_error[batch_index].item()) <= 1.0e-4
+                )
+                if not exact:
                     self.stats["errors"] += 1
                     fsm.fail(torch.as_tensor([env_id], device=fsm.device), 45)
                     continue
-                controller = self.controllers[env_id]
                 ids.append(env_id)
                 panel.append(controller.panel_contact_target_world)
                 desired.append(request.desired_position_world)
-                commands.append(result["command_position"])
-                orientations.append(result["command_orientation"])
+                commands.append(
+                    result.command_position_world[batch_index].detach().cpu().numpy()
+                )
+                orientations.append(
+                    result.command_orientation_world_wxyz[batch_index]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                )
         if ids:
             fsm.install_contact_plan(ids, panel, desired, commands, orientations)
 

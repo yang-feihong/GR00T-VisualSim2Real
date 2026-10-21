@@ -13,7 +13,7 @@ from isaaclab.utils.math import quat_from_matrix, quat_inv
 from legged_gym.utils.isaaclab_math import quat_rotate_inverse, quat_mul, quat_apply, quat_from_euler_xyz, euler_from_quat, torch_rand_float, wrap_to_pi
 from legged_gym.utils.door_diagnostic_camera import (
     closed_leaf_pose,
-    infer_push_side_leaf,
+    panel_normal_toward_reference,
 )
 from legged_gym.utils.episode_rng import (
     canonical_env_origins,
@@ -1477,12 +1477,12 @@ class LeggedRobotIsaacLab(DirectRLEnv):
                 "World-mounted door diagnostic cameras currently require "
                 "target_reference='door_leaf_bounds_center'."
             )
-        if diagnostic["view_axis_reference"] != "push_side":
+        if diagnostic["view_axis_reference"] != "robot_side":
             raise ValueError(
                 "World-mounted door diagnostic cameras currently require "
-                "view_axis_reference='push_side'."
+                "view_axis_reference='robot_side'."
             )
-        hinge_pivot_leaf, hinge_axis_leaf, handle_pivot_leaf, leaf_bounds = (
+        hinge_pivot_leaf, hinge_axis_leaf, _, leaf_bounds = (
             self._door_diagnostic_geometry(env_id)
         )
         joint_names = list(self.door.data.joint_names)
@@ -1511,33 +1511,30 @@ class LeggedRobotIsaacLab(DirectRLEnv):
             hinge_axis_leaf,
             hinge_angle,
         )
-        # The generated DoorMan articulation uses positive hinge travel as its
-        # opening direction for both mirrored hinge layouts.
-        push_side_leaf = infer_push_side_leaf(
-            hinge_axis_leaf,
-            1.0,
-            hinge_pivot_leaf,
-            handle_pivot_leaf,
-        )
-        push_side_world = closed_rotation @ push_side_leaf
         door_center_leaf = 0.5 * (leaf_bounds[0] + leaf_bounds[1])
+        door_center_world = closed_position + closed_rotation @ door_center_leaf
+        robot_position = (
+            self.robot.data.root_pos_w[env_id].detach().cpu().numpy().astype(np.float64)
+        )
+        robot_side_world = panel_normal_toward_reference(
+            closed_rotation @ np.asarray([1.0, 0.0, 0.0], dtype=np.float64),
+            door_center_world,
+            robot_position,
+        )
         target_leaf = door_center_leaf + np.asarray(
             diagnostic["target_offset_leaf_m"], dtype=np.float64
         )
         target = closed_position + closed_rotation @ target_leaf
-        axis = push_side_world.copy()
-        axis /= np.linalg.norm(axis)
-        axis *= float(diagnostic["view_axis_direction_sign"])
+        axis = robot_side_world
         camera_position = target + float(diagnostic["axis_distance_m"]) * axis
-        minimum_push_side_offset = float(diagnostic["minimum_push_side_offset_m"])
-        door_center_world = closed_position + closed_rotation @ door_center_leaf
-        push_side_offset = float(
-            np.dot(camera_position - door_center_world, push_side_world)
+        minimum_robot_side_offset = float(diagnostic["minimum_robot_side_offset_m"])
+        robot_side_offset = float(
+            np.dot(camera_position - door_center_world, robot_side_world)
         )
-        if push_side_offset < minimum_push_side_offset:
+        if robot_side_offset < minimum_robot_side_offset:
             camera_position += (
-                minimum_push_side_offset - push_side_offset
-            ) * push_side_world
+                minimum_robot_side_offset - robot_side_offset
+            ) * robot_side_world
 
         forward = target - camera_position
         forward /= np.linalg.norm(forward)
@@ -1560,7 +1557,8 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         print(
             f"[rgb_camera][door] {diagnostic['camera_name']}: mount=world "
             f"target={target.tolist()} camera={camera_position.tolist()} "
-            f"push_side={push_side_world.tolist()} distance={float(np.linalg.norm(camera_position - target)):.4f}"
+            f"robot={robot_position.tolist()} robot_side={robot_side_world.tolist()} "
+            f"distance={float(np.linalg.norm(camera_position - target)):.4f}"
         )
 
     def _update_door_rgb_camera_world_pose(self, rig, env_id):

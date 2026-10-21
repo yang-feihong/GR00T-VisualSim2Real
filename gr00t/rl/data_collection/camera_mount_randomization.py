@@ -136,8 +136,9 @@ def randomize_camera_mounts(
     """Return an actual camera config and traceable camera-error metadata.
 
     Position errors are expressed in the parent link frame. Orientation errors
-    are post-multiplied in the nominal camera frame. Each enabled camera owns an
-    independent deterministic random stream and remains fixed for the episode.
+    are post-multiplied in the nominal camera frame. Each enabled camera with
+    ``randomize_for_collection=true`` owns an independent deterministic random
+    stream and remains fixed for the episode.
     """
     position_radius_m = float(position_radius_m)
     rotation_angle_deg = float(rotation_angle_deg)
@@ -170,12 +171,16 @@ def randomize_camera_mounts(
 
     rotation_limit = math.radians(rotation_angle_deg)
     samples = {}
+    excluded_cameras = []
     for camera in actual_config.get("cameras", []):
         if not bool(camera.get("enabled", True)):
             continue
         name = str(camera.get("name", "")).strip()
         if not name:
             raise ValueError("enabled camera must have a non-empty name")
+        if not bool(camera.get("randomize_for_collection", True)):
+            excluded_cameras.append(name)
+            continue
         position_key = "position" if "position" in camera else "local_position"
         rotation_key = "rotation" if "rotation" in camera else "local_rotation"
         if position_key not in camera or rotation_key not in camera:
@@ -335,6 +340,7 @@ def randomize_camera_mounts(
             }
         },
         "episode_constant": True,
+        "excluded_cameras": excluded_cameras,
         "samples": samples,
     }
     actual_config["mount_randomization"] = copy.deepcopy(metadata)

@@ -1,7 +1,4 @@
-import ast
 from pathlib import Path
-
-import pytest
 
 from gr00t.rl.scripts.doorman_auto_open import DoorController, Stage, STAGE_SPECS
 
@@ -17,7 +14,8 @@ EXPECTED_STAGES = (
     Stage.OPEN_GRIPPER,
     Stage.CENTER_HANDLE,
     Stage.GRASP_HANDLE,
-    Stage.TURN_HANDLE,
+    Stage.PRESS_HANDLE,
+    Stage.PUSH_PULL_DOOR,
     Stage.RETURN_HANDLE,
     Stage.OPEN_AND_CLEAR,
     Stage.RETREAT_ARM,
@@ -39,7 +37,8 @@ EXPECTED_BUDGETS = {
     Stage.OPEN_GRIPPER: 100,
     Stage.CENTER_HANDLE: 800,
     Stage.GRASP_HANDLE: 400,
-    Stage.TURN_HANDLE: 900,
+    Stage.PRESS_HANDLE: 900,
+    Stage.PUSH_PULL_DOOR: 900,
     Stage.RETURN_HANDLE: 150,
     Stage.OPEN_AND_CLEAR: 100,
     Stage.RETREAT_ARM: 200,
@@ -60,8 +59,9 @@ EXPECTED_SUCCESSORS = {
     Stage.PREGRASP: (Stage.OPEN_GRIPPER,),
     Stage.OPEN_GRIPPER: (Stage.CENTER_HANDLE,),
     Stage.CENTER_HANDLE: (Stage.GRASP_HANDLE,),
-    Stage.GRASP_HANDLE: (Stage.TURN_HANDLE,),
-    Stage.TURN_HANDLE: (Stage.RETURN_HANDLE,),
+    Stage.GRASP_HANDLE: (Stage.PRESS_HANDLE,),
+    Stage.PRESS_HANDLE: (Stage.PUSH_PULL_DOOR,),
+    Stage.PUSH_PULL_DOOR: (Stage.RETURN_HANDLE,),
     Stage.RETURN_HANDLE: (Stage.OPEN_AND_CLEAR,),
     Stage.OPEN_AND_CLEAR: (Stage.RETREAT_ARM,),
     Stage.RETREAT_ARM: (Stage.RESTORE_GRIPPER,),
@@ -88,53 +88,6 @@ def test_stage_spec_is_the_complete_ordered_runtime_contract():
     assert all(spec.control and spec.acceptance for spec in STAGE_SPECS.values())
 
 
-def test_transition_validation_consumes_the_declared_graph():
-    controller = DoorController.__new__(DoorController)
-    controller.stage = Stage.PUSH_OPEN
-    controller.stage_steps = 73
-
-    controller._transition_to(Stage.PUSH_ARM_RETRACT)
-    assert controller.stage == Stage.PUSH_ARM_RETRACT
-    assert controller.stage_steps == 0
-
-    with pytest.raises(RuntimeError, match="illegal AutoOpen transition"):
-        controller._transition_to(Stage.GRASP_HANDLE)
-
-    controller.stage_steps = 19
-    controller._transition_to(Stage.FAILURE, reset_steps=False)
-    assert controller.stage == Stage.FAILURE
-    assert controller.stage_steps == 19
-
-
-def test_runtime_code_cannot_bypass_the_stage_transition_contract():
-    direct_writes = []
-    for source_path in (AUTO_OPEN_SOURCE, LIFECYCLE_SOURCE):
-        tree = ast.parse(source_path.read_text(encoding="utf-8"))
-        parents = {}
-        for node in ast.walk(tree):
-            for child in ast.iter_child_nodes(node):
-                parents[child] = node
-
-        for node in ast.walk(tree):
-            targets = []
-            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
-                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            for target in targets:
-                if (
-                    isinstance(target, ast.Attribute)
-                    and isinstance(target.value, ast.Name)
-                    and target.value.id in {"self", "controller"}
-                    and target.attr == "stage"
-                ):
-                    owner = node
-                    while owner is not None and not isinstance(owner, ast.FunctionDef):
-                        owner = parents.get(owner)
-                    direct_writes.append(
-                        (source_path.name, target.value.id, owner.name)
-                    )
-
-    assert direct_writes == [
-        ("doorman_auto_open.py", "self", "__init__"),
-        ("doorman_auto_open.py", "self", "_transition_to"),
-        ("lifecycle.py", "self", "reset_controller"),
-    ]
+def test_door_controller_has_no_second_fsm_execution_path():
+    assert not hasattr(DoorController, "command")
+    assert not hasattr(DoorController, "advance")

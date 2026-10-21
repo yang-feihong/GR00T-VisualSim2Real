@@ -27,6 +27,7 @@ from gr00t.rl.data_collection.auto_open_writer import (
     _short_round_trips,
     aggregate_standard_shards,
     _verify_video,
+    write_six_camera_mosaics,
 )
 from gr00t.rl.data_collection.auto_open_collector import (
     _door_edge_gap_m,
@@ -73,6 +74,48 @@ def test_camera_modes_share_one_dynamic_image_contract():
     transformed = transform_collection_images(source, "six")
     assert set(transformed) == {stream["key"] for stream in six.values()}
     assert all(image.shape == (480, 640, 3) for image in transformed.values())
+
+
+def test_six_camera_debug_mosaic_is_published_per_seed(tmp_path):
+    root = tmp_path / "debug"
+    video_root = root / "shards/episode-seed1700/quarantine/videos"
+    streams = camera_streams_for_mode("six")
+    for index, stream in enumerate(streams.values()):
+        path = video_root / stream["key"] / "chunk-000/episode_000000.mp4"
+        encoder = StreamingVideoEncoder(path, (16, 16, 3))
+        try:
+            for frame in range(2):
+                encoder.append(
+                    np.full((16, 16, 3), index * 30 + frame, dtype=np.uint8)
+                )
+        finally:
+            encoder.close()
+
+    manifest = write_six_camera_mosaics(root)
+
+    assert manifest == [
+        {
+            "seed": 1700,
+            "frames": 2,
+            "fps": 50,
+            "layout": "3x2",
+            "path": "six_camera_mosaics/seed1700_six_camera_mosaic.mp4",
+            "cameras": [
+                "door_world_diagnostic",
+                "door_panel_diagnostic",
+                "door_panel_top_diagnostic",
+                "robot_top_diagnostic",
+                "trunk_front",
+                "wrist",
+            ],
+        }
+    ]
+    output = root / manifest[0]["path"]
+    _verify_video(output, (720, 1440, 3), 2)
+    saved_manifest = json.loads(
+        (root / "six_camera_mosaics/manifest.json").read_text()
+    )
+    assert saved_manifest == {"episodes": manifest}
 
 
 def test_camera_mode_rejects_missing_or_extra_streams():

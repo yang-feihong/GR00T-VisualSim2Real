@@ -28,7 +28,7 @@ def _parser() -> argparse.ArgumentParser:
         num_envs=1,
         enable_doorman_scene=True,
         doorman_randomize_robot_init=True,
-        doorman_arm_joint_init_center=(-1.57, 1.6, -0.63, -1.1, 0.0, 0.0),
+        doorman_arm_joint_init_center=(-1.57, 1.75, -0.785, -0.93, 0.0, 0.0),
         doorman_gripper_joint_init=0.0,
         doorman_randomize_door_init_state=False,
         action_delay_mode="undelayed",
@@ -189,6 +189,18 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max_steps", type=int, default=3000)
     parser.add_argument(
+        "--pitch_probe_output",
+        type=str,
+        default=None,
+        help="Debug-only JSON output; stop after PREGRASP pitch selection.",
+    )
+    parser.add_argument(
+        "--terminal_stage",
+        choices=("THROUGH", "RESTORE_GRIPPER"),
+        default="THROUGH",
+        help="Stage whose completed acceptance terminates the requested workflow.",
+    )
+    parser.add_argument(
         "--disable_rgb_cameras",
         action="store_true",
         help="Run physics-only without creating RGB sensors or render products.",
@@ -197,6 +209,14 @@ def _parser() -> argparse.ArgumentParser:
         "--summary_only",
         action="store_true",
         help="Write per-episode metadata without trajectories or RGB artifacts.",
+    )
+    parser.add_argument(
+        "--debug_trace",
+        action="store_true",
+        help=(
+            "Persist complete per-frame FSM acceptance inputs and events. "
+            "This is observational and is enabled only by the debug workflow."
+        ),
     )
     parser.add_argument(
         "--robot_side",

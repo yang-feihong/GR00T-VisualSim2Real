@@ -7,9 +7,10 @@ import torch
 
 from gr00t.rl.envs.door.b2z1_reset_geometry import (
     quaternion_xyzw_to_matrix,
-    solve_b2z1_arm_ik,
 )
+from gr00t.rl.auto_open.planning_ik import solve_candidate_ik as solve_b2z1_arm_ik
 from gr00t.rl.auto_open.control import (
+    _effective_grasp_target,
     _ee_world_orientation_target,
     _ee_world_target,
     _quat_distance,
@@ -22,8 +23,11 @@ from gr00t.rl.auto_open.geometry import (
     _quat_axis_angle_np,
     _quat_mul_np,
     _quat_rotate_np,
-    _rotate_about_z,
     _yaw_quat,
+)
+from gr00t.rl.auto_open.pregrasp_reachability import (
+    pregrasp_reachability_samples,
+    select_pregrasp_candidate_from_errors,
 )
 from gr00t.rl.auto_open.utils import as_numpy as _as_np
 
@@ -627,194 +631,6 @@ def _panel_contact_inverse_command(
         self.panel_contact_inverse_command_orientation_world.copy(),
     )
 
-def _reset_turn_path(self):
-    """Invalidate the rolling path whenever TURN_HANDLE is left."""
-    self.turn_path_world = None
-    self.turn_path_quat = None
-    self.turn_path_index = 0
-    self.turn_path_stage = None
-
-def _ensure_turn_endpoint(self, state):
-    """Create TURN_HANDLE's fixed geometric endpoint exactly once.
-
-    The endpoint is the original open-loop handle-rotation construction:
-    rotate the grasp offset around the physical handle axle by the
-    preselected target handle angle.  Feedback may change the path start,
-    but never this endpoint.
-    """
-    if self.turn_endpoint_world is not None and self.turn_endpoint_quat is not None:
-        return
-    door_bodies = _as_np(state["door_body_state_w"])[0]
-    handle_state = door_bodies[self.handle_body_idx, :7]
-    # The revolute handle joint is defined at the handle body's axle, as
-    # in the original open-loop construction.  Do not rotate around the
-    # grasp point itself.
-    axle = handle_state[:3].copy()
-    panel_state = door_bodies[self.panel_body_idx, :7]
-    axis = _quat_rotate_np(
-        panel_state[3:7], self.handle_joint_axis_panel_local
-    )
-    axis /= max(float(np.linalg.norm(axis)), 1.0e-8)
-    start_pos = _as_np(state["ee_pos"])[0].copy()
-    start_quat = _as_np(state["ee_orn"])[0].copy()
-    current_angle = float(_as_np(state["door_joint_position"])[0, self.handle_joint_idx])
-    self.turn_start_handle_angle = current_angle
-    # This is the fixed local goal inherited from the original trajectory.
-    self.turn_target_handle_angle = max(
-        float(self.turn_target_handle_angle or 0.74)
-        + self.target_noise.positive_margin(
-            "turn_handle_overtravel_rad",
-            self.target_noise.config.turn_handle_overtravel_rad,
-        ),
-        current_angle,
-    )
-    handle_delta = self.turn_target_handle_angle - current_angle
-    current_hinge = float(_as_np(state["door_joint_position"])[0, self.hinge_idx])
-    self.turn_start_hinge_angle = current_hinge
-    # Keep the latch depressed until the randomized door edge has fully
-    # cleared the frame.  Plan beyond this episode's geometric threshold;
-    # the margin absorbs steady Cartesian tracking error at the endpoint.
-    if self.turn_gap_angle is None:
-        raise RuntimeError("door gap angle is unavailable")
-    gap_delta = self.hinge_axis_sign * (
-        self.turn_gap_angle
-        + math.radians(2.0)
-        + self.target_noise.positive_margin(
-            "turn_gap_overtravel_rad",
-            self.target_noise.config.turn_gap_overtravel_rad,
-        )
-    )
-    self.turn_target_hinge_angle = gap_delta
-    self.turn_handle_axis_world = axis.copy()
-    self.turn_axle_world = axle.copy()
-    self.turn_grasp_offset_world = start_pos - axle
-    self.turn_grasp_orientation = start_quat.copy()
-    current_goal = _as_np(state.get("ee_goal_cart_world"))
-    if current_goal is not None:
-        self.turn_command_bias_world = current_goal[0] - start_pos
-    else:
-        self.turn_command_bias_world[:] = 0.0
-    handle_endpoint = axle + _quat_rotate_np(
-        _quat_axis_angle_np(axis, handle_delta), self.turn_grasp_offset_world
-    )
-    self.turn_endpoint_world = _rotate_about_z(
-        handle_endpoint, self.hinge_world, gap_delta
-    )
-    self.turn_endpoint_quat = _quat_mul_np(
-        _yaw_quat(gap_delta),
-        _quat_mul_np(
-            _quat_axis_angle_np(axis, handle_delta), self.turn_grasp_orientation
-        ),
-    )
-    print(
-        f"[doorman][turn] fixed endpoint angle={self.turn_target_handle_angle:.4f} "
-        f"hinge_target={self.turn_target_hinge_angle:.4f} "
-        f"start_angle={current_angle:.4f} axle={axle.round(4).tolist()} "
-        f"endpoint={self.turn_endpoint_world.round(4).tolist()}",
-        flush=True,
-    )
-
-def _replan_turn_path(self, state):
-    """Generate a complete handle-axis arc to the fixed endpoint."""
-    _ensure_turn_endpoint(self, state)
-    start = _as_np(state["ee_pos"])[0].copy()
-    start_q = _as_np(state["ee_orn"])[0].copy()
-    current_angle = float(_as_np(state["door_joint_position"])[0, self.handle_joint_idx])
-    remaining_angle = max(0.0, self.turn_target_handle_angle - current_angle)
-    current_hinge = float(_as_np(state["door_joint_position"])[0, self.hinge_idx])
-    current_hinge_delta = self.hinge_axis_sign * (
-        current_hinge - self.turn_start_hinge_angle
-    )
-    remaining_hinge = (
-        self.turn_target_hinge_angle - current_hinge_delta
-        if self.turn_gap_started
-        else 0.0
-    )
-    distance = float(np.linalg.norm(self.turn_endpoint_world - start))
-    angle = _quat_distance(start_q, self.turn_endpoint_quat)
-    count = max(120, int(math.ceil(distance / 0.004)) + 1, int(math.ceil(angle / 0.03)) + 1)
-    fractions = np.linspace(0.0, 1.0, count, dtype=np.float32)
-    nominal_handle_current = self.turn_axle_world + _quat_rotate_np(
-        _quat_axis_angle_np(
-            self.turn_handle_axis_world,
-            current_angle - self.turn_start_handle_angle,
-        ),
-        self.turn_grasp_offset_world,
-    )
-    nominal_current = _rotate_about_z(
-        nominal_handle_current,
-        self.hinge_world,
-        current_hinge_delta,
-    )
-    tracking_offset = start - nominal_current
-    path = []
-    orientations = []
-    for fraction in fractions:
-        planned_angle = (
-            current_angle - self.turn_start_handle_angle
-            + float(fraction) * remaining_angle
-        )
-        nominal_handle = self.turn_axle_world + _quat_rotate_np(
-            _quat_axis_angle_np(self.turn_handle_axis_world, planned_angle),
-            self.turn_grasp_offset_world,
-        )
-        planned_hinge = (
-            current_hinge_delta
-            + float(fraction) * remaining_hinge
-        )
-        nominal = _rotate_about_z(
-            nominal_handle, self.hinge_world, planned_hinge
-        )
-        # Start at the measured EE pose, converge continuously onto the
-        # exact handle/hinge arc while retaining the steady-state command
-        # bias measured at the accepted grasp.
-        path.append(
-            nominal
-            + self.turn_command_bias_world
-            + (1.0 - float(fraction)) * tracking_offset
-        )
-        orientations.append(
-            _quat_mul_np(
-                _yaw_quat(planned_hinge),
-                _quat_mul_np(
-                    _quat_axis_angle_np(
-                        self.turn_handle_axis_world, planned_angle
-                    ),
-                    self.turn_grasp_orientation,
-                ),
-            )
-        )
-    self.turn_path_world = np.asarray(path, dtype=np.float32)
-    self.turn_path_quat = np.asarray(orientations, dtype=np.float32)
-    # Index zero is the measured pose itself; command the next sample so
-    # replanning does not insert a one-step pause every five frames.
-    self.turn_path_index = 1
-    self.turn_path_stage = self.stage
-    self.turn_path_replan_count += 1
-
-def _turn_path_target(self, state):
-    """Return the next sample from the fixed stage-entry turn path."""
-    latch_position = float(
-        _as_np(state["door_joint_position"])[0, self.latch_joint_idx]
-    )
-    if not self.turn_gap_started and latch_position >= 0.02:
-        self.turn_gap_started = True
-        _reset_turn_path(self)
-        print(
-            f"[doorman][turn] latch released at {latch_position:.4f} m; "
-            "starting door-gap arc",
-            flush=True,
-        )
-    if (
-        self.turn_path_stage != self.stage
-        or self.turn_path_world is None
-    ):
-        _replan_turn_path(self, state)
-    index = min(self.turn_path_index, len(self.turn_path_world) - 1)
-    target = self.turn_path_world[index].copy()
-    quat = self.turn_path_quat[index].copy()
-    self.turn_path_index = min(self.turn_path_index + 1, len(self.turn_path_world) - 1)
-    return target, quat
 
 def _pregrasp_pitch_candidates(self):
     """Return downward wrist-pitch candidates in increasing order."""
@@ -857,6 +673,94 @@ def _pregrasp_pitch_candidates(self):
         )
     return candidates
 
+def _attach_pregrasp_reachability(self, candidate, end_position_world, state):
+    """Qualify each pitch against the insertion and full rotation pose family."""
+    nominal_orientation = np.asarray(candidate["nominal_orientation"])
+    grasp = _effective_grasp_target(self, self.grasp_center_pos, nominal_orientation)
+    grasp[2] = candidate["nominal_end_position"][2]
+    grasp, grasp_orientation = _perturb_ee_target(
+        self, "center_handle", grasp, nominal_orientation
+    )
+    panel_pose = _as_np(state["door_body_state_w"])[0, self.panel_body_idx, :7]
+    handle_pose = _as_np(state["door_body_state_w"])[0, self.handle_body_idx, :7]
+    handle_axis = _quat_rotate_np(panel_pose[3:7], self.handle_joint_axis_panel_local)
+    handle_angle = float(_as_np(state["door_joint_position"])[0, self.handle_joint_idx])
+    noise = self.target_noise
+    press_margin = noise.positive_margin(
+        "turn_handle_overtravel_rad", noise.config.turn_handle_overtravel_rad
+    )
+    gap_margin = noise.positive_margin(
+        "turn_gap_overtravel_rad", noise.config.turn_gap_overtravel_rad
+    )
+    enriched = dict(candidate)
+    enriched.update(pregrasp_reachability_samples(
+        end_position_world, candidate["orientation"], grasp, grasp_orientation,
+        handle_axle_world=handle_pose[:3],
+        handle_axis_world=handle_axis,
+        hinge_world=self.hinge_world,
+        hinge_rotation_rad=self.hinge_axis_sign * (
+            self.turn_gap_angle + math.radians(2.0) + gap_margin
+        ),
+        handle_start_angle_rad=handle_angle,
+        handle_target_angle_rad=max(0.74 + press_margin, handle_angle),
+    ))
+    return enriched
+
+def _select_pregrasp_candidates_with_steady_inverse(entries):
+    """Qualify the same pose families when using the offline CPU reference."""
+    if not entries:
+        return []
+
+    selections = []
+    for controller, state, candidates in entries:
+        dof_names = list(state["dof_names"])
+        dof_positions = _as_np(state["dof_pos"])[0]
+        initial_joint_positions = {
+            name: float(dof_positions[index])
+            for index, name in enumerate(dof_names)
+        }
+        root = _as_np(state["root_states"])[0].astype(np.float64)
+        position_errors, orientation_errors = [], []
+
+        for candidate_index, candidate in enumerate(candidates):
+            candidate_positions = np.asarray(
+                candidate["reachability_positions"], dtype=np.float64
+            )
+            candidate_orientations = np.asarray(candidate["reachability_orientations"])
+            errors = np.full(len(candidate_positions), np.inf)
+            rotation_errors = np.full(len(candidate_positions), np.inf)
+            for sample_index, (position, orientation) in enumerate(zip(
+                candidate_positions, candidate_orientations, strict=True
+            )):
+                try:
+                    result = controller.ee_steady_model.inverse(
+                        position,
+                        orientation,
+                        base_position_world=root[:3],
+                        base_orientation_world_wxyz=root[3:7],
+                        joint_positions=initial_joint_positions.copy(),
+                        position_tolerance_m=float("inf"),
+                        orientation_tolerance=float("inf"),
+                    )
+                except RuntimeError:
+                    continue
+                errors[sample_index] = float(
+                    np.linalg.norm(result.position_error)
+                )
+                rotation_errors[sample_index] = float(
+                    np.linalg.norm(result.orientation_error)
+                )
+            position_errors.append(errors)
+            orientation_errors.append(rotation_errors)
+
+        selected, exact, diagnostics = select_pregrasp_candidate_from_errors(
+            candidates,
+            position_errors,
+            orientation_errors,
+        )
+        selections.append((selected, exact, diagnostics))
+    return selections
+
 def _apply_pregrasp_candidate(self, candidate):
     """Commit one selected pitch and its fixed-jaw-anchored target height."""
     orientation = np.asarray(candidate["orientation"], dtype=np.float32)
@@ -896,50 +800,35 @@ def _plan_pregrasp_path(self, state, start_position_world):
             label="arm_align_path",
         )
     candidates = _pregrasp_pitch_candidates(self)
-    dof_names = list(state["dof_names"])
-    dof_positions = _as_np(state["dof_pos"])[0]
-    joint_positions = {
-        name: float(dof_positions[index])
-        for index, name in enumerate(dof_names)
-    }
-    root = _as_np(state["root_states"])[0]
-    selected = None
-    best = None
-    diagnostics = []
+    qualified_candidates = []
     for candidate in candidates:
         command_position, command_orientation = _perturb_ee_target(self,
             "pregrasp",
             candidate["end_position"],
             candidate["orientation"],
         )
-        result = self.ee_steady_model.inverse(
-            command_position,
-            command_orientation,
-            base_position_world=root[:3],
-            base_orientation_world_wxyz=root[3:7],
-            joint_positions=joint_positions,
-            position_tolerance_m=float("inf"),
-            orientation_tolerance=float("inf"),
+        qualified = dict(candidate)
+        qualified["orientation"] = command_orientation
+        qualified["end_position"] = command_position
+        qualified["nominal_orientation"] = candidate["orientation"]
+        qualified["nominal_end_position"] = candidate["end_position"]
+        qualified = _attach_pregrasp_reachability(
+            self, qualified, command_position, state
         )
-        position_error = float(np.linalg.norm(result.position_error))
-        orientation_error = float(np.linalg.norm(result.orientation_error))
-        diagnostics.append(
-            (candidate["pitch_deg"], position_error, orientation_error)
-        )
-        score = position_error + orientation_error
-        if best is None or score < best[0]:
-            best = (score, candidate)
-        if position_error <= 1.0e-4 and orientation_error <= 1.0e-4:
-            selected = candidate
-            break
-    if selected is None:
-        selected = best[1]
-        print(
-            "[doorman][pregrasp-pitch][warn] no exact candidate; "
-            f"using best pitch={selected['pitch_deg']:.0f}deg",
-            flush=True,
-        )
-    _apply_pregrasp_candidate(self, selected)
+        qualified_candidates.append(qualified)
+    selected, exact, diagnostics = _select_pregrasp_candidates_with_steady_inverse(
+        [(self, state, qualified_candidates)]
+    )[0]
+    if not exact:
+        raise RuntimeError(f"no reachable PREGRASP pitch: {diagnostics}")
+    _apply_pregrasp_candidate(
+        self,
+        {
+            "pitch_deg": selected["pitch_deg"],
+            "orientation": selected["nominal_orientation"],
+            "end_position": selected["nominal_end_position"],
+        },
+    )
     print(
         f"[doorman][pregrasp-pitch] selected={self.pregrasp_pitch_deg:.0f}deg "
         f"candidates={diagnostics}",

@@ -21,23 +21,26 @@ def axis_angle_to_matrix(axis: np.ndarray, angle_rad: float) -> np.ndarray:
     )
 
 
-def infer_push_side_leaf(
-    hinge_axis_leaf: np.ndarray,
-    hinge_open_direction: float,
-    hinge_pivot_leaf: np.ndarray,
-    handle_pivot_leaf: np.ndarray,
+def panel_normal_toward_reference(
+    panel_normal_world: np.ndarray,
+    panel_point_world: np.ndarray,
+    reference_position_world: np.ndarray,
 ) -> np.ndarray:
-    opening_axis = float(hinge_open_direction) * np.asarray(
-        hinge_axis_leaf, dtype=np.float64
-    )
-    hinge_to_handle = np.asarray(handle_pivot_leaf, dtype=np.float64) - np.asarray(
-        hinge_pivot_leaf, dtype=np.float64
-    )
-    opening_motion = np.cross(opening_axis, hinge_to_handle)
-    norm = float(np.linalg.norm(opening_motion))
+    normal = np.asarray(panel_normal_world, dtype=np.float64)
+    norm = float(np.linalg.norm(normal))
     if norm <= 1.0e-9:
-        raise ValueError("The handle pivot lies on the door hinge axis")
-    return -opening_motion / norm
+        raise ValueError("The panel normal must be non-zero")
+    normal /= norm
+    side = float(
+        np.dot(
+            np.asarray(reference_position_world, dtype=np.float64)
+            - np.asarray(panel_point_world, dtype=np.float64),
+            normal,
+        )
+    )
+    if abs(side) <= 1.0e-9:
+        raise ValueError("The reference position lies in the door panel plane")
+    return normal if side > 0.0 else -normal
 
 
 def closed_leaf_pose(

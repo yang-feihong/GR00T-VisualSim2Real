@@ -95,7 +95,13 @@ CONTACT_PENETRATION_LIMITS_M = {
     "door_internal": 0.001,
 }
 HANDLE_CONTACT_STAGES = frozenset(
-    {"GRASP_HANDLE", "TURN_HANDLE", "RETURN_HANDLE", "OPEN_AND_CLEAR"}
+    {
+        "GRASP_HANDLE",
+        "PRESS_HANDLE",
+        "PUSH_PULL_DOOR",
+        "RETURN_HANDLE",
+        "OPEN_AND_CLEAR",
+    }
 )
 PANEL_CONTACT_STAGES = frozenset({"PUSH_OPEN", "PUSH_ARM_RETRACT"})
 
@@ -172,6 +178,19 @@ _AUDIT_FIXED_LISTS = {
     "arm_joint_position": 6,
     "arm_joint_velocity": 6,
     "physx_arm_joint_velocity": 6,
+    "all_joint_position": 19,
+    "all_joint_velocity": 19,
+    "gripper_ee_pose_world_xyzw": 7,
+    "handle_finger_contact_forces_world": 6,
+    "handle_finger_contact_points_world": 6,
+    "finger_contact_forces_world": 6,
+    "post_root_state": 13,
+    "post_all_joint_position": 19,
+    "post_all_joint_velocity": 19,
+    "post_gripper_ee_pose_world_xyzw": 7,
+    "post_handle_finger_contact_forces_world": 6,
+    "post_handle_finger_contact_points_world": 6,
+    "post_finger_contact_forces_world": 6,
     "b2_joint_position": 12,
     "b2_joint_velocity": 12,
     "foot_position_world": 12,
@@ -183,6 +202,8 @@ _AUDIT_FIXED_LISTS = {
     "base_command_dispatched": 3,
     "arm_joint_target_pre": 6,
     "arm_joint_target_dispatched": 6,
+    "ee_inverse_input_world": 3,
+    "ee_inverse_output_world": 3,
 }
 
 
@@ -343,6 +364,126 @@ def _verify_video(path: Path, expected_shape, expected_frames: int):
             decoded += 1
     if decoded != expected_frames:
         raise ValueError(f"decoded {decoded} frames from {path}, expected {expected_frames}")
+
+
+def write_six_camera_mosaics(dataset_root: Path):
+    """Build one labeled 3x2 review video for every six-camera debug episode."""
+    try:
+        import av
+    except ImportError as exc:
+        raise RuntimeError("six-camera mosaics require PyAV") from exc
+    from PIL import Image, ImageDraw
+
+    dataset_root = Path(dataset_root)
+    streams = camera_streams_for_mode("six")
+    preferred_sources = (
+        "door_world_diagnostic",
+        "door_panel_diagnostic",
+        "door_panel_top_diagnostic",
+        "robot_top_diagnostic",
+        "trunk_front",
+        "wrist",
+    )
+    camera_rows = [(name, streams[name]["key"]) for name in preferred_sources]
+    output_root = dataset_root / "six_camera_mosaics"
+    output_root.mkdir(parents=True, exist_ok=True)
+    manifest = []
+
+    for episode_root in sorted((dataset_root / "shards").glob("episode-seed*")):
+        try:
+            seed = int(episode_root.name.removeprefix("episode-seed"))
+        except ValueError as exc:
+            raise ValueError(f"invalid episode shard name: {episode_root.name}") from exc
+        candidates = (episode_root / "videos", episode_root / "quarantine" / "videos")
+        video_root = next((path for path in candidates if path.is_dir()), None)
+        if video_root is None:
+            raise FileNotFoundError(f"seed {seed} has no six-camera video directory")
+
+        input_paths = []
+        for _, camera_key in camera_rows:
+            matches = sorted((video_root / camera_key).glob("chunk-*/episode_*.mp4"))
+            if len(matches) != 1:
+                raise ValueError(
+                    f"seed {seed} camera {camera_key} has {len(matches)} videos"
+                )
+            input_paths.append(matches[0])
+
+        containers = [av.open(str(path), mode="r") for path in input_paths]
+        try:
+            video_streams = [container.streams.video[0] for container in containers]
+            rates = [float(stream.average_rate) for stream in video_streams]
+            if any(abs(rate - CONTROL_HZ) > 1.0e-6 for rate in rates):
+                raise ValueError(f"seed {seed} camera rates are not {CONTROL_HZ} Hz: {rates}")
+            decoders = [iter(container.decode(stream)) for container, stream in zip(containers, video_streams)]
+            output_path = output_root / f"seed{seed}_six_camera_mosaic.mp4"
+            pending_path = output_path.with_suffix(".pending.mp4")
+            pending_path.unlink(missing_ok=True)
+            encoder = StreamingVideoEncoder(
+                pending_path,
+                (720, 1440, 3),
+                codec_options={"crf": "23", "threads": "4", "preset": "veryfast"},
+            )
+            frame_count = 0
+            try:
+                while True:
+                    decoded = []
+                    ended = []
+                    for decoder in decoders:
+                        try:
+                            decoded.append(next(decoder))
+                            ended.append(False)
+                        except StopIteration:
+                            decoded.append(None)
+                            ended.append(True)
+                    if all(ended):
+                        break
+                    if any(ended):
+                        raise ValueError(f"seed {seed} camera videos have unequal lengths")
+
+                    tiles = []
+                    for (label, _), frame in zip(camera_rows, decoded):
+                        tile = Image.fromarray(
+                            frame.to_ndarray(format="rgb24")
+                        ).resize((480, 360), Image.Resampling.BILINEAR)
+                        draw = ImageDraw.Draw(tile)
+                        box = draw.textbbox((0, 0), label)
+                        width = box[2] - box[0]
+                        height = box[3] - box[1]
+                        draw.rectangle((8, 8, 20 + width, 18 + height), fill=(0, 0, 0))
+                        draw.text((14, 12), label, fill=(255, 255, 255))
+                        tiles.append(np.asarray(tile, dtype=np.uint8))
+                    mosaic = np.concatenate(
+                        (
+                            np.concatenate(tiles[:3], axis=1),
+                            np.concatenate(tiles[3:], axis=1),
+                        ),
+                        axis=0,
+                    )
+                    encoder.append(mosaic)
+                    frame_count += 1
+            finally:
+                encoder.close()
+            _verify_video(pending_path, (720, 1440, 3), frame_count)
+            pending_path.replace(output_path)
+        finally:
+            for container in containers:
+                container.close()
+
+        manifest.append(
+            {
+                "seed": seed,
+                "frames": frame_count,
+                "fps": CONTROL_HZ,
+                "layout": "3x2",
+                "path": str(output_path.relative_to(dataset_root)),
+                "cameras": [name for name, _ in camera_rows],
+            }
+        )
+
+    if not manifest:
+        raise ValueError(f"no episode shards found under {dataset_root}")
+    _json_dump(output_root / "manifest.json", {"episodes": manifest})
+    return manifest
 
 
 def _encode_and_verify_video(path: Path, frames: Sequence[np.ndarray], expected_shape):
@@ -630,7 +771,9 @@ def _physical_acceptance_reasons(episode, boundary):
             f"count={len(arm_round_trips)},frame={first['frame']},"
             f"joint={first['component'] + 1},jump={first['jump']:.6f}"
         )
-    grasp_hold = np.isin(stages, ("GRASP_HANDLE", "TURN_HANDLE"))
+    grasp_hold = np.isin(
+        stages, ("GRASP_HANDLE", "PRESS_HANDLE", "PUSH_PULL_DOOR")
+    )
     if np.any(np.abs(gripper_dispatched[grasp_hold]) > 1.0e-6):
         reasons.append("grasp_hold_high_level_target_not_zero")
     if action.shape == (frames, 25):

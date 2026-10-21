@@ -119,6 +119,7 @@ class AutoOpenStandardEpisodeCollector:
         camera_mode: str = "dual",
         env_id: int = 0,
         contact_audit=None,
+        debug_diagnostics: bool = False,
     ):
         self.runner = runner
         self.env = runner.env
@@ -129,6 +130,7 @@ class AutoOpenStandardEpisodeCollector:
         self.episode_index = int(episode_index)
         self.seed = int(seed)
         self.contact_audit = contact_audit or SubstepContactAudit.create(self.env)
+        self.debug_diagnostics = bool(debug_diagnostics)
         self._owns_contact_audit = contact_audit is None
         if self._owns_contact_audit:
             self.contact_audit.attach()
@@ -271,6 +273,8 @@ class AutoOpenStandardEpisodeCollector:
         contacts=None,
         target_height_invariant_pose=None,
         joint_mode=None,
+        ee_inverse_input_world=None,
+        ee_inverse_output_world=None,
     ):
         """Attach the target actually dispatched over [t[k], t[k+1])."""
         if self._pending is None:
@@ -322,6 +326,13 @@ class AutoOpenStandardEpisodeCollector:
         self.audit["arm_joint_target_pre"].append(arm_raw_target)
         self.audit["arm_joint_target_dispatched"].append(arm_target)
         self.audit["arm_joint_position_target"].append(arm_target)
+        if ee_inverse_input_world is not None:
+            self.audit["ee_inverse_input_world"].append(
+                np.asarray(ee_inverse_input_world, dtype=np.float32)
+            )
+            self.audit["ee_inverse_output_world"].append(
+                np.asarray(ee_inverse_output_world, dtype=np.float32)
+            )
         self.audit["gripper_target_pre"].append(float(pending["high"][9]))
         self.audit["gripper_target_dispatched"].append(gripper_dispatched)
         self.audit["gripper_actuator_target"].append(gripper_actuator_target)
@@ -329,6 +340,8 @@ class AutoOpenStandardEpisodeCollector:
         self.audit["arm_teleop_inactive_dispatched"].append(inactive)
         self.audit["arm_reset_pre"].append(reset)
         self.audit["arm_reset_dispatched"].append(reset)
+        if self.debug_diagnostics:
+            self._append_debug_post_state_audit(post_state, pending["frame_index"] + 1)
         for row in contacts:
             self.contacts.append(
                 {
@@ -341,6 +354,68 @@ class AutoOpenStandardEpisodeCollector:
         self._record_events(post_state)
         self.timing["contact_finalize_s"] += time.perf_counter() - phase_start
         self._pending = None
+
+    def _append_debug_post_state_audit(self, state, state_frame_index):
+        """Record the exact t[k+1] state used by FSM acceptance after action k."""
+        root = _numpy(state["root_states"])[0]
+        dof_pos = _numpy(state["dof_pos"])[0]
+        dof_vel = _numpy(state["dof_vel"])[0]
+        ee_position = _numpy(state["ee_pos"])[0]
+        ee_quaternion = _numpy(state["ee_orn"])[0]
+        door_q = _numpy(state["door_joint_position"])[0]
+        door_qd = _numpy(state["door_joint_velocity"])[0]
+        handle_forces = _numpy(
+            state.get(
+                "handle_finger_contact_forces_w",
+                np.zeros((1, 2, 3), dtype=np.float32),
+            )
+        )[0]
+        handle_points = _numpy(
+            state.get(
+                "handle_finger_contact_points_w",
+                np.full((1, 2, 3), np.nan, dtype=np.float32),
+            )
+        )[0]
+        finger_forces = _numpy(
+            state.get(
+                "finger_contact_forces_w",
+                np.zeros((1, 2, 3), dtype=np.float32),
+            )
+        )[0]
+        self.audit["post_state_frame_index"].append(int(state_frame_index))
+        self.audit["post_root_state"].append(root)
+        self.audit["post_all_joint_position"].append(dof_pos)
+        self.audit["post_all_joint_velocity"].append(dof_vel)
+        self.audit["post_gripper_joint_velocity"].append(
+            dof_vel[self.gripper_index]
+        )
+        self.audit["post_gripper_ee_pose_world_xyzw"].append(
+            np.concatenate((ee_position, ee_quaternion[[1, 2, 3, 0]]))
+        )
+        self.audit["post_door_hinge_position"].append(
+            door_q[self.controller.hinge_idx]
+        )
+        self.audit["post_door_hinge_velocity"].append(
+            door_qd[self.controller.hinge_idx]
+        )
+        self.audit["post_handle_position"].append(
+            door_q[self.controller.handle_joint_idx]
+        )
+        self.audit["post_handle_velocity"].append(
+            door_qd[self.controller.handle_joint_idx]
+        )
+        self.audit["post_door_latch_position"].append(
+            door_q[self.controller.latch_joint_idx]
+        )
+        self.audit["post_handle_finger_contact_forces_world"].append(
+            handle_forces.reshape(-1)
+        )
+        self.audit["post_handle_finger_contact_points_world"].append(
+            handle_points.reshape(-1)
+        )
+        self.audit["post_finger_contact_forces_world"].append(
+            finger_forces.reshape(-1)
+        )
 
     def finish(self, acceptance_reasons=(), provenance=None):
         if self._pending is not None:
@@ -425,6 +500,24 @@ class AutoOpenStandardEpisodeCollector:
             "foot_normal_force": foot_normal_force,
             "door_q": door_q,
             "door_qd": door_qd,
+            "handle_finger_contact_forces": _numpy(
+                state.get(
+                    "handle_finger_contact_forces_w",
+                    np.zeros((1, 2, 3), dtype=np.float32),
+                )
+            )[0],
+            "handle_finger_contact_points": _numpy(
+                state.get(
+                    "handle_finger_contact_points_w",
+                    np.full((1, 2, 3), np.nan, dtype=np.float32),
+                )
+            )[0],
+            "finger_contact_forces": _numpy(
+                state.get(
+                    "finger_contact_forces_w",
+                    np.zeros((1, 2, 3), dtype=np.float32),
+                )
+            )[0],
         }
 
     def _append_state_audit(self, value, frame_index, sim_time_ns, stage_name):
@@ -444,6 +537,26 @@ class AutoOpenStandardEpisodeCollector:
             value["dof_vel"][self.arm_indices]
         )
         self.audit["gripper_feedback"].append(value["dof_pos"][self.gripper_index])
+        if self.debug_diagnostics:
+            self.audit["all_joint_position"].append(value["dof_pos"])
+            self.audit["all_joint_velocity"].append(value["dof_vel"])
+            self.audit["gripper_joint_velocity"].append(
+                value["dof_vel"][self.gripper_index]
+            )
+            self.audit["gripper_ee_pose_world_xyzw"].append(
+                np.concatenate(
+                    (value["ee_position"], value["ee_quaternion"][[1, 2, 3, 0]])
+                )
+            )
+            self.audit["handle_finger_contact_forces_world"].append(
+                value["handle_finger_contact_forces"].reshape(-1)
+            )
+            self.audit["handle_finger_contact_points_world"].append(
+                value["handle_finger_contact_points"].reshape(-1)
+            )
+            self.audit["finger_contact_forces_world"].append(
+                value["finger_contact_forces"].reshape(-1)
+            )
         self.audit["b2_joint_position"].append(value["dof_pos"][self.b2_indices])
         self.audit["b2_joint_velocity"].append(value["dof_vel"][self.b2_indices])
         self.audit["foot_position_world"].append(

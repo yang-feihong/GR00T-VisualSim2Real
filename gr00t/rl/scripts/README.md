@@ -1,7 +1,23 @@
 # AutoOpen Official Collection
 
 `run_auto_open.sh` is the only supported AutoOpen execution entry. A single
-invocation runs one of two maintained workflows.
+invocation selects official publication, canonical-only validation, or debug
+collection.
+
+## Collision-section diagnostics
+
+Render the real gripper collision hulls, handle collider, contact forces, and
+low-level target for any recorded frame:
+
+```bash
+python gr00t/rl/scripts/render_auto_open_collision_section.py \
+  --dataset datasets/auto_open/debug/<dataset_name> \
+  --seed 1700 --frame 904
+```
+
+Repeat `--frame` to compare several frames, or use repeated `--time` values in
+seconds. Output defaults to the dataset's `diagnostics/collision_sections`
+directory.
 
 ## Official mode
 
@@ -55,7 +71,48 @@ Debug outputs are stored under `datasets/auto_open/debug/`. They include an
 `accepted_seeds.txt` selection but are never published under `releases/` and
 remain independent of every official dataset.
 
+Debug outputs also include one stitched six-camera video per episode under
+`six_camera_mosaics/`.
+
+### Pull-door prefix
+
+The implemented pull-door workflow shares the push-door control modules and
+currently stops after `RESTORE_GRIPPER`. Run the four diagnostic seeds with:
+
+```bash
+DOOR_MOTION=pull AUTO_OPEN_MODE=debug SEED_START=1700 SEED_END=1703 \
+bash gr00t/rl/scripts/run_auto_open.sh
+```
+
+Handle manipulation consists of `PRESS_HANDLE`, `PUSH_PULL_DOOR`, and
+`RETURN_HANDLE`: rotation about the handle axis, rotation about the door hinge,
+then rotation about the handle axis. A pull prefix's
+`completed_terminal_seeds.txt` records completion of the requested prefix,
+not full-task strict data acceptance or a trainable official release.
+
+For complete no-camera push validation without subsequent image generation,
+use `AUTO_OPEN_MODE=canonical` with the same seed-range settings.
+
+Each episode shard also contains the standard self-diagnosis contract:
+
+- `debug/acceptance_trace.jsonl`: every named acceptance predicate evaluated
+  by every visited stage, with its raw value, comparison, threshold, result,
+  true/false streak, stage visit, and stage step.
+- `debug/fsm_events.jsonl`: stage transitions and planning/FSM events.
+- `debug/acceptance_summary.json`: extrema with exact frames, complete
+  true/false intervals, longest runs, and sole-blocker frames, derived only
+  from `acceptance_trace.jsonl`.
+- `quarantine/raw_audit/...parquet`: commands plus pre-action state `t[k]` and,
+  in debug mode, the complete post-action state `t[k+1]` used by acceptance.
+
+Trace rows identify both `action_frame_index=k` and
+`state_frame_index=frame_index=k+1`; the matching raw-audit row is selected by
+`action_frame_index`, and its `post_*` columns are the exact acceptance state.
+This diagnostic recording is passive and does not alter control, physics,
+randomization, thresholds, or FSM transitions.
+
 The launcher accepts no command-line arguments. The maintained configuration
-surface is `SEED_START`, `SEED_END`, and optional `AUTO_OPEN_MODE`; `GPU_IDS` is
+surface is `SEED_START`, `SEED_END`, optional `AUTO_OPEN_MODE`, `DOOR_MOTION`,
+and `STOP_AFTER_STAGE`; `GPU_IDS` is
 only an execution-resource setting. Direct Python invocation is rejected, and
 there are no separate no-camera, camera, scalar, video, or replay launchers.

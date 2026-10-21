@@ -13,6 +13,7 @@ def build_training_doorman_door_cfg(
     num_envs: int,
     door_open_lr: str | None = None,
     physics_only: bool = False,
+    door_open_io: str | None = None,
 ):
     """Reuse the exact door asset configuration used by high-level training."""
     from gr00t.rl.data.tasks.door.scenario_cfg.isaacsim import TaskObjCfgDict
@@ -25,6 +26,13 @@ def build_training_doorman_door_cfg(
             raise ValueError(f"Unsupported door_open_lr={door_open_lr!r}")
         door_cfg.spawn.assets_cfg = [
             asset_cfg.replace(door_open_lr=[door_open_lr])
+            for asset_cfg in door_cfg.spawn.assets_cfg
+        ]
+    if door_open_io is not None:
+        if door_open_io not in ("in", "out"):
+            raise ValueError(f"Unsupported door_open_io={door_open_io!r}")
+        door_cfg.spawn.assets_cfg = [
+            asset_cfg.replace(door_open_io=[door_open_io])
             for asset_cfg in door_cfg.spawn.assets_cfg
         ]
     if physics_only:
@@ -44,6 +52,7 @@ def build_grouped_training_doorman_door_cfgs(
     seed: int,
     physics_only: bool = False,
     door_open_lr: str | None = None,
+    door_open_io: str | None = None,
     episode_seeds=None,
     source_asset_snapshots=None,
 ):
@@ -52,6 +61,8 @@ def build_grouped_training_doorman_door_cfgs(
         raise ValueError("Grouped door configuration requires an environment")
     if door_open_lr is not None and door_open_lr not in ("left", "right"):
         raise ValueError(f"Unsupported door_open_lr={door_open_lr!r}")
+    if door_open_io is not None and door_open_io not in ("in", "out"):
+        raise ValueError(f"Unsupported door_open_io={door_open_io!r}")
     episode_seeds = (
         [int(seed) + env_id for env_id in range(num_envs)]
         if episode_seeds is None
@@ -82,7 +93,10 @@ def build_grouped_training_doorman_door_cfgs(
             continue
         env_pattern = "|".join(str(index) for index in env_ids)
         door_cfg = build_training_doorman_door_cfg(
-            len(env_ids), side, physics_only=physics_only
+            len(env_ids),
+            side,
+            physics_only=physics_only,
+            door_open_io=door_open_io,
         )
         door_cfg.spawn.assets_cfg = [
             asset_cfg.replace(
