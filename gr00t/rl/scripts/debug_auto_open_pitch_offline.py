@@ -53,7 +53,7 @@ def main():
     roots = np.array(audit["root_position_world"])[selection]
     root_quats = np.array(audit["root_quaternion_xyzw"])[selection]
     initial = np.array(audit["arm_joint_position"][args.start_frame])
-    urdf = LOWLEVEL / "resources/robots/b2z1/urdf/b2z1_refined_gripper_collision.urdf"
+    urdf = LOWLEVEL / "resources/robots/b2z1/urdf/b2z1.urdf"
     tree = ET.parse(urdf).getroot()
     limits = []
     for index in range(1, 7):

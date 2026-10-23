@@ -2,6 +2,8 @@
 
 import warp as wp
 
+from gr00t.rl.utils.b2z1_asset import read_arm_mount
+
 from gr00t.rl.envs.door.b2z1_reset_geometry import (
     _ARM_JOINT_AXES,
     _ARM_JOINT_ORIGINS,
@@ -16,6 +18,8 @@ ORIGINS = wp.constant(M63(*[v for row in _ARM_JOINT_ORIGINS for v in row]))
 AXES = wp.constant(wp.types.vector(length=6, dtype=wp.int32)(*_ARM_JOINT_AXES))
 ZERO = wp.constant(wp.float64(0.0))
 ONE = wp.constant(wp.float64(1.0))
+MOUNT = wp.constant(wp.vec3d(*read_arm_mount()[0]))
+MOUNT_YAW = wp.constant(wp.float64(read_arm_mount()[1]))
 
 
 @wp.func
@@ -34,8 +38,8 @@ def _rotation(axis: int, angle: wp.float64):
 @wp.func
 def _fk(base: wp.vec3d, base_q: wp.quatd, arm: V6):
     rotation = wp.quat_to_matrix(base_q)
-    position = base + rotation * wp.vec3d(wp.float64(0.22), ZERO, wp.float64(0.17))
-    rotation = rotation * _rotation(2, wp.float64(1.5707963267948966))
+    position = base + rotation * MOUNT
+    rotation = rotation * _rotation(2, MOUNT_YAW)
     origins, axes = M63(), M63()
     for joint in range(6):
         position = position + rotation * wp.vec3d(

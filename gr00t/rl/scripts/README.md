@@ -4,6 +4,49 @@
 invocation selects official publication, canonical-only validation, or debug
 collection.
 
+## Robot asset
+
+All B2Z1 entry points use `gr00t/rl/data/robots/b2z1_lab30/b2z1.usd`.
+It includes the back box at trunk coordinates `(-0.05, 0, 0.0930129412)` m,
+rotated +90 degrees about Z, and the Z1 mount at `(0.28, 0, 0.14)` m.
+The new USD references the unchanged original 90-degree robot USD and adds only
+the box visual, box colliders and the arm mounting translation. The box follows `base_link`.
+Original robot joints, masses, inertias, colliders and contact parameters are
+preserved. The box uses 63 oriented primitive colliders derived from CAD faces,
+including a 4 mm floor slab. Its internal space is not replaced by one solid box.
+Small holes and fasteners are approximated. No separate rigid body, movable joint
+or estimated box mass is added. `cad/back_box_colliders.json` stores the shapes
+in box-local coordinates for both USD and URDF generation.
+Its silver appearance is an approximation because the source STEP contains no colors.
+
+Robot geometry lives together under
+`gr00t/rl/third_party/visual_wholebody_lowlevel/resources/robots/b2z1/`:
+`meshes/` contains the referenced visual and collision meshes. `urdf/b2z1_base.urdf`
+is the original 90-degree robot template; `urdf/b2z1.urdf` is the current robot,
+including the box. `cad/` contains the STEP, collider descriptions and assembly
+metadata. Unused historical URDF variants, DWG and ZIP copies are not retained.
+Only one new robot USD is authored; existing USD files and layers are unchanged.
+
+Rebuild using Python with USD, reusing the box mesh:
+
+```bash
+python gr00t/rl/scripts/build_b2z1_asset.py
+```
+
+The box mesh uses COLLADA (`meshes/back_box.dae`), matching the other robot
+visual meshes. Regenerate it from STEP with `python gr00t/rl/scripts/b2z1_mesh.py`
+in an environment providing OpenCascade (`cadquery-ocp-novtk`) and NumPy.
+
+The existing USD supplies the mounting position when rebuilding. To deliberately
+change it, pass `--arm-mount-xyz X Y Z` in meters. Old robot USD entries are not
+redirected to the new asset.
+Physical FK/IK reads the mount from the USD fixed joint instead of maintaining
+an independent installation offset. URDF-based calculations use that same USD
+mount in memory. Restart the process after changing the asset's mounting transform.
+The current URDF uses a stable filename; its origin is synchronized to USD.
+Checkpoint-defined policy and dataset
+goal-reference coordinate conventions are preserved.
+
 ## Collision-section diagnostics
 
 Render the real gripper collision hulls, handle collider, contact forces, and

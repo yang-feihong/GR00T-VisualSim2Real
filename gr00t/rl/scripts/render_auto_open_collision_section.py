@@ -79,8 +79,11 @@ def gripper_pose(
     arm_joint_position: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     rotation = quaternion_xyzw_matrix(root_quaternion_xyzw)
-    position = root_position + rotation @ np.asarray((0.22, 0.0, 0.17))
-    rotation = rotation @ axis_rotation(2, math.pi / 2.0)
+    from gr00t.rl.utils.b2z1_asset import read_arm_mount
+
+    mount_xyz, mount_yaw = read_arm_mount()
+    position = root_position + rotation @ np.asarray(mount_xyz)
+    rotation = rotation @ axis_rotation(2, mount_yaw)
     for joint_angle, origin, axis in zip(
         arm_joint_position, ARM_JOINT_ORIGINS, ARM_JOINT_AXES
     ):

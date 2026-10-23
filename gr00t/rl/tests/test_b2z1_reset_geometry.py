@@ -19,8 +19,8 @@ class B2Z1ResetGeometryTest(unittest.TestCase):
     def test_forward_kinematics_matches_production_urdf(self):
         urdf = (
             Path(__file__).parents[1]
-            / "third_party/visual_wholebody_lowlevel/resources/robots/b2z1/urdf/generated"
-            / "b2z1_mount_90_x0p22_y0_z0p17.urdf"
+            / "third_party/visual_wholebody_lowlevel/resources/robots/b2z1/urdf"
+            / "b2z1.urdf"
         )
         model = pin.buildModelFromUrdf(str(urdf))
         data = model.createData()
@@ -146,7 +146,7 @@ class B2Z1ResetGeometryTest(unittest.TestCase):
         self.assertTrue(torch.all(orientation_error < 1.0e-4), orientation_error)
     def test_closed_door_collision_changes_with_base_distance(self):
         arm = torch.tensor([[-1.57, 1.60, -0.63, -1.10, 0.0, 0.0]]).repeat(2, 1)
-        root_position = torch.tensor([[0.55, 0.0, 0.45], [2.0, 0.0, 0.45]])
+        root_position = torch.tensor([[0.61, 0.0, 0.45], [2.0, 0.0, 0.45]])
         root_quaternion = torch.tensor([[0.0, 0.0, 1.0, 0.0]]).repeat(2, 1)
         door_position = torch.zeros(2, 3)
         door_quaternion = torch.tensor([[1.0, 0.0, 0.0, 0.0]]).repeat(2, 1)

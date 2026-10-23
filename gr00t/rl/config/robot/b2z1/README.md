@@ -71,7 +71,7 @@ robot.b2z1_command.lowlevel_policy_path=/absolute/path/to/model_8000.pt
 成功标准：
 
 ```text
-gr00t/rl/data/robots/b2z1/b2z1.usd
+gr00t/rl/data/robots/b2z1_lab30/b2z1.usd
 ```
 
 文件生成，并且脚本没有报 URDF mesh、IsaacLab importer 或 USD 写入错误。
@@ -176,7 +176,7 @@ models/b2z1_lowlevel/model_8000.pt
 
 如果阶段 2 失败，优先检查：
 
-- `gr00t/rl/data/robots/b2z1/b2z1.usd` 是否存在。
+- `gr00t/rl/data/robots/b2z1_lab30/b2z1.usd` 是否存在。
 - `asset.usd_file` 是否仍然是 `b2z1/b2z1.usd`。
 - `root_body_name`、`gripper_body_name`、`task_contact_body_names` 是否和 USD 里的 body 名一致。
 - `dof_names` 是否和 USD articulation joint 名一致。

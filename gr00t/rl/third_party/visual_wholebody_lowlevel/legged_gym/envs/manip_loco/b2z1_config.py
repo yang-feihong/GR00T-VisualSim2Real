@@ -1,6 +1,7 @@
 from isaaclab.utils import configclass
 from legged_gym.envs.base.legged_robot_config import LeggedRobotIsaacLabCfg, ControlCfg
 import numpy as np
+from gr00t.rl.utils.b2z1_asset import read_arm_mount
 
 
 @configclass
@@ -209,8 +210,8 @@ class B2Z1IsaacLabCfg(LeggedRobotIsaacLabCfg):
             back_height = [0.0, 0.3]
 
         class urdf_mount:
-            arm_base_offset = [0.2, 0.0, 0.09]
-            mount_yaw_offset = 0.0
+            arm_base_offset = list(read_arm_mount()[0])
+            mount_yaw_offset = read_arm_mount()[1]
             arm_waist_offset_z = 0.0585
             arm_shoulder_offset_z = 0.045
 

@@ -124,8 +124,8 @@ def test_gpu_inverse_matches_cpu_without_gravity_at_joint_limit():
 
     urdf = (
         Path(__file__).resolve().parents[1]
-        / "third_party/visual_wholebody_lowlevel/resources/robots/b2z1/urdf/generated"
-        / "b2z1_mount_90_x0p22_y0_z0p17.urdf"
+        / "third_party/visual_wholebody_lowlevel/resources/robots/b2z1/urdf"
+        / "b2z1.urdf"
     )
     cpu_model = B2Z1SteadyEeForwardModel(
         urdf,

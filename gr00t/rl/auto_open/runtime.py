@@ -1096,8 +1096,8 @@ def _run_batched(args, *, controller_cls, stage_enum):
     state_rows = _slice_all_control_states(full_state, num_envs)
     shared_steady_model = B2Z1SteadyEeForwardModel(
         LOWLEVEL_ROOT
-        / "resources/robots/b2z1/urdf/generated"
-        / "b2z1_mount_90_x0p22_y0_z0p17.urdf",
+        / "resources/robots/b2z1/urdf"
+        / "b2z1.urdf",
         stiffness=_arm_drive_stiffness(env),
         emit_tolerance_warnings=not args.summary_only,
     )

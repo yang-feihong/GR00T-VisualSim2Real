@@ -16,7 +16,7 @@ from isaaclab.actuators import ImplicitActuatorCfg
 _LOW_LEVEL_ROOT = Path(__file__).resolve().parents[3]
 _DEFAULT_B2Z1_USD = (
     _LOW_LEVEL_ROOT.parents[1]
-    / "data/robots/b2z1_lab30/b2z1_mount_90_x0p22_y0_z0p17.usd"
+    / "data/robots/b2z1_lab30/b2z1.usd"
 )
 
 

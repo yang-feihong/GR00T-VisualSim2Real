@@ -508,8 +508,8 @@ class DoorController:
         self.center_metrics = {}
         steady_urdf = (
             LOWLEVEL_ROOT
-            / "resources/robots/b2z1/urdf/generated"
-            / "b2z1_mount_90_x0p22_y0_z0p17.urdf"
+            / "resources/robots/b2z1/urdf"
+            / "b2z1.urdf"
         )
         arm_drive_stiffness = _arm_drive_stiffness(self.env)
         if shared_steady_model is not None:

@@ -1,0 +1,18 @@
+{
+  "source_usd": "b2z1_mount_90_x0p22_y0_z0p17.usd",
+  "arm_mount_xyz_m": [
+    0.2800000011920929,
+    0.0,
+    0.14000000059604645
+  ],
+  "box_mount_xyz_m": [
+    -0.05,
+    0.0,
+    0.0930129411816597
+  ],
+  "box_yaw_rad": 1.5707963267948966,
+  "box_appearance": "silver-white approximation; source STEP contains no color",
+  "physics": "original robot mass, inertia, colliders, and joint settings preserved; box colliders belong to base_link",
+  "box_collider_count": 63,
+  "urdf": "urdf/b2z1.urdf"
+}

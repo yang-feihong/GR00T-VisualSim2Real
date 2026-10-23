@@ -7,6 +7,8 @@ from functools import lru_cache
 
 import torch
 
+from gr00t.rl.utils.b2z1_asset import read_arm_mount
+
 
 _ARM_JOINT_ORIGINS = (
     (0.0, 0.0, 0.0585),
@@ -21,7 +23,7 @@ _ARM_JOINT_AXES = (2, 1, 1, 1, 2, 0)
 
 @lru_cache(maxsize=16)
 def _arm_offset_tensors(dtype, device):
-    offsets = ((0.22, 0.0, 0.17), *_ARM_JOINT_ORIGINS,
+    offsets = (read_arm_mount()[0], *_ARM_JOINT_ORIGINS,
                (0.051, 0.0, 0.0), (0.049, 0.0, 0.0))
     return tuple(torch.tensor(offset, dtype=dtype, device=device) for offset in offsets)
 
@@ -119,7 +121,7 @@ def b2z1_gripper_pose_and_jacobian(
     mount_offset = offsets[0]
     position = position + _fixed_matvec_3(rotation, mount_offset)
     mount_yaw = torch.full(
-        arm_joint_position.shape[:-1], math.pi / 2.0, dtype=dtype, device=device
+        arm_joint_position.shape[:-1], read_arm_mount()[1], dtype=dtype, device=device
     )
     rotation = _fixed_matmul_3x3(rotation, _axis_rotation(mount_yaw, 2, dtype))
 

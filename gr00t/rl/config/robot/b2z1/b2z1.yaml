@@ -324,7 +324,7 @@ robot:
     disable_gravity: False
     fix_base_link: False
     # Generated offline from the lab30-aligned URDF with convex decomposition.
-    usd_file: "b2z1_lab30/b2z1_mount_90_x0p22_y0_z0p17.usd"
+    usd_file: "b2z1_lab30/b2z1.usd"
     xml_file: null
     robot_type: b2z1
     self_collisions: 0

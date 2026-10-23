@@ -51,7 +51,7 @@ def main():
     torch.set_num_threads(1)
     root = Path(__file__).resolve().parents[3]
     low = Path("gr00t/rl/third_party/visual_wholebody_lowlevel")
-    urdf = ET.parse(root / low / "resources/robots/b2z1/urdf/b2z1_refined_gripper_collision.urdf")
+    urdf = ET.parse(root / low / "resources/robots/b2z1/urdf/b2z1.urdf")
     limits = []
     for joint in range(1, 7):
         limit = urdf.find(f"joint[@name='joint{joint}']/limit")
@@ -106,7 +106,7 @@ def main():
             if count == 12000 and args.cpu_checks:
                 from gr00t.rl.third_party.visual_wholebody_lowlevel.legged_gym.utils.ee_steady_state import B2Z1SteadyEeForwardModel
                 model = B2Z1SteadyEeForwardModel(
-                    root / low / "resources/robots/b2z1/urdf/generated/b2z1_mount_90_x0p22_y0_z0p17.urdf",
+                    root / low / "resources/robots/b2z1/urdf/b2z1.urdf",
                     stiffness=10000.0, gravity_magnitude=0.0, emit_tolerance_warnings=False,
                 )
                 differences = (result.arm_joint_positions - old.arm_joint_positions).abs().amax(dim=-1)

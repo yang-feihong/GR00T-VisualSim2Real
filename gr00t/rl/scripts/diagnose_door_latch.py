@@ -65,7 +65,7 @@ def _default_paths(args) -> None:
             / "data"
             / "robots"
             / "b2z1_lab30"
-            / "b2z1_mount_90_x0p22_y0_z0p17.usd"
+            / "b2z1.usd"
         )
 
 

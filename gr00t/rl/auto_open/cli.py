@@ -294,7 +294,10 @@ def _default_paths(args):
     if not args.run_metadata_path:
         args.run_metadata_path = str(run_dir / "run_metadata.json")
     if not args.robot_usd_path:
-        args.robot_usd_path = str(repo / "gr00t" / "rl" / "data" / "robots" / "b2z1_lab30" / "b2z1_mount_90_x0p22_y0_z0p17.usd")
+        args.robot_usd_path = str(repo / "gr00t" / "rl" / "data" / "robots" / "b2z1_lab30" / "b2z1.usd")
+    from gr00t.rl.utils.b2z1_asset import set_robot_usd
+
+    set_robot_usd(args.robot_usd_path)
     if args.standard_dataset_dir is not None:
         if args.collection_camera_mode == "none":
             if not args.disable_rgb_cameras:

@@ -98,7 +98,7 @@ def _retract_selector_fixture(seed):
     repository = Path(__file__).resolve().parents[3]
     model = B2Z1SteadyEeForwardModel(
         repository
-        / "gr00t/rl/third_party/visual_wholebody_lowlevel/resources/robots/b2z1/urdf/generated/b2z1_mount_90_x0p22_y0_z0p17.urdf",
+        / "gr00t/rl/third_party/visual_wholebody_lowlevel/resources/robots/b2z1/urdf/b2z1.urdf",
         stiffness=1000.0,
     )
     controller = SimpleNamespace(

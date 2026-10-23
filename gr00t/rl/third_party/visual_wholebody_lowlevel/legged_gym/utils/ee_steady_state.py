@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import math
 import warnings
+import xml.etree.ElementTree as ElementTree
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -139,7 +140,16 @@ class B2Z1SteadyEeForwardModel:
         if not self.urdf_path.is_file():
             raise FileNotFoundError(self.urdf_path)
 
-        self.model = pin.buildModelFromUrdf(str(self.urdf_path))
+        from gr00t.rl.utils.b2z1_asset import read_arm_mount
+
+        robot = ElementTree.parse(self.urdf_path).getroot()
+        mount = robot.find("joint[@name='z1_mount_joint']/origin")
+        if mount is None:
+            raise ValueError(f"URDF has no z1_mount_joint origin: {self.urdf_path}")
+        mount_xyz, mount_yaw = read_arm_mount()
+        mount.set("xyz", " ".join(str(value) for value in mount_xyz))
+        mount.set("rpy", f"0 0 {mount_yaw}")
+        self.model = pin.buildModelFromXML(ElementTree.tostring(robot, encoding="unicode"))
         self.data = self.model.createData()
         if not self.model.existFrame(ee_frame_name):
             raise ValueError(f"URDF has no EE frame {ee_frame_name!r}")

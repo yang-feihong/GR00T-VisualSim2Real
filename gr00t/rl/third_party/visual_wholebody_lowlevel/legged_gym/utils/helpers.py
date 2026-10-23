@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import math
 import sys
 from pathlib import Path
 
@@ -342,14 +343,22 @@ def _apply_cli_scene_args(cfg, args):
 
 
 def _apply_cli_robot_args(cfg, args, for_play: bool, checkpoint_features):
+    from gr00t.rl.utils.b2z1_asset import read_arm_mount, set_robot_usd
+
     del for_play, checkpoint_features
     if args.robot_usd_path is not None:
         cfg.robot_usd_path = str(Path(args.robot_usd_path).resolve())
     if not Path(cfg.robot_usd_path).is_file():
         raise FileNotFoundError(f"B2Z1 USD not found: {cfg.robot_usd_path}")
     cfg.robot.spawn.usd_path = cfg.robot_usd_path
+    set_robot_usd(cfg.robot_usd_path)
+    mount_xyz, mount_yaw = read_arm_mount()
     if args.mount_deg is not None:
-        cfg.goal_ee.urdf_mount.mount_yaw_offset = mount_deg_to_rad(args.mount_deg)
+        yaw_error = math.remainder(mount_deg_to_rad(args.mount_deg) - mount_yaw, 2 * math.pi)
+        if abs(yaw_error) > 1e-6:
+            raise ValueError("--mount_deg must agree with the mounting rotation in the robot USD")
+    cfg.goal_ee.urdf_mount.arm_base_offset = list(mount_xyz)
+    cfg.goal_ee.urdf_mount.mount_yaw_offset = mount_yaw
 
 
 def _apply_cli_goal_and_observation_args(cfg, args):
@@ -441,6 +450,10 @@ def _apply_cli_play_args(cfg, args):
 
 
 def build_env_cfg(args, for_play=False):
+    from gr00t.rl.utils.b2z1_asset import set_robot_usd
+
+    if args.robot_usd_path is not None:
+        set_robot_usd(args.robot_usd_path)
     from legged_gym.envs.manip_loco.b2z1_config import B2Z1IsaacLabCfg, apply_reward_scale_preset
 
     cfg = B2Z1IsaacLabCfg()
