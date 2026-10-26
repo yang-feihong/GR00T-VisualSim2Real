@@ -33,9 +33,7 @@ class B2Z1ResetGeometryTest(unittest.TestCase):
             ],
             dtype=torch.float64,
         )
-        root_position = torch.tensor(
-            [[0.7, -0.3, 0.45], [1.2, 0.8, 0.45]], dtype=torch.float64
-        )
+        root_position = torch.tensor([[0.7, -0.3, 0.45], [1.2, 0.8, 0.45]], dtype=torch.float64)
         yaw = torch.tensor([0.4, -1.0], dtype=torch.float64)
         root_quaternion = torch.stack(
             (
@@ -49,9 +47,7 @@ class B2Z1ResetGeometryTest(unittest.TestCase):
         center, axes, half_extent = b2z1_gripper_collision_obb(
             root_position, root_quaternion, samples
         )
-        local_center = torch.tensor(
-            [0.02203577, 0.0, -0.001962435], dtype=torch.float64
-        )
+        local_center = torch.tensor([0.02203577, 0.0, -0.001962435], dtype=torch.float64)
         ee_positions = center - torch.einsum("bij,j->bi", axes, local_center)
 
         for sample_index in range(samples.shape[0]):
@@ -70,17 +66,14 @@ class B2Z1ResetGeometryTest(unittest.TestCase):
                     [0.0, 0.0, 1.0],
                 ]
             )
-            expected_position = (
-                root_position[sample_index].numpy()
-                + rotation_root @ np.asarray(pose_base.translation)
+            expected_position = root_position[sample_index].numpy() + rotation_root @ np.asarray(
+                pose_base.translation
             )
             expected_rotation = rotation_root @ np.asarray(pose_base.rotation)
             np.testing.assert_allclose(
                 ee_positions[sample_index].numpy(), expected_position, atol=1.0e-9
             )
-            np.testing.assert_allclose(
-                axes[sample_index].numpy(), expected_rotation, atol=1.0e-9
-            )
+            np.testing.assert_allclose(axes[sample_index].numpy(), expected_rotation, atol=1.0e-9)
         self.assertTrue(torch.all(half_extent > 0.0))
 
     def test_obb_overlap_respects_rotation_and_margin(self):
@@ -113,9 +106,7 @@ class B2Z1ResetGeometryTest(unittest.TestCase):
             ],
             dtype=torch.float64,
         )
-        root_position = torch.tensor(
-            [[0.75, -0.2, 0.45], [0.9, 0.35, 0.45]], dtype=torch.float64
-        )
+        root_position = torch.tensor([[0.75, -0.2, 0.45], [0.9, 0.35, 0.45]], dtype=torch.float64)
         yaw = torch.tensor([0.15, -0.3], dtype=torch.float64)
         root_quaternion = torch.stack(
             (
@@ -129,9 +120,9 @@ class B2Z1ResetGeometryTest(unittest.TestCase):
         target_position, target_rotation, _ = b2z1_gripper_pose_and_jacobian(
             root_position, root_quaternion, target_joint_position
         )
-        initial = torch.tensor(
-            [-1.57, 1.60, -0.63, -1.10, 0.0, 0.0], dtype=torch.float64
-        ).expand(2, -1)
+        initial = torch.tensor([-1.57, 1.60, -0.63, -1.10, 0.0, 0.0], dtype=torch.float64).expand(
+            2, -1
+        )
         solution, position_error, orientation_error = solve_b2z1_arm_ik(
             root_position,
             root_quaternion,
@@ -144,6 +135,7 @@ class B2Z1ResetGeometryTest(unittest.TestCase):
         self.assertEqual(solution.shape, (2, 6))
         self.assertTrue(torch.all(position_error < 1.0e-4), position_error)
         self.assertTrue(torch.all(orientation_error < 1.0e-4), orientation_error)
+
     def test_closed_door_collision_changes_with_base_distance(self):
         arm = torch.tensor([[-1.57, 1.60, -0.63, -1.10, 0.0, 0.0]]).repeat(2, 1)
         root_position = torch.tensor([[0.61, 0.0, 0.45], [2.0, 0.0, 0.45]])

@@ -1,4 +1,4 @@
-"""Shared reachability qualification for PREGRASP wrist-pitch candidates."""
+"""Shared reachability qualification for MOVE_TO_PREGRASP wrist-pitch candidates."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from gr00t.rl.auto_open.geometry import (
     _quat_mul_np,
     _quat_rotate_np,
 )
-
 
 PREGRASP_SAMPLE_POSITION_STEP_M = 0.004
 PREGRASP_SAMPLE_ROTATION_STEP_RAD = np.deg2rad(1.0)
@@ -92,7 +91,8 @@ def pregrasp_reachability_samples(
     # The production latch mimic maps 45 degrees of handle rotation to 30 mm.
     release = np.clip(
         np.deg2rad(45.0) * PRESS_HANDLE_LATCH_RELEASE_M / 0.03,
-        handle_start_angle_rad, target,
+        handle_start_angle_rad,
+        target,
     )
     branches = np.unique([release, (release + target) / 2, target])
     door_rotation = _quat_axis_angle_np([0, 0, 1], hinge_rotation_rad)
@@ -103,12 +103,22 @@ def pregrasp_reachability_samples(
         point = axle + _quat_rotate_np(rotation, grasp - axle)
         quat = _quat_mul_np(rotation, end_q)
         point, quat = rotate_path(
-            "push_pull_door", point, quat, hinge, [0, 0, 1],
-            hinge_rotation_rad, float(branch),
+            "push_pull_door",
+            point,
+            quat,
+            hinge,
+            [0, 0, 1],
+            hinge_rotation_rad,
+            float(branch),
         )
         rotate_path(
-            "return_handle", point, quat, return_axle, return_axis,
-            -float(branch - handle_start_angle_rad), float(branch),
+            "return_handle",
+            point,
+            quat,
+            return_axle,
+            return_axis,
+            -float(branch - handle_start_angle_rad),
+            float(branch),
         )
     return {
         "reachability_positions": np.asarray(positions),
@@ -117,12 +127,10 @@ def pregrasp_reachability_samples(
     }
 
 
-def select_pregrasp_candidate_from_errors(
-    candidates, position_errors, orientation_errors
-):
+def select_pregrasp_candidate_from_errors(candidates, position_errors, orientation_errors):
     """Reduce ragged batched inverse errors into the smallest valid pitch."""
     if not candidates:
-        raise ValueError("PREGRASP requires at least one pitch candidate")
+        raise ValueError("MOVE_TO_PREGRASP requires at least one pitch candidate")
     if len(position_errors) != len(candidates) or len(orientation_errors) != len(candidates):
         raise ValueError("inverse error rows must match pitch candidates")
 
@@ -135,7 +143,8 @@ def select_pregrasp_candidate_from_errors(
         if positions.shape != (sample_count,) or rotations.shape != (sample_count,):
             raise ValueError("inverse error count must match candidate samples")
         failed = np.flatnonzero(
-            ~np.isfinite(positions) | ~np.isfinite(rotations)
+            ~np.isfinite(positions)
+            | ~np.isfinite(rotations)
             | (positions > PREGRASP_EXACT_POSITION_TOLERANCE_M)
             | (rotations > PREGRASP_EXACT_ORIENTATION_TOLERANCE)
         )

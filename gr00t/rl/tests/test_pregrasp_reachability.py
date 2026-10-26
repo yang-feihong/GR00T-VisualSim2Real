@@ -16,29 +16,40 @@ from gr00t.rl.auto_open.pregrasp_reachability import (
 
 @pytest.fixture(autouse=True)
 def lowlevel_import_path(monkeypatch):
-    monkeypatch.syspath_prepend(str(Path(__file__).resolve().parents[1] / "third_party/visual_wholebody_lowlevel"))
+    monkeypatch.syspath_prepend(
+        str(Path(__file__).resolve().parents[1] / "third_party/visual_wholebody_lowlevel")
+    )
 
 
 def _family(hinge_angle=0.17):
     return pregrasp_reachability_samples(
-        [.8, .3, .9], [1., 0, 0, 0], [.65, .3, .9], [1., 0, 0, 0],
-        handle_axle_world=[.6, .3, 1.], handle_axis_world=[1., 0, 0],
-        hinge_world=[0., 0, 0], hinge_rotation_rad=hinge_angle,
-        handle_start_angle_rad=0., handle_target_angle_rad=.74,
+        [0.8, 0.3, 0.9],
+        [1.0, 0, 0, 0],
+        [0.65, 0.3, 0.9],
+        [1.0, 0, 0, 0],
+        handle_axle_world=[0.6, 0.3, 1.0],
+        handle_axis_world=[1.0, 0, 0],
+        hinge_world=[0.0, 0, 0],
+        hinge_rotation_rad=hinge_angle,
+        handle_start_angle_rad=0.0,
+        handle_target_angle_rad=0.74,
     )
 
 
-@pytest.mark.parametrize("hinge_angle", [-.17, .17])
+@pytest.mark.parametrize("hinge_angle", [-0.17, 0.17])
 def test_pose_family_covers_three_rigid_rotations_with_bounded_spacing(hinge_angle):
     family = _family(hinge_angle)
     positions = family["reachability_positions"]
     quats = family["reachability_orientations"]
     labels = family["reachability_samples"]
-    np.testing.assert_allclose(positions[0], [.8, .3, .9])
+    np.testing.assert_allclose(positions[0], [0.8, 0.3, 0.9])
     insertion = [i for i, s in enumerate(labels) if s["stage"] == "insertion"]
-    np.testing.assert_allclose(positions[insertion[-1]], [.65, .3, .9])
+    np.testing.assert_allclose(positions[insertion[-1]], [0.65, 0.3, 0.9])
     assert {s["stage"] for s in labels} == {
-        "insertion", "press_handle", "push_pull_door", "return_handle"
+        "insertion",
+        "press_handle",
+        "push_pull_door",
+        "return_handle",
     }
     groups = {}
     for index, sample in enumerate(labels):
@@ -46,32 +57,41 @@ def test_pose_family_covers_three_rigid_rotations_with_bounded_spacing(hinge_ang
     assert len([key for key in groups if key[0] == "push_pull_door"]) == 3
     for (stage, branch), indices in groups.items():
         p, q = positions[indices], quats[indices]
-        assert np.linalg.norm(np.diff(p, axis=0), axis=1).max() <= PREGRASP_SAMPLE_POSITION_STEP_M + 1e-6
+        assert (
+            np.linalg.norm(np.diff(p, axis=0), axis=1).max()
+            <= PREGRASP_SAMPLE_POSITION_STEP_M + 1e-6
+        )
         q = q / np.linalg.norm(q, axis=1, keepdims=True)
         steps = 2 * np.arccos(np.clip(abs((q[1:] * q[:-1]).sum(axis=1)), 0, 1))
         assert steps.max() <= PREGRASP_SAMPLE_ROTATION_STEP_RAD + 1e-6
         if stage == "push_pull_door":
             np.testing.assert_allclose(p[:, 2], p[0, 2], atol=1e-6)
-            np.testing.assert_allclose(np.linalg.norm(p[:, :2], axis=1), np.linalg.norm(p[0, :2]), atol=1e-6)
+            np.testing.assert_allclose(
+                np.linalg.norm(p[:, :2], axis=1), np.linalg.norm(p[0, :2]), atol=1e-6
+            )
             rotation = _quat_axis_angle_np([0, 0, 1], hinge_angle)
             np.testing.assert_allclose(q[-1], _quat_mul_np(rotation, q[0]), atol=1e-6)
         if stage == "return_handle":
-            np.testing.assert_allclose(q[-1], _quat_axis_angle_np([0, 0, 1], hinge_angle), atol=1e-6)
+            np.testing.assert_allclose(
+                q[-1], _quat_axis_angle_np([0, 0, 1], hinge_angle), atol=1e-6
+            )
     np.testing.assert_allclose(
         sorted({s["press_branch_rad"] for s in labels if s["stage"] == "push_pull_door"}),
-        [np.deg2rad(37.5), (np.deg2rad(37.5) + .74) / 2, .74],
+        [np.deg2rad(37.5), (np.deg2rad(37.5) + 0.74) / 2, 0.74],
     )
 
 
 def _candidate(pitch, count):
     return {
-        "pitch_deg": pitch, "end_position": [.03, 0, 0], "orientation": [1., 0, 0, 0],
+        "pitch_deg": pitch,
+        "end_position": [0.03, 0, 0],
+        "orientation": [1.0, 0, 0, 0],
         "reachability_positions": np.c_[np.arange(count), np.zeros((count, 2))],
-        "reachability_orientations": np.array([
-            _quat_axis_angle_np([0, 0, 1], index * .01) for index in range(count)
-        ]),
+        "reachability_orientations": np.array(
+            [_quat_axis_angle_np([0, 0, 1], index * 0.01) for index in range(count)]
+        ),
         "reachability_samples": [
-            {"stage": "push_pull_door", "angle_rad": index * .01, "press_branch_rad": .74}
+            {"stage": "push_pull_door", "angle_rad": index * 0.01, "press_branch_rad": 0.74}
             for index in range(count)
         ],
     }
@@ -80,10 +100,10 @@ def _candidate(pitch, count):
 def test_ragged_selection_rejects_rotation_failure_and_preserves_pregrasp_target():
     candidates = [_candidate(0, 3), _candidate(5, 5)]
     selected, exact, diagnostics = select_pregrasp_candidate_from_errors(
-        candidates, [[0, .002, 0], np.zeros(5)], [np.zeros(3), np.zeros(5)]
+        candidates, [[0, 0.002, 0], np.zeros(5)], [np.zeros(3), np.zeros(5)]
     )
     assert exact and selected["pitch_deg"] == 5
-    assert selected["end_position"] == [.03, 0, 0]
+    assert selected["end_position"] == [0.03, 0, 0]
     assert diagnostics[0]["first_failure"]["stage"] == "push_pull_door"
     assert diagnostics[0]["first_failure"]["sample_index"] == 1
     assert [row["sample_count"] for row in diagnostics] == [3, 5]
@@ -99,36 +119,75 @@ def test_nonfinite_inverse_result_cannot_qualify_pitch():
 
 def _gpu_pregrasp_case(fail_all=False):
     from gr00t.rl.auto_open.tensor_stage_planning import GPUStagePlanningMixin
-    from gr00t.rl.auto_open.tensor_fsm import PaddedPathBank
+    from gr00t.rl.auto_open.motion_targets import PaddedPathBank
+    from gr00t.rl.auto_open.pull_entry_gpu import PullEntryGPU
 
     coordinator = GPUStagePlanningMixin()
     coordinator.path_diagnostics = []
     coordinator.gpu_stage_metadata = []
     coordinator._record_stats = lambda *args, **kwargs: None
-    position = torch.tensor([[[.8, .3, .9], [.8, .3, .91]],
-                             [[.7, .3, .9], [.7, .3, .91]]])
-    quat = torch.tensor([1., 0, 0, 0]).expand(2, 2, -1).clone()
+    position = torch.tensor(
+        [[[0.8, 0.3, 0.9], [0.8, 0.3, 0.91]], [[0.7, 0.3, 0.9], [0.7, 0.3, 0.91]]]
+    )
+    quat = torch.tensor([1.0, 0, 0, 0]).expand(2, 2, -1).clone()
     coordinator.gpu_stage_constants = {
-        "position": position, "quat": quat, "grasp": position - torch.tensor([.15, 0, 0]),
-        "grasp_q": quat, "selected_pitch": torch.zeros(2, dtype=torch.int64),
-        "pitch_deg": torch.tensor([0., 5.]),
-        "nominal_q": quat, "nominal": position,
+        "position": position,
+        "quat": quat,
+        "grasp": position - torch.tensor([0.15, 0, 0]),
+        "grasp_q": quat,
+        "selected_pitch": torch.zeros(2, dtype=torch.int64),
+        "pitch_deg": torch.tensor([0.0, 5.0]),
+        "nominal_q": quat,
+        "nominal": position,
     }
     failures, calls = [], []
     fsm = SimpleNamespace(
-        device="cpu", Stage=SimpleNamespace(PREGRASP=1), panel_body_idx=0, handle_body_idx=1,
-        handle_joint_idx=0, handle_joint_axis_panel_local=torch.tensor([[1., 0, 0]]).expand(2, -1),
-        hinge_axis_sign=torch.tensor([-1., 1.]), turn_gap_angle=torch.tensor([.1, .2]),
-        turn_gap_margin=torch.zeros(2), turn_target_margin=torch.zeros(2), hinge_world=torch.zeros((2, 3)),
-        arm_align_path=PaddedPathBank(2, 512, "cpu"), arm_align_desired_target_world=torch.zeros((2, 3)),
-        arm_align_target_valid=torch.zeros(2, dtype=torch.bool), stage_steps=torch.zeros(2, dtype=torch.int64),
-        arm_stability=SimpleNamespace(clear=lambda rows: None), transition=lambda *args: None,
-        fail=lambda rows, code: failures.extend((int(row), code) for row in rows))
+        device="cpu",
+        Stage=SimpleNamespace(MOVE_TO_PREGRASP=1),
+        panel_body_idx=0,
+        handle_body_idx=1,
+        handle_joint_idx=0,
+        handle_joint_axis_panel_local=torch.tensor([[1.0, 0, 0]]).expand(2, -1),
+        hinge_axis_sign=torch.tensor([-1.0, 1.0]),
+        turn_gap_angle=torch.tensor([0.1, 0.2]),
+        turn_gap_margin=torch.zeros(2),
+        turn_target_margin=torch.zeros(2),
+        hinge_world=torch.zeros((2, 3)),
+        arm_align_path=PaddedPathBank(2, 512, "cpu"),
+        arm_align_desired_target_world=torch.zeros((2, 3)),
+        arm_align_target_valid=torch.zeros(2, dtype=torch.bool),
+        stage_steps=torch.zeros(2, dtype=torch.int64),
+        arm_stability=SimpleNamespace(clear=lambda rows: None),
+        transition=lambda *args: None,
+        fail=lambda rows, code: failures.extend((int(row), code) for row in rows),
+    )
     bodies = torch.zeros((2, 2, 13))
     bodies[..., 3] = 1
-    bodies[:, 1, :3] = torch.tensor([.6, .3, 1.])
-    state = {"door_body_state_w": bodies, "door_joint_position": torch.zeros((2, 1)),
-             "ee_pos": torch.tensor([[.8, .3, .9], [.7, .3, .9]]), "ee_orn": quat[:, 0]}
+    bodies[:, 1, :3] = torch.tensor([0.6, 0.3, 1.0])
+    state = {
+        "door_body_state_w": bodies,
+        "door_joint_position": torch.zeros((2, 1)),
+        "ee_pos": torch.tensor([[0.8, 0.3, 0.9], [0.7, 0.3, 0.9]]),
+        "ee_orn": quat[:, 0],
+    }
+    state["robot_body_state_w"] = torch.zeros(2, 2, 13)
+    state["robot_body_state_w"][..., :3] = state["ee_pos"][:, None]
+    state["robot_body_state_w"][..., 3] = 1.0
+    coordinator.gpu_stage_constants["geometry"] = {
+        "fixed_body_idx": 0,
+        "moving_body_idx": 1,
+        "handle_body_idx": 1,
+        "fixed_points": torch.zeros(1, 3),
+        "moving_points": torch.zeros(1, 3),
+        "handle_center_local": torch.zeros(2, 3),
+        "handle_axis_local": torch.tensor([[0.0, 1.0, 0.0]]).repeat(2, 1),
+        "handle_half_length": torch.full((2,), 0.05),
+        "handle_radius": torch.full((2,), 0.01),
+        "door_normal": torch.tensor([[1.0, 0.0, 0.0]]).repeat(2, 1),
+    }
+    coordinator.pull_geometry = SimpleNamespace(
+        _sample=lambda p, q, n: PullEntryGPU._sample(SimpleNamespace(max_samples=512), p, q, n)
+    )
 
     def inverse(fsm, state, rows, positions, orientations, lengths):
         owner, sample = torch.where(torch.arange(positions.shape[1])[None] < lengths[:, None])
@@ -136,11 +195,14 @@ def _gpu_pregrasp_case(fail_all=False):
         error = torch.zeros((len(owner), 3))
         if len(calls) == 1:
             # Reject first candidate by one sample; or reject every sample.
-            error[:, 0] = .01 if fail_all else 0.
-            error[0, 0] = .01
-        result = SimpleNamespace(position_error=error, orientation_error=torch.zeros_like(error),
-                                 command_position_world=positions[owner, sample],
-                                 command_orientation_world_wxyz=orientations[owner, sample])
+            error[:, 0] = 0.01 if fail_all else 0.0
+            error[0, 0] = 0.01
+        result = SimpleNamespace(
+            position_error=error,
+            orientation_error=torch.zeros_like(error),
+            command_position_world=positions[owner, sample],
+            command_orientation_world_wxyz=orientations[owner, sample],
+        )
         return result, owner, sample
 
     coordinator._inverse_pose_bank = inverse
@@ -155,8 +217,9 @@ def test_gpu_selection_submits_all_ragged_env_candidates_once():
     assert family_positions.shape[1:] == (1, 3)
     assert set(family_rows.tolist()) == {0, 1}
     assert coordinator.gpu_stage_constants["selected_pitch"].tolist() == [1, 0]
-    torch.testing.assert_close(fsm.arm_align_desired_target_world,
-        torch.tensor([[.8, .3, .91], [.7, .3, .9]]))
+    torch.testing.assert_close(
+        fsm.arm_align_desired_target_world, torch.tensor([[0.8, 0.3, 0.91], [0.7, 0.3, 0.9]])
+    )
     assert not failures
 
 
@@ -172,19 +235,27 @@ def test_no_reachable_pitch_fails_without_installing_best_effort_path():
 def test_pregrasp_controller_metadata_is_materialized_offline_only():
     coordinator, fsm, state, _, _ = _gpu_pregrasp_case()
     controllers = []
-    names = ("center_standoff_ee_world", "center_standoff_nominal_world", "center_insert_waypoint_world",
-             "center_insert_nominal_world", "grasp_waypoint_world", "grasp_nominal_world")
+    names = (
+        "center_standoff_ee_world",
+        "center_standoff_nominal_world",
+        "center_insert_waypoint_world",
+        "center_insert_nominal_world",
+        "grasp_waypoint_world",
+        "grasp_nominal_world",
+    )
     for _ in range(2):
-        controller = SimpleNamespace(pregrasp_pitch_deg=-1.,
-            open_template={"tip_capture_center": np.zeros(3, dtype=np.float32)})
+        controller = SimpleNamespace(
+            pregrasp_pitch_deg=-1.0,
+            open_template={"tip_capture_center": np.zeros(3, dtype=np.float32)},
+        )
         for name in names:
             setattr(controller, name, np.zeros(3, dtype=np.float32))
         controllers.append(controller)
     coordinator.controllers = controllers
     coordinator.plan_pregrasp(fsm, state, torch.tensor([0, 1]))
-    assert [c.pregrasp_pitch_deg for c in controllers] == [-1., -1.]
+    assert [c.pregrasp_pitch_deg for c in controllers] == [-1.0, -1.0]
     coordinator.finalize_gpu_stage_diagnostics()
-    assert [c.pregrasp_pitch_deg for c in controllers] == [5., 0.]
+    assert [c.pregrasp_pitch_deg for c in controllers] == [5.0, 0.0]
     assert controllers[0].pregrasp_pitch_diagnostics[0]["first_failure"]["sample_index"] == 0
     assert not controllers[0].pregrasp_pitch_diagnostics[0]["exact"]
     assert controllers[0].pregrasp_pitch_diagnostics[1]["exact"]

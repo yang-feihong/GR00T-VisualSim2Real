@@ -219,7 +219,7 @@ def main():
         root = np.asarray(c['entry_root_state'])
         raw = pq.read_table(next(shard.rglob('raw_audit/**/*.parquet'))).to_pydict()
         stages = np.array(raw['autoopen_stage'])
-        entry = int(np.flatnonzero(stages == 'PULL_INSERT')[0])
+        entry = int(np.flatnonzero(stages == 'INSERT_INTO_DOOR_GAP')[0])
         roots = np.array(raw['root_position_world'])
         ees = np.array(raw['ee_pose_world_xyzw'])
         match = np.linalg.norm(roots-root[:3], axis=1) + np.linalg.norm(ees[:, :3]-c['entry_ee_position_world_m'], axis=1)
@@ -305,7 +305,7 @@ def main():
                     worst_gap_m=min((v['closest']['signed_sat_gap_m'] for v in checks if v['closest']), default=None)))
             print('PATHS', seed, [(p['dz_m'],p['collision_samples'],p['worst_gap_m']) for p in result['offline_paths']], flush=True)
         report = json.loads((shard/'meta/acceptance_report.json').read_text())['episodes'][0]
-        contacts = [v for v in report['contacts']['abnormal_contacts'] if v['stage']=='PULL_INSERT']
+        contacts = [v for v in report['contacts']['abnormal_contacts'] if v['stage']=='INSERT_INTO_DOOR_GAP']
         if contacts:
             first = min(contacts, key=lambda v:v['frame'])
             row = raw['frame_index'].index(first['frame'])

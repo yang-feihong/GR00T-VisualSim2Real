@@ -4,11 +4,7 @@ from pathlib import Path
 import torch
 
 
-LOWLEVEL_ROOT = (
-    Path(__file__).resolve().parents[1]
-    / "third_party"
-    / "visual_wholebody_lowlevel"
-)
+LOWLEVEL_ROOT = Path(__file__).resolve().parents[1] / "third_party" / "visual_wholebody_lowlevel"
 sys.path.insert(0, str(LOWLEVEL_ROOT))
 
 from legged_gym.scripts.manip_loco_interface import ManipLoco_Policy

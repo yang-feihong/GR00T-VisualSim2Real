@@ -5,52 +5,40 @@ import numpy as np
 import pytest
 import torch
 
-from gr00t.rl.auto_open.tensor_fsm import (
-    PaddedPathBank,
-    TensorCommandBuffers,
-    TensorDoorFSM,
+from gr00t.rl.auto_open.motion_targets import PaddedPathBank
+from gr00t.rl.auto_open.execution import TensorCommandBuffers
+from gr00t.rl.auto_open.tensor_fsm import TensorDoorFSM
+from gr00t.rl.auto_open.motion_math import (
     _axis_angle_quat,
     _quat_distance,
     _quat_multiply,
     _signed_quat_rotation_about_axis,
     _slew_quaternion,
     track_base_pose,
-    update_robot_stability,
 )
+from gr00t.rl.auto_open.acceptance import update_robot_stability
 
 
 def test_opposed_grasp_allows_contacts_near_handle_end():
     fsm = TensorDoorFSM.__new__(TensorDoorFSM)
     fsm.handle_body_idx = 0
     fsm.handle_center_local = torch.zeros(4, 3)
-    fsm.handle_axis_local = torch.tensor([[1., 0., 0.]]).repeat(4, 1)
-    fsm.door_normal = torch.tensor([[0., 1., 0.]]).repeat(4, 1)
-    fsm.handle_radius = torch.full((4,), .01)
-    fsm.handle_half_length = torch.full((4,), .05)
+    fsm.handle_axis_local = torch.tensor([[1.0, 0.0, 0.0]]).repeat(4, 1)
+    fsm.door_normal = torch.tensor([[0.0, 1.0, 0.0]]).repeat(4, 1)
+    fsm.handle_radius = torch.full((4,), 0.01)
+    fsm.handle_half_length = torch.full((4,), 0.05)
     poses = torch.zeros(4, 1, 7)
-    poses[:, :, 3] = 1.
-    points = torch.tensor([
-        [[.049, 0., .005], [.049, 0., -.005]],
-        [[.049, 0., .005], [.049, 0., .006]],
-        [[.049, 0., .001], [.049, 0., -.001]],
-        [[float('nan'), 0., .005], [.049, 0., -.005]],
-    ])
-    actual = fsm._opposed_grasp(
-        {"door_body_state_w": poses}, torch.arange(4), points
+    poses[:, :, 3] = 1.0
+    points = torch.tensor(
+        [
+            [[0.049, 0.0, 0.005], [0.049, 0.0, -0.005]],
+            [[0.049, 0.0, 0.005], [0.049, 0.0, 0.006]],
+            [[0.049, 0.0, 0.001], [0.049, 0.0, -0.001]],
+            [[float("nan"), 0.0, 0.005], [0.049, 0.0, -0.005]],
+        ]
     )
+    actual = fsm._opposed_grasp({"door_body_state_w": poses}, torch.arange(4), points)
     assert actual.tolist() == [True, False, False, False]
-    from gr00t.rl.auto_open.geometry import _contacts_form_opposed_grasp
-
-    geometry = SimpleNamespace(
-        batched_handle_center=np.zeros(3),
-        handle_axis_local=np.array([1., 0., 0.]),
-        door_normal=np.array([0., 1., 0.]),
-        handle_upper_z=.01, handle_lower_z=-.01, handle_half_length=.05,
-    )
-    handle_state = np.array([0., 0., 0., 1., 0., 0., 0.])
-    expected = [True, False, False, False]
-    for contacts, valid in zip(points.numpy(), expected):
-        assert _contacts_form_opposed_grasp(geometry, contacts, handle_state)[0] == valid
 
 
 def test_shared_station_tracking_preserves_approach_commands():
@@ -67,15 +55,23 @@ def test_shared_station_tracking_preserves_approach_commands():
         roots[:, 8] = velocity
         roots[:, 12] = velocity
         expected, distance, yaw = track_base_pose(
-            roots, target_xy, target_yaw, target_xy, target_yaw,
+            roots,
+            target_xy,
+            target_yaw,
+            target_xy,
+            target_yaw,
             minimum_speed_toward_target_only=True,
         )
         expected[1] = 0.0
         crossing = (previous * expected < 0.0) & ((expected - previous).abs() >= 0.15)
         expected = torch.where(crossing, torch.zeros_like(expected), expected)
         actual, actual_distance, actual_yaw = fsm._track_station(
-            {"root_states": roots}, rows,
-            target_xy, target_yaw, target_xy, target_yaw,
+            {"root_states": roots},
+            rows,
+            target_xy,
+            target_yaw,
+            target_xy,
+            target_yaw,
         )
         assert torch.equal(actual, expected)
         assert torch.equal(actual_distance, distance)
@@ -85,30 +81,50 @@ def test_shared_station_tracking_preserves_approach_commands():
 
 def test_station_stability_gate_does_not_block_motion_or_shortcut_window():
     from gr00t.rl.auto_open.control import APPROACH_ARRIVAL
+
     fsm = TensorDoorFSM.__new__(TensorDoorFSM)
-    fsm.device = torch.device('cpu')
+    fsm.device = torch.device("cpu")
     fsm.base_command_previous = torch.zeros(1, 3)
     fsm.base_arrival_confirmed = torch.zeros(1, dtype=torch.bool)
     fsm.base_stability_confirmed = torch.zeros(1, dtype=torch.bool)
-    for name in ('base_arrival_settle_steps', 'base_arrival_max_settle_steps', 'base_stability_steps'):
+    for name in (
+        "base_arrival_settle_steps",
+        "base_arrival_max_settle_steps",
+        "base_stability_steps",
+    ):
         setattr(fsm, name, torch.zeros(1, dtype=torch.int32))
-    fsm.through_min_base_height = torch.tensor([.4])
+    fsm.through_min_base_height = torch.tensor([0.4])
     rows = torch.tensor([0])
     # configure_base_arrival writes these per-environment tensors in place.
-    for name in ('inner_distance', 'outer_distance', 'inner_yaw', 'outer_yaw',
-                 'max_linear_speed', 'max_angular_speed'):
-        setattr(fsm, 'base_arrival_' + name, torch.zeros(1))
+    for name in (
+        "inner_distance",
+        "outer_distance",
+        "inner_yaw",
+        "outer_yaw",
+        "max_linear_speed",
+        "max_angular_speed",
+    ):
+        setattr(fsm, "base_arrival_" + name, torch.zeros(1))
     fsm.base_arrival_required_frames = torch.zeros(1, dtype=torch.int32)
     fsm.reset_base_arrival(rows, APPROACH_ARRIVAL)
     root = torch.zeros(1, 13)
-    root[:, 2], root[:, 3] = .5, 1.
-    root[:, 0] = .5
+    root[:, 2], root[:, 3] = 0.5, 1.0
+    root[:, 0] = 0.5
     target, yaw = torch.zeros(1, 2), torch.zeros(1)
+
     def command(slow):
-        return fsm._track_station({'root_states': root}, rows, target, yaw, target, yaw,
-            stability_condition=torch.tensor([slow]))[0]
-    assert command(False).abs().max() >= .15
-    root[:, 0] = 0.
+        return fsm._track_station(
+            {"root_states": root},
+            rows,
+            target,
+            yaw,
+            target,
+            yaw,
+            stability_condition=torch.tensor([slow]),
+        )[0]
+
+    assert command(False).abs().max() >= 0.15
+    root[:, 0] = 0.0
     for _ in range(30):
         assert torch.count_nonzero(command(False)) == 0
     assert not fsm.base_stability_confirmed.item()
@@ -129,7 +145,8 @@ def test_acceptance_diagnostics_preserves_unobserved_rows_without_nan_conversion
     fsm.stage_visit = torch.ones((2, 3), dtype=torch.int32)
     fsm._acceptance = {}
     fsm.record_acceptance(
-        1, torch.tensor([0]),
+        1,
+        torch.tensor([0]),
         {"position": (torch.tensor([True]), torch.tensor([0.0]), "<", 0.01)},
         required_streak=10,
     )
@@ -151,7 +168,7 @@ def test_open_gripper_requires_no_blocking_jaw_contact(blocking):
 
     fsm = TensorDoorFSM.__new__(TensorDoorFSM)
     fsm.device = torch.device("cpu")
-    fsm.Stage = IntEnum("Stage", {"OPEN_AND_CLEAR": 1})
+    fsm.Stage = IntEnum("Stage", {"RELEASE_HANDLE": 1})
     fsm.mask = lambda stage: torch.tensor([True])
     fsm.q_open = torch.tensor([-1.0])
     fsm.release_stable_steps = torch.zeros(1, dtype=torch.int32)
@@ -161,14 +178,17 @@ def test_open_gripper_requires_no_blocking_jaw_contact(blocking):
     fsm.record_acceptance = lambda stage, rows, conditions, **kwargs: recorded.append(conditions)
     state = {"gripper_position": torch.tensor([[-1.0]])}
     for _ in range(9):
-        assert fsm.advance_open_and_clear(state).numel() == 0
-    assert fsm.advance_open_and_clear(state).tolist() == ([] if blocking else [0])
-    assert all(set(conditions) == {
-        "gripper_open_error_rad", "fixed_jaw_contact_clear", "moving_jaw_contact_clear"
-    } for conditions in recorded)
+        assert fsm.advance_release_handle(state).numel() == 0
+    assert fsm.advance_release_handle(state).tolist() == ([] if blocking else [0])
+    assert all(
+        set(conditions)
+        == {"gripper_open_error_rad", "fixed_jaw_contact_clear", "moving_jaw_contact_clear"}
+        for conditions in recorded
+    )
     state["gripper_position"][:] = -0.5
-    assert fsm.advance_open_and_clear(state).numel() == 0
+    assert fsm.advance_release_handle(state).numel() == 0
     assert fsm.release_stable_steps.item() == 0
+
 
 def _numpy_reference(
     roots,
@@ -180,9 +200,7 @@ def _numpy_reference(
     roots = np.asarray(roots, dtype=np.float32)
     error = np.asarray(command_xy, dtype=np.float32) - roots[:, :2]
     w, x, y, z = (roots[:, index] for index in range(3, 7))
-    yaw = np.arctan2(
-        2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z)
-    )
+    yaw = np.arctan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
     cosine, sine = np.cos(yaw), np.sin(yaw)
     local_x = cosine * error[:, 0] + sine * error[:, 1]
     local_y = -sine * error[:, 0] + cosine * error[:, 1]
@@ -214,9 +232,7 @@ def _numpy_reference(
     )
     command[yaw_deadzone, 2] = np.copysign(0.2, command[yaw_deadzone, 2])
     distance = np.linalg.norm(acceptance_xy - roots[:, :2], axis=-1)
-    acceptance_error = np.abs(
-        (acceptance_yaw - yaw + math.pi) % (2.0 * math.pi) - math.pi
-    )
+    acceptance_error = np.abs((acceptance_yaw - yaw + math.pi) % (2.0 * math.pi) - math.pi)
     return command, distance, acceptance_error
 
 
@@ -248,9 +264,7 @@ def test_gpu_base_tracking_matches_reference_batch():
         acceptance_yaw.numpy(),
     )
     for actual_value, expected_value in zip(actual, expected, strict=True):
-        np.testing.assert_allclose(
-            actual_value.numpy(), expected_value, rtol=2.0e-5, atol=2.0e-6
-        )
+        np.testing.assert_allclose(actual_value.numpy(), expected_value, rtol=2.0e-5, atol=2.0e-6)
 
 
 def test_robot_stability_requires_every_configured_condition_consecutively():
@@ -295,9 +309,7 @@ def test_turn_gap_path_is_only_a_rigid_rotation_about_the_door_hinge():
     fsm.turn_gap_gripper_angle = torch.zeros(1)
     fsm.turn_path = PaddedPathBank(1, 512, "cpu")
     start = torch.tensor([[1.0, 0.0, 0.25]])
-    start_q = _axis_angle_quat(
-        torch.tensor([[0.0, 1.0, 0.0]]), torch.tensor([0.61])
-    )
+    start_q = _axis_angle_quat(torch.tensor([[0.0, 1.0, 0.0]]), torch.tensor([0.61]))
     state = {
         "ee_pos": torch.tensor([[9.0, 9.0, 9.0]]),
         "ee_orn": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
@@ -330,9 +342,7 @@ def test_return_rotation_uses_gripper_orientation_not_handle_angle():
     horizontal = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
     gripper_pressed = _axis_angle_quat(axis, torch.tensor([math.radians(35.0)]))
 
-    return_angle = _signed_quat_rotation_about_axis(
-        gripper_pressed, horizontal, axis
-    )
+    return_angle = _signed_quat_rotation_about_axis(gripper_pressed, horizontal, axis)
 
     assert return_angle.item() == pytest.approx(math.radians(-35.0), abs=1e-6)
 
@@ -388,8 +398,8 @@ def test_padded_path_bank_advances_rows_independently():
     positions = torch.ones(2, 3, 3)
     positions[0] = torch.arange(9, dtype=torch.float32).reshape(3, 3)
     orientations = torch.zeros(2, 3, 4)
-    orientations[0, :, 0] = 1.
-    orientations[1, :, 1] = 1.
+    orientations[0, :, 0] = 1.0
+    orientations[1, :, 1] = 1.0
     bank.install_tensor(torch.tensor([0, 2]), positions, orientations, torch.tensor([3, 2]))
     rows = torch.tensor([0, 2])
     first, _ = bank.current(rows, advance=True)
@@ -428,22 +438,20 @@ def test_command_buffers_use_arm_mode_transition_api():
 
     assert transitions == [("joint", [1]), ("ee", [0])]
     assert env.teleop_arm_joint_control_mask.tolist() == [False, True, True]
-    torch.testing.assert_close(
-        env.teleop_arm_joint_pos_targets, torch.full((3, 6), 0.25)
-    )
+    torch.testing.assert_close(env.teleop_arm_joint_pos_targets, torch.full((3, 6), 0.25))
 
 
 def test_push_arc_latches_physical_contact_not_inverse_command():
     fsm = TensorDoorFSM.__new__(TensorDoorFSM)
     fsm.device = torch.device("cpu")
-    fsm.Stage = SimpleNamespace(PUSH_OPEN=13)
+    fsm.Stage = SimpleNamespace(PUSH_PANEL_OPEN=13)
     fsm.stage = torch.tensor([12], dtype=torch.int64)
     fsm.stage_steps = torch.zeros(1, dtype=torch.int32)
     fsm.hinge_idx = 0
     fsm.panel_contact_target_world = torch.tensor([[1.0, 2.0, 3.0]])
-    fsm.panel_push_tip_offset_local = torch.tensor([[.1, 0., 0.]])
-    fsm.panel_push_tip_surface_world = torch.tensor([[1.1, 2., 3.]])
-    fsm.panel_push_tip_hinge_angle = torch.tensor([.25])
+    fsm.panel_push_tip_offset_local = torch.tensor([[0.1, 0.0, 0.0]])
+    fsm.panel_push_tip_surface_world = torch.tensor([[1.1, 2.0, 3.0]])
+    fsm.panel_push_tip_hinge_angle = torch.tensor([0.25])
     fsm.hinge_world = torch.zeros(1, 3)
     fsm.hinge_axis_sign = torch.ones(1)
     fsm.push_tip_offset_world = torch.zeros(1, 3)
@@ -473,19 +481,15 @@ def test_push_arc_latches_physical_contact_not_inverse_command():
         "ee_pos": torch.tensor([[0.5, 0.6, 0.7]]),
     }
 
-    fsm.begin_push(state, torch.tensor([0]), torch.tensor([0.03]))
+    fsm.begin_push_panel_open(state, torch.tensor([0]), torch.tensor([0.03]))
 
-    torch.testing.assert_close(
-        fsm.push_contact_world, fsm.panel_contact_target_world
-    )
-    assert not torch.equal(
-        fsm.push_contact_world, fsm.panel_contact_command_target_world
-    )
+    torch.testing.assert_close(fsm.push_contact_world, fsm.panel_contact_target_world)
+    assert not torch.equal(fsm.push_contact_world, fsm.panel_contact_command_target_world)
 
 
 def test_base_advance_reentry_preserves_contact_seed_and_actual_ee_origin():
     fsm = TensorDoorFSM.__new__(TensorDoorFSM)
-    fsm.Stage = SimpleNamespace(BASE_ADVANCE=15, CONTACT_PANEL=12)
+    fsm.Stage = SimpleNamespace(ADVANCE_TO_NEXT_PUSH_STATION=15, MOVE_TO_PANEL_STANDOFF=12)
     fsm.stage = torch.tensor([15], dtype=torch.int64)
     fsm.stage_steps = torch.tensor([23], dtype=torch.int32)
     fsm.push_recovery_settle_steps = torch.tensor([10], dtype=torch.int32)
@@ -511,7 +515,7 @@ def test_base_advance_reentry_preserves_contact_seed_and_actual_ee_origin():
         "ee_pos": torch.tensor([[0.4, -0.2, 1.1]]),
     }
 
-    completed = fsm.advance_base_advance(state)
+    completed = fsm.advance_advance_to_next_push_station(state)
 
     assert completed.tolist() == [0]
     assert fsm.stage.tolist() == [12]
@@ -525,23 +529,21 @@ def test_base_advance_reentry_preserves_contact_seed_and_actual_ee_origin():
 
 def test_push_retract_slews_orientation_instead_of_jumping_to_endpoint():
     fsm = TensorDoorFSM.__new__(TensorDoorFSM)
-    fsm.Stage = SimpleNamespace(PUSH_ARM_RETRACT=14)
+    fsm.Stage = SimpleNamespace(STOW_ARM_AFTER_PUSH=14)
     fsm.device = torch.device("cpu")
     fsm.stage = torch.tensor([14], dtype=torch.int64)
     fsm.stage_steps = torch.tensor([1], dtype=torch.int32)
     fsm.push_detached_ee_goal_local = torch.tensor([[0.3, 0.0, 0.3]])
-    fsm.active_arm_retract_pose_local = torch.tensor(
-        [[0.3, 0.0, 0.3, 0.0, 0.0, math.pi / 2.0]]
-    )
+    fsm.active_arm_retract_pose_local = torch.tensor([[0.3, 0.0, 0.3, 0.0, 0.0, math.pi / 2.0]])
     fsm.ee_orientation_command = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
     fsm.arm_induced_pitch = torch.zeros(1)
     fsm.q_closed = torch.zeros(1)
-    fsm._base_hold_command = lambda state, rows: (
-        torch.zeros((len(rows), 3)), torch.zeros(len(rows)), torch.zeros(len(rows))
+    fsm._base_hold_command = lambda state, rows, buffers=None: (
+        torch.zeros((len(rows), 3)),
+        torch.zeros(len(rows)),
+        torch.zeros(len(rows)),
     )
-    fsm.env = SimpleNamespace(
-        get_goal_reference_quat=lambda: torch.tensor([[1.0, 0.0, 0.0, 0.0]])
-    )
+    fsm.env = SimpleNamespace(get_goal_reference_quat=lambda: torch.tensor([[1.0, 0.0, 0.0, 0.0]]))
     buffers = SimpleNamespace(
         base=torch.zeros((1, 3)),
         ee_cart=torch.zeros((1, 3)),
@@ -552,23 +554,22 @@ def test_push_retract_slews_orientation_instead_of_jumping_to_endpoint():
         gripper=torch.zeros((1, 1)),
     )
 
-    fsm.command_push_retract({}, buffers)
+    fsm.command_stow_arm_after_push({}, buffers)
 
     start = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
-    endpoint = torch.tensor(
-        [[math.sqrt(0.5), 0.0, 0.0, math.sqrt(0.5)]]
-    )
+    endpoint = torch.tensor([[math.sqrt(0.5), 0.0, 0.0, math.sqrt(0.5)]])
     torch.testing.assert_close(_quat_distance(start, buffers.ee_quat), torch.tensor([0.025]))
     assert _quat_distance(buffers.ee_quat, endpoint).item() > 1.5
 
 
 def test_terminal_hold_dispatches_exact_zero_after_reversal_filter():
     from gr00t.rl.auto_open.base_trajectory import BasePoseTrajectory
+
     fsm = TensorDoorFSM.__new__(TensorDoorFSM)
-    fsm.through_trajectory = BasePoseTrajectory(1, 'cpu')
+    fsm.through_trajectory = BasePoseTrajectory(1, "cpu")
     fsm.through_trajectory.length[:] = 1
     fsm.device = torch.device("cpu")
-    fsm.Stage = SimpleNamespace(THROUGH=16, SUCCESS=17)
+    fsm.Stage = SimpleNamespace(PASS_THROUGH_DOORWAY=16, SUCCESS=17)
     fsm.stage = torch.tensor([16], dtype=torch.int64)
     fsm.through_command_xy = torch.zeros((1, 2))
     fsm.through_command_yaw = torch.zeros(1)
@@ -602,7 +603,7 @@ def test_terminal_hold_dispatches_exact_zero_after_reversal_filter():
         gripper=torch.ones((1, 1)),
     )
 
-    fsm.command_through(state, buffers)
+    fsm.command_pass_through_doorway(state, buffers)
 
     torch.testing.assert_close(buffers.base, torch.zeros((1, 3)))
     assert fsm.through_stop_latched.tolist() == [True]

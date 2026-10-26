@@ -4,7 +4,6 @@ import importlib
 import symtable
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).resolve().parents[3]
 SCRIPTS = REPO_ROOT / "gr00t" / "rl" / "scripts"
 AUTO_OPEN = REPO_ROOT / "gr00t" / "rl" / "auto_open"
@@ -14,35 +13,51 @@ MANIP_LOCO = (
 )
 
 
+def test_retired_cpu_planning_paths_are_not_present():
+    utils = MANIP_LOCO.parents[2] / "utils"
+    for path in (
+        AUTO_OPEN / "planning.py",
+        utils / "ee_steady_state.py",
+        utils / "steady_path_worker.py",
+    ):
+        assert not path.exists(), path
+    retired = {"ee_steady_state", "steady_path_worker", "gr00t.rl.auto_open.planning"}
+    for path in (*AUTO_OPEN.glob("*.py"), SCRIPTS / "doorman_auto_open.py"):
+        for node in ast.walk(ast.parse(path.read_text())):
+            modules = []
+            if isinstance(node, ast.Import):
+                modules = [alias.name for alias in node.names]
+            elif isinstance(node, ast.ImportFrom):
+                modules = [node.module or ""]
+                modules.extend(alias.name for alias in node.names)
+            assert not any(
+                module == name or module.endswith("." + name)
+                for module in modules
+                for name in retired
+            ), path
+
+
 def test_default_arm_presets_match_requested_joint_angles():
     config = ast.parse((MANIP_LOCO.parent / "b2z1_config.py").read_text())
     xr = next(n for n in ast.walk(config) if isinstance(n, ast.ClassDef) and n.name == "xr_teleop")
     presets = {
-        n.targets[0].id: ast.literal_eval(n.value)
-        for n in xr.body if isinstance(n, ast.Assign)
+        n.targets[0].id: ast.literal_eval(n.value) for n in xr.body if isinstance(n, ast.Assign)
     }
     assert presets["front_preset_q"] == "-1.57,2.6,-1.5,0.4,0,0"
     assert presets["back_preset_q"] == "1.57,1.57,-1.3,1.1,0,0"
     cli = ast.parse((AUTO_OPEN / "cli.py").read_text())
     middle = next(
-        k.value for n in ast.walk(cli) if isinstance(n, ast.Call)
-        for k in n.keywords if k.arg == "doorman_arm_joint_init_center"
+        k.value
+        for n in ast.walk(cli)
+        if isinstance(n, ast.Call)
+        for k in n.keywords
+        if k.arg == "doorman_arm_joint_init_center"
     )
     assert ast.literal_eval(middle) == (-1.57, 1.75, -0.785, -0.93, 0.0, 0.0)
 
 
 def test_all_auto_open_modules_resolve_their_runtime_imports():
-    module_names = (
-        "cli",
-        "control",
-        "geometry",
-        "io",
-        "lifecycle",
-        "planning",
-        "runtime",
-        "target_noise",
-        "utils",
-    )
+    module_names = sorted(path.stem for path in AUTO_OPEN.glob("*.py") if path.stem != "__init__")
     importlib.import_module("gr00t.rl.scripts.doorman_auto_open")
     for name in module_names:
         importlib.import_module(f"gr00t.rl.auto_open.{name}")
@@ -52,9 +67,7 @@ def test_auto_open_modules_have_no_unbound_global_references():
     paths = [SCRIPTS / "doorman_auto_open.py", *AUTO_OPEN.glob("*.py")]
     unresolved = []
     for path in paths:
-        table = symtable.symtable(
-            path.read_text(encoding="utf-8"), str(path), "exec"
-        )
+        table = symtable.symtable(path.read_text(encoding="utf-8"), str(path), "exec")
         module_bindings = {
             symbol.get_name()
             for symbol in table.get_symbols()
@@ -64,9 +77,7 @@ def test_auto_open_modules_have_no_unbound_global_references():
 
         def collect_references(scope):
             for symbol in scope.get_symbols():
-                if symbol.is_referenced() and (
-                    scope.get_type() == "module" or symbol.is_global()
-                ):
+                if symbol.is_referenced() and (scope.get_type() == "module" or symbol.is_global()):
                     global_references.add(symbol.get_name())
             for child in scope.get_children():
                 collect_references(child)
@@ -107,9 +118,7 @@ def test_extracted_static_geometry_helpers_keep_their_original_call_arity():
 
 
 def test_domain_modules_do_not_call_removed_controller_methods():
-    orchestrator_tree = ast.parse(
-        (SCRIPTS / "doorman_auto_open.py").read_text(encoding="utf-8")
-    )
+    orchestrator_tree = ast.parse((SCRIPTS / "doorman_auto_open.py").read_text(encoding="utf-8"))
     controller = next(
         node
         for node in orchestrator_tree.body
@@ -126,7 +135,6 @@ def test_domain_modules_do_not_call_removed_controller_methods():
             "control.py",
             "geometry.py",
             "lifecycle.py",
-            "planning.py",
             "runtime.py",
         )
     ]
@@ -196,17 +204,15 @@ def test_domain_package_never_imports_from_executable_scripts():
     for path in AUTO_OPEN.glob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom) and (
-                node.module or ""
-            ).startswith("gr00t.rl.scripts"):
+            if isinstance(node, ast.ImportFrom) and (node.module or "").startswith(
+                "gr00t.rl.scripts"
+            ):
                 violations.append((path.name, node.lineno, node.module))
     assert violations == []
 
 
 def test_domain_package_dependency_graph_is_acyclic():
-    module_paths = {
-        path.stem: path for path in AUTO_OPEN.glob("*.py") if path.stem != "__init__"
-    }
+    module_paths = {path.stem: path for path in AUTO_OPEN.glob("*.py") if path.stem != "__init__"}
     dependencies = {name: set() for name in module_paths}
     for name, path in module_paths.items():
         tree = ast.parse(path.read_text(encoding="utf-8"))
@@ -238,7 +244,12 @@ def test_domain_package_dependency_graph_is_acyclic():
 
 def test_direct_python_entry_requires_the_fixed_launcher_identity():
     source = (SCRIPTS / "doorman_auto_open.py").read_text(encoding="utf-8")
-    assert '"run_auto_open.sh", "run_auto_open_pitch_probe.sh"' in source
+    literals = {
+        node.value
+        for node in ast.walk(ast.parse(source))
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    }
+    assert {"run_auto_open.sh", "run_auto_open_pitch_probe.sh"} <= literals
     assert "run_auto_open_*.sh" not in source
 
 
@@ -279,9 +290,7 @@ def test_tensor_fsm_is_the_only_auto_open_execution_path():
 
 
 def test_one_vectorized_episode_runner_handles_batch_size_one_and_many():
-    orchestrator_source = (SCRIPTS / "doorman_auto_open.py").read_text(
-        encoding="utf-8"
-    )
+    orchestrator_source = (SCRIPTS / "doorman_auto_open.py").read_text(encoding="utf-8")
     runtime_source = (AUTO_OPEN / "runtime.py").read_text(encoding="utf-8")
     orchestrator_tree = ast.parse(orchestrator_source)
     runtime_tree = ast.parse(runtime_source)
@@ -334,20 +343,38 @@ def test_gpu_runtime_has_no_obsolete_backend_selection():
         "--batch_panel_clearance_backend",
         "--batch_geometry_fallback_backend",
     )
-    for path in (AUTO_OPEN / "cli.py", SCRIPTS / "run_auto_open.sh", SCRIPTS / "run_auto_open_pitch_probe.sh"):
+    for path in (
+        AUTO_OPEN / "cli.py",
+        SCRIPTS / "run_auto_open.sh",
+        SCRIPTS / "run_auto_open_pitch_probe.sh",
+    ):
         source = path.read_text(encoding="utf-8")
         assert all(option not in source for option in removed)
 
 
 def test_runtime_keeps_reference_snapshots_out_of_the_online_loop():
     tree = ast.parse((AUTO_OPEN / "runtime.py").read_text(encoding="utf-8"))
-    loop = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_run_tensor_fsm_loop")
+    loop = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_run_tensor_fsm_loop"
+    )
     calls = [node for node in ast.walk(loop) if isinstance(node, ast.Call)]
-    assert not any(isinstance(node.func, ast.Name) and node.func.id in (
-        "_update_batched_reference_buffers", "_snapshot_initial_reference_buffers",
-        "batched_target_height_invariant_poses",
-    ) for node in calls)
-    finalizers = [node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "finalize_diagnostics"]
+    assert not any(
+        isinstance(node.func, ast.Name)
+        and node.func.id
+        in (
+            "_update_batched_reference_buffers",
+            "_snapshot_initial_reference_buffers",
+            "batched_target_height_invariant_poses",
+        )
+        for node in calls
+    )
+    finalizers = [
+        node
+        for node in calls
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "finalize_diagnostics"
+    ]
     assert len(finalizers) == 1
     online_loop = next(node for node in loop.body if isinstance(node, ast.For))
     assert finalizers[0].lineno > online_loop.end_lineno
@@ -356,15 +383,21 @@ def test_runtime_keeps_reference_snapshots_out_of_the_online_loop():
 def test_runtime_has_no_scalar_runner_adapters_or_executor_lifecycle():
     source = (AUTO_OPEN / "runtime.py").read_text(encoding="utf-8")
     for removed in (
-        "steady_path_executor", "_BatchedRunnerView", "_BatchedEnvView",
-        "_make_batched_command_buffers", "_batched_state_rows",
-        "_update_batched_reference_buffers", "_snapshot_initial_reference_buffers",
+        "steady_path_executor",
+        "_BatchedRunnerView",
+        "_BatchedEnvView",
+        "_make_batched_command_buffers",
+        "_batched_state_rows",
+        "_update_batched_reference_buffers",
+        "_snapshot_initial_reference_buffers",
     ):
         assert removed not in source
     tree = ast.parse(source)
     constructors = [
-        node for node in ast.walk(tree)
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
         and node.func.id == "TensorPlanningCoordinator"
     ]
     assert len(constructors) == 1
@@ -374,18 +407,33 @@ def test_runtime_has_no_scalar_runner_adapters_or_executor_lifecycle():
 
 def test_runtime_audit_fk_uses_pre_step_device_root_snapshot():
     tree = ast.parse((AUTO_OPEN / "runtime.py").read_text(encoding="utf-8"))
-    loop = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_run_tensor_fsm_loop")
+    loop = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "_run_tensor_fsm_loop"
+    )
     calls = [node for node in ast.walk(loop) if isinstance(node, ast.Call)]
-    step = next(node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "step_once")
+    step = next(
+        node
+        for node in calls
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "step_once"
+    )
     snapshot = next(
-        node for node in ast.walk(loop) if isinstance(node, ast.Assign)
-        and any(isinstance(target, ast.Name) and target.id == "capture_root_states" for target in node.targets)
+        node
+        for node in ast.walk(loop)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "capture_root_states"
+            for target in node.targets
+        )
         and isinstance(node.value, ast.Call)
     )
     assert snapshot.lineno < step.lineno
     assert ast.unparse(snapshot.value) == "device_state['root_states'].detach().clone()"
     for name in ("_target_height_invariant_poses_gpu", "b2z1_gripper_pose_and_jacobian"):
-        call = next(node for node in calls if isinstance(node.func, ast.Name) and node.func.id == name)
+        call = next(
+            node for node in calls if isinstance(node.func, ast.Name) and node.func.id == name
+        )
         assert call.lineno > step.lineno
         assert "capture_root_states" in ast.unparse(call.args[0])
 
@@ -410,8 +458,8 @@ def test_fixed_launcher_owns_the_complete_official_two_phase_workflow():
 
 def test_fixed_launcher_exposes_only_range_and_two_workflow_modes():
     launcher = (SCRIPTS / "run_auto_open.sh").read_text(encoding="utf-8")
-    assert 'SEED_START and SEED_END' in launcher
-    assert 'for ((seed=SEED_START; seed<=SEED_END; seed++))' in launcher
+    assert "SEED_START and SEED_END" in launcher
+    assert "for ((seed=SEED_START; seed<=SEED_END; seed++))" in launcher
     assert 'AUTO_OPEN_MODE="${AUTO_OPEN_MODE:-official}"' in launcher
     assert 'AUTO_OPEN_MODE}" != official' in launcher
     assert 'AUTO_OPEN_MODE}" != debug' in launcher
@@ -437,14 +485,14 @@ def test_debug_workflow_runs_six_camera_collection_then_strict_selection():
 def test_official_release_name_contains_range_count_camera_and_date():
     launcher = (SCRIPTS / "run_auto_open.sh").read_text(encoding="utf-8")
     assert 'range_tag="seeds${SEED_START}-${SEED_END}"' in launcher
-    assert 'episodes${accepted_count}_dual_camera_${RELEASE_STAMP}' in launcher
-    assert 'canonical_no_camera_${RELEASE_STAMP}' in launcher
+    assert "episodes${accepted_count}_dual_camera_${RELEASE_STAMP}" in launcher
+    assert "canonical_no_camera_${RELEASE_STAMP}" in launcher
     assert 'FORMAL_DATA_ROOT="${REPO_ROOT}/datasets/auto_open"' in launcher
 
 
 def test_every_official_run_is_an_independent_timestamped_dataset():
     launcher = (SCRIPTS / "run_auto_open.sh").read_text(encoding="utf-8")
-    assert 'canonical_no_camera_${RELEASE_STAMP}' in launcher
+    assert "canonical_no_camera_${RELEASE_STAMP}" in launcher
     assert "reusing complete canonical" not in launcher
     assert "official release already complete" not in launcher
     assert '"source_fingerprint_sha256": sys.argv[7]' in launcher
@@ -455,8 +503,12 @@ def test_forced_camera_refresh_advances_the_sensor_clock():
     refresh = "update(float(self.dt), force_recompute=True)"
     assert source.count(refresh) == 3
     assert "def render_stereo_rgb_camera_rigs_batch" in source
-    assert "update(0.0, force_recompute=True)" not in source[
-        source.index("def _camera_rgb_to_numpy") : source.index(
-            "def render_stereo_rgb_camera_rigs"
-        ) + 2500
-    ]
+    assert (
+        "update(0.0, force_recompute=True)"
+        not in source[
+            source.index("def _camera_rgb_to_numpy") : source.index(
+                "def render_stereo_rgb_camera_rigs"
+            )
+            + 2500
+        ]
+    )

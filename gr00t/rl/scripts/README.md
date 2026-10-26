@@ -132,10 +132,10 @@ Debug outputs also include one stitched six-camera video per episode under
 ### Pull-door workflow
 
 The implemented pull-door workflow shares the push-door control modules and
-continues from `RESTORE_GRIPPER` through `PULL_CLEAR_SWEEP`, then
-`PULL_INSERT` -> `PULL_OPEN` -> `PULL_ARM_RETRACT` -> `PULL_BASE_ADVANCE`.
+continues from `STOW_ARM_AND_CLOSE_GRIPPER` through `MOVE_TO_GAP_STATION`, then
+`INSERT_INTO_DOOR_GAP` -> `PRY_DOOR_OPEN` -> `STOW_ARM_AFTER_PULL` -> `FOLLOW_WALL_TO_PANEL`.
 The first pry must open the door at least 30 degrees. After retraction,
-`PULL_BASE_ADVANCE` precomputes a trajectory for the front shoulder nearest the
+`FOLLOW_WALL_TO_PANEL` precomputes a trajectory for the front shoulder nearest the
 wall, preserving its wall-normal coordinate. For shoulder A and hinge B, its
 heading angle is arcsin((body width + 10 cm) / |AB|) plus the AB/wall angle,
 clamped between the entry heading angle and 90 degrees. The trajectory is
@@ -145,11 +145,11 @@ reference holds, with no backward index changes or actual-tracking gate.
 Base travel starts immediately after accepted retraction, even while the door
 is rotating. Completion requires the reference gate to hold and the shared 25-frame zero-command
 stability window to also satisfy door speed below 2 degrees/s throughout.
-After settling, the workflow enters the shared `CONTACT_PANEL` push interface
+After settling, the workflow enters the shared `MOVE_TO_PANEL_STANDOFF` push interface
 instead of planning another pry. Contact planning and measured finger clearance
 use the same selected panel-side normal. Further opening repeats
-`CONTACT_PANEL` -> `PUSH_OPEN` -> `PULL_ARM_RETRACT` -> `PULL_BASE_ADVANCE`;
-it never uses push-door `BASE_ADVANCE` for pull-door repositioning.
+`MOVE_TO_PANEL_STANDOFF` -> `PUSH_PANEL_OPEN` -> `STOW_ARM_AFTER_PULL` -> `FOLLOW_WALL_TO_PANEL`;
+it never uses push-door `ADVANCE_TO_NEXT_PUSH_STATION` for pull-door repositioning.
 All pull-door retractions use the same entry-planned GPU-inverse restore path
 and measured arm-stability acceptance as the first pry retraction.
 The shared contact grid keeps nine height offsets at 5 cm spacing. Its tangent
@@ -169,12 +169,12 @@ band, expanded by 1 cm. The handle band follows its actual pose. This filter is
 applied before the existing batched IK, without adding solver batches. It is an
 endpoint-selection constraint, not an approach-path collision guarantee.
 At the shared 89-degree opening acceptance, retraction finishes before
-the pull workflow enters `THROUGH` directly, without a frame-alignment stage.
+the pull workflow enters `PASS_THROUGH_DOORWAY` directly, without a frame-alignment stage.
 After opening is accepted, the pull workflow leaves the pushing stages for
 retraction and traversal; it does not keep advancing the push target.
 The original push-door angle and angular-speed protection is unchanged.
 If the door reaches the same opening threshold during the initial
-base motion, it hands off directly to `THROUGH` without a stationary window;
+base motion, it hands off directly to `PASS_THROUGH_DOORWAY` without a stationary window;
 the final terminal stationary acceptance remains unchanged.
 Insertion candidates are geometrically screened and solved together through one
 GPU inverse batch. Base motion checks separate articulated rigid-body envelopes,
@@ -187,15 +187,15 @@ DOOR_MOTION=pull AUTO_OPEN_MODE=debug SEED_START=1700 SEED_END=1703 \
 bash gr00t/rl/scripts/run_auto_open.sh
 ```
 
-Handle manipulation consists of `PRESS_HANDLE`, `PUSH_PULL_DOOR`, and
-`RETURN_HANDLE`: rotation about the handle axis, rotation about the door hinge,
+Handle manipulation consists of `PRESS_HANDLE`, `OPEN_DOOR_WITH_HANDLE`, and
+`RESET_HANDLE`: rotation about the handle axis, rotation about the door hinge,
 then rotation about the handle axis. A pull prefix's
 `completed_terminal_seeds.txt` records completion of the requested prefix,
 not full-task strict data acceptance or a trainable official release.
 
-`PULL_CLEAR_SWEEP` holds the restored arm joints and closed gripper, moving the
+`MOVE_TO_GAP_STATION` holds the restored arm joints and closed gripper, moving the
 base toward the free-end side of the door and facing the open gap. It uses the
-same `_track_station` interface and arrival profile as APPROACH: 2/10 cm inner/
+same `_track_station` interface and arrival profile as APPROACH_HANDLE: 2/10 cm inner/
 outer position thresholds, 0.05/0.15 rad yaw thresholds, and a 25-frame zero-
 command stability window. No separate locomotion controller is introduced.
 
@@ -228,17 +228,17 @@ free edge and the current open free edge. Geometry and randomization defaults
 are maintained in `gr00t/rl/auto_open/pull_station.py`; debug metadata records
 the sampled target, frame boundary, planned clearance, and acceptance predicates.
 
-`PULL_INSERT` keeps the gripper closed, approaches outside the free panel edge,
+`INSERT_INTO_DOOR_GAP` keeps the gripper closed, approaches outside the free panel edge,
 passes behind the panel, and inserts the outside jaw face at a 2 mm standoff.
 This is a positioning stage: acceptance checks pose, clearance, and stability,
 not physical contact or contact force. Contact forms during the following arc.
 Contact targets come from measured closed-jaw collision geometry. The entry
 path is checked against panel and wall envelopes before execution.
 
-`PULL_OPEN` moves the EE position along a hinge-centered arc while holding its
+`PRY_DOOR_OPEN` moves the EE position along a hinge-centered arc while holding its
 entry world orientation fixed. Contact can migrate from the jaw's outside face
 toward its tip as the door opens; orientation does not follow the panel.
-It shares PUSH_OPEN's PI door-speed feedback (20 deg/s target, 30 deg/s limit,
+It shares PUSH_PANEL_OPEN's PI door-speed feedback (20 deg/s target, 30 deg/s limit,
 2-degree maximum lead) and 0.7 m XY comfort-workspace test. The complete arc
 is mapped once through the common GPU inverse at stage entry and interpolated
 online according to the feedback hinge target. No per-frame inverse solve or
@@ -247,16 +247,16 @@ restore planner retracts the closed gripper; no pull-specific retract detour
 is added. Completion additionally requires a measured door angle of at least
 30 degrees; reaching the workspace boundary alone cannot pass this stage.
 The following wall-parallel shoulder motion uses the same hysteretic arrival
-tracker as APPROACH. Defaults live in `auto_open/panel_motion.py` and
+tracker as APPROACH_HANDLE. Defaults live in `auto_open/panel_motion.py` and
 `auto_open/pull_station.py`.
 
-Use `STOP_AFTER_STAGE=RESTORE_GRIPPER` or `STOP_AFTER_STAGE=PULL_CLEAR_SWEEP`
-to retain an earlier pull prefix; `STOP_AFTER_STAGE=PULL_INSERT` stops before
-the feedback opening motion; `STOP_AFTER_STAGE=PULL_OPEN` stops after the first
-opening cycle rather than completing traversal. `STOP_AFTER_STAGE=PULL_BASE_ADVANCE`
+Use `STOP_AFTER_STAGE=STOW_ARM_AND_CLOSE_GRIPPER` or `STOP_AFTER_STAGE=MOVE_TO_GAP_STATION`
+to retain an earlier pull prefix; `STOP_AFTER_STAGE=INSERT_INTO_DOOR_GAP` stops before
+the feedback opening motion; `STOP_AFTER_STAGE=PRY_DOOR_OPEN` stops after the first
+opening cycle rather than completing traversal. `STOP_AFTER_STAGE=FOLLOW_WALL_TO_PANEL`
 includes retraction and settling beside the panel, stopping before shared pushing.
 Partial workflows support `canonical` (no cameras) and `debug` (six cameras),
-but cannot be published by `official` mode. Full pull-door runs stop at `THROUGH`
+but cannot be published by `official` mode. Full pull-door runs stop at `PASS_THROUGH_DOORWAY`
 by default. Their physical validation status is recorded separately in
 `docs/auto_open_pull_panel_validation_zh.md`.
 

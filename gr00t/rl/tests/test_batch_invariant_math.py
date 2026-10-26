@@ -47,9 +47,7 @@ def test_fixed_order_math_preserves_native_single_row_results(width):
     for row in range(len(left)):
         one_left = left[row : row + 1]
         one_right = right[row : row + 1]
-        assert torch.equal(
-            fixed_norm(one_left), torch.linalg.vector_norm(one_left, dim=-1)
-        )
+        assert torch.equal(fixed_norm(one_left), torch.linalg.vector_norm(one_left, dim=-1))
         assert torch.equal(
             fixed_dot(one_left, one_right),
             torch.sum(one_left * one_right, dim=-1),

@@ -7,8 +7,8 @@ import numpy as np
 from gr00t.rl.auto_open.control import (
     APPROACH_ARRIVAL,
     ROBOT_TRUNK_REAR_X,
-    THROUGH_TARGET_LEAD_DISTANCE,
     THROUGH_TAIL_TARGET_DISTANCE,
+    THROUGH_TARGET_LEAD_DISTANCE,
     _effective_grasp_target,
     _quat_distance,
 )
@@ -27,11 +27,12 @@ from gr00t.rl.auto_open.geometry import (
 )
 from gr00t.rl.auto_open.utils import as_numpy as _as_np
 
+
 def reset_controller(self, state=None, reset_env=True, close_gripper=True):
     if reset_env:
         self.env.reset()
         self.runner.obs = self.env.get_observations()
-    self.stage = type(self.stage).APPROACH
+    self.stage = type(self.stage).APPROACH_HANDLE
     self.stage_steps = 0
     self.base_hold_stage = None
     self.base_hold_target_xy = None
@@ -70,7 +71,6 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
     self.prepared_panel_contact_command = None
     self.panel_contact_selected_offset = None
     self.batched_panel_finger_clearance = None
-    self.defer_path_solve = False
     self.panel_contact_orientation = None
     self.panel_contact_settle_steps = 0
     self.panel_align_ee_goal_local = None
@@ -123,7 +123,6 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
     self.last_acceptance_diagnostics = {}
     self.last_stability_diagnostics = {}
     self.stage_exit_diagnostics = {}
-    self.precomputed_steady_paths = {}
     self.center_orientation_settle_steps = 0
     self.pregrasp_clearance_fallback = False
     self.center_clearance_fallback = False
@@ -147,7 +146,6 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
     self.arm_forward_orientation_path = None
     self.arm_forward_path_index = 0
     self.center_vertical_plan = None
-    self.arm_stability_window.clear()
     self.grasp_latched = False
     self.grasp_vertical_lift = 0.0
     self.grasp_vertical_lift_target = 0.0
@@ -180,36 +178,24 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
     self.handle_collider_center_local, handle_radius, self.handle_collider_path = (
         _measure_handle_geometry(self, handle_state, grasp_state)
     )
-    _measure_panel_geometry(self, )
+    _measure_panel_geometry(
+        self,
+    )
     if self.panel_center_world is None or self.hinge_world is None:
         raise RuntimeError("door panel or hinge geometry is unavailable")
     self.grasp_center_pos = _physical_handle_grasp_position(self, handle_state)
-    self.handle_free_axis_world = _quat_rotate_np(
-        handle_state[3:7], self.handle_free_axis_local
-    )
-    self.handle_free_axis_world /= max(
-        float(np.linalg.norm(self.handle_free_axis_world)), 1.0e-8
-    )
+    self.handle_free_axis_world = _quat_rotate_np(handle_state[3:7], self.handle_free_axis_local)
+    self.handle_free_axis_world /= max(float(np.linalg.norm(self.handle_free_axis_world)), 1.0e-8)
     # Define the push point in door-local physical coordinates rather than
     # as a fraction of the randomized panel dimensions.
     self.panel_push_world = self.hinge_world.copy()
+    self.panel_push_world += self.panel_push_tangent_offset * self.panel_hinge_to_free_direction
+    self.panel_push_world[2] = self.panel_bottom_z + self.panel_push_height_offset
+    panel_midplane_projection = float(np.dot(self.panel_center_world, self.door_normal))
     self.panel_push_world += (
-        self.panel_push_tangent_offset
-        * self.panel_hinge_to_free_direction
-    )
-    self.panel_push_world[2] = (
-        self.panel_bottom_z + self.panel_push_height_offset
-    )
-    panel_midplane_projection = float(
-        np.dot(self.panel_center_world, self.door_normal)
-    )
-    self.panel_push_world += (
-        panel_midplane_projection
-        - float(np.dot(self.panel_push_world, self.door_normal))
+        panel_midplane_projection - float(np.dot(self.panel_push_world, self.door_normal))
     ) * self.door_normal
-    door_tangent = np.array(
-        [-self.door_normal[1], self.door_normal[0]], dtype=np.float32
-    )
+    door_tangent = np.array([-self.door_normal[1], self.door_normal[0]], dtype=np.float32)
     panel_contact_world = self.panel_push_world + self.door_normal * self.panel_half_thickness
     self.panel_contact_local = _quat_rotate_inverse_np(
         panel_state[3:7], panel_contact_world - panel_state[:3]
@@ -222,18 +208,17 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
     # frame.  Keep the
     # geometric target here for logging; arrival tolerances are owned by
     # the shared base-target tracker.
-    # Nominal station. The batch runtime may only enlarge APPROACH after
+    # Nominal station. The batch runtime may only enlarge APPROACH_HANDLE after
     # measuring the actual initial closed-jaw height gap and forward extent.
     self.approach_distance = 0.85
     self.station_xy = self.grasp_center_pos[:2] + self.approach_distance * normal
     self.panel_station_xy = self.station_xy.copy()
-    self.panel_station_xy += float(
-        np.dot(self.panel_center_world[:2] - self.panel_station_xy, door_tangent)
-    ) * door_tangent
-    self.door_forward = -self.door_normal
-    self.through_station_yaw = math.atan2(
-        float(self.door_forward[1]), float(self.door_forward[0])
+    self.panel_station_xy += (
+        float(np.dot(self.panel_center_world[:2] - self.panel_station_xy, door_tangent))
+        * door_tangent
     )
+    self.door_forward = -self.door_normal
+    self.through_station_yaw = math.atan2(float(self.door_forward[1]), float(self.door_forward[0]))
     c = math.cos(self.through_station_yaw)
     s = math.sin(self.through_station_yaw)
     rear_offset_world = np.array(
@@ -242,8 +227,7 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
     )
     target_tail_xy = (
         door_root[:2]
-        + (THROUGH_TAIL_TARGET_DISTANCE + THROUGH_TARGET_LEAD_DISTANCE)
-        * self.door_forward[:2]
+        + (THROUGH_TAIL_TARGET_DISTANCE + THROUGH_TARGET_LEAD_DISTANCE) * self.door_forward[:2]
     )
     self.through_station_xy = target_tail_xy - rear_offset_world
     self.initial_handle_pos = self.grasp_center_pos.copy()
@@ -268,9 +252,7 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
         [dof_position[dof_names.index(name)] for name in self.env.arm_joint_names],
         dtype=np.float32,
     )
-    self.initial_wrist_roll = float(
-        dof_position[dof_names.index("joint6")]
-    )
+    self.initial_wrist_roll = float(dof_position[dof_names.index("joint6")])
     self.ee_orientation_command = self.initial_ee_orientation.copy()
     # Keep orientation alignment at a fixed, collision-safe point on the
     # robot side of the handle.  Using the measured current EE position
@@ -329,12 +311,8 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
         moving_inner_points = moving_local[moving_inner_indices]
         fixed_depth = fixed_inner_points @ depth_local
         moving_depth = moving_inner_points @ depth_local
-        fixed_tip_points = fixed_inner_points[
-            fixed_depth >= np.quantile(fixed_depth, 0.95)
-        ]
-        moving_tip_points = moving_inner_points[
-            moving_depth >= np.quantile(moving_depth, 0.95)
-        ]
+        fixed_tip_points = fixed_inner_points[fixed_depth >= np.quantile(fixed_depth, 0.95)]
+        moving_tip_points = moving_inner_points[moving_depth >= np.quantile(moving_depth, 0.95)]
         fixed_tip_center = fixed_tip_points.mean(axis=0)
         moving_tip_center = moving_tip_points.mean(axis=0)
         tip_capture_center = 0.5 * (fixed_tip_center + moving_tip_center)
@@ -344,9 +322,7 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
         # depend on contact.
         fixed_full_depth = fixed_local @ depth_local
         moving_full_depth = moving_local @ depth_local
-        pocket_depth = max(
-            float(fixed_full_depth.min()), float(moving_full_depth.min())
-        )
+        pocket_depth = max(float(fixed_full_depth.min()), float(moving_full_depth.min()))
         pocket_depth += float(handle_radius) + 0.0015
         pocket_capture_center = capture_center.copy()
         pocket_capture_center += (
@@ -354,31 +330,23 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
         ) * depth_local
         # This point is the handle-center target carried by the TCP.  The
         # grasp frame maps local +X to the door-facing shaft direction,
-        # so include the former 10 mm CENTER_HANDLE insertion in the
+        # so include the former 10 mm INSERT_AROUND_HANDLE insertion in the
         # local geometry instead of adding a separate world-frame offset.
         pocket_capture_center[0] -= 0.010
         pocket_depth = float(np.dot(pocket_capture_center, depth_local))
         # A grasp may slide along the lever without becoming invalid.
         # Record the axial band covered by both inner jaw surfaces; the
-        # CENTER_HANDLE gate later checks its physical overlap with the
+        # INSERT_AROUND_HANDLE gate later checks its physical overlap with the
         # finite handle segment instead of forcing both centers to match.
         joint_axis_local = np.array([0.0, 1.0, 0.0], dtype=np.float32)
-        fixed_axial = (
-            fixed_local[fixed_inner_indices] - pocket_capture_center
-        ) @ joint_axis_local
+        fixed_axial = (fixed_local[fixed_inner_indices] - pocket_capture_center) @ joint_axis_local
         moving_axial = (
             moving_local[moving_inner_indices] - pocket_capture_center
         ) @ joint_axis_local
-        common_axial_min = max(
-            float(fixed_axial.min()), float(moving_axial.min())
-        )
-        common_axial_max = min(
-            float(fixed_axial.max()), float(moving_axial.max())
-        )
+        common_axial_min = max(float(fixed_axial.min()), float(moving_axial.min()))
+        common_axial_max = min(float(fixed_axial.max()), float(moving_axial.max()))
         if common_axial_max <= common_axial_min:
-            raise RuntimeError(
-                "fixed and moving jaw inner surfaces have no common axial band"
-            )
+            raise RuntimeError("fixed and moving jaw inner surfaces have no common axial band")
         self.open_template = {
             "fixed_points": fixed_local,
             "moving_points": moving_local,
@@ -396,9 +364,7 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
             "common_axial_max": common_axial_max,
         }
         all_gripper_points_local = np.concatenate((fixed_local, moving_local), axis=0)
-        rotation_sweep_radius = float(
-            np.linalg.norm(all_gripper_points_local, axis=1).max()
-        )
+        rotation_sweep_radius = float(np.linalg.norm(all_gripper_points_local, axis=1).max())
         self.rotation_sweep_radius = rotation_sweep_radius
         obstacle_front = max(
             float(np.dot(panel_surface, self.door_normal)),
@@ -414,22 +380,18 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
         safe_ee_projection = obstacle_front + rotation_sweep_radius + 0.13
         self.orientation_standoff_ee_world = ee_pos.copy()
         self.orientation_standoff_ee_world += (
-            safe_ee_projection
-            - float(np.dot(self.orientation_standoff_ee_world, self.door_normal))
+            safe_ee_projection - float(np.dot(self.orientation_standoff_ee_world, self.door_normal))
         ) * self.door_normal
         self.orientation_standoff_ee_world[1] = self.grasp_center_pos[1]
         self.orientation_standoff_ee_world[2] = self.grasp_center_pos[2] + 0.05
         initial_offsets_world = _quat_rotate_points_np(
             self.initial_ee_orientation, all_gripper_points_local
         )
-        initial_min_normal_offset = float(
-            (initial_offsets_world @ self.door_normal).min()
-        )
+        initial_min_normal_offset = float((initial_offsets_world @ self.door_normal).min())
         self.pregrasp_target_world = self.grasp_center_pos.copy()
         pregrasp_projection = obstacle_front + 0.03 - initial_min_normal_offset
         self.pregrasp_target_world += (
-            pregrasp_projection
-            - float(np.dot(self.pregrasp_target_world, self.door_normal))
+            pregrasp_projection - float(np.dot(self.pregrasp_target_world, self.door_normal))
         ) * self.door_normal
         self.pregrasp_target_world[2] += 0.05
         self.finger_separation_local = separation_local
@@ -447,34 +409,22 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
         tip_sep_world = _quat_rotate_np(ee_quat, tip_sep_local)
         separation_world = tip_sep_world
         desired_axis_world = -self.door_normal.copy()
-        desired_axis_world /= max(
-            float(np.linalg.norm(desired_axis_world)), 1.0e-8
-        )
+        desired_axis_world /= max(float(np.linalg.norm(desired_axis_world)), 1.0e-8)
         # jointGripper is 86 mm behind the TCP on local -X, so local +X
         # is the physical gripper shaft and local +Y is its revolute
         # axis.  Map those two URDF axes directly instead of inferring a
         # frame from mesh centroids.
-        gripper_axis_local = np.array(
-            [1.0, 0.0, 0.0], dtype=np.float32
-        )
-        handle_axis_world = _quat_rotate_np(
-            handle_state[3:7], self.handle_axis_local
-        )
+        gripper_axis_local = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        handle_axis_world = _quat_rotate_np(handle_state[3:7], self.handle_axis_local)
         handle_axis_world -= desired_axis_world * float(
             np.dot(handle_axis_world, desired_axis_world)
         )
-        handle_axis_world /= max(
-            float(np.linalg.norm(handle_axis_world)), 1.0e-8
-        )
+        handle_axis_world /= max(float(np.linalg.norm(handle_axis_world)), 1.0e-8)
 
         def _grasp_candidate(joint_axis_world):
             joint_axis_world = np.asarray(joint_axis_world, dtype=np.float32)
-            closing_plane_axis = np.cross(
-                desired_axis_world, joint_axis_world
-            )
-            closing_plane_axis /= max(
-                float(np.linalg.norm(closing_plane_axis)), 1.0e-8
-            )
+            closing_plane_axis = np.cross(desired_axis_world, joint_axis_world)
+            closing_plane_axis /= max(float(np.linalg.norm(closing_plane_axis)), 1.0e-8)
             return _matrix_to_quat_np(
                 np.column_stack(
                     (
@@ -491,9 +441,7 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
             _grasp_candidate(-handle_axis_world),
             _grasp_candidate(handle_axis_world),
         )
-        candidate_distances = [
-            _quat_distance(ee_quat, candidate) for candidate in grasp_candidates
-        ]
+        candidate_distances = [_quat_distance(ee_quat, candidate) for candidate in grasp_candidates]
         # Mirror the wrist-roll branch with the lever direction.  From the
         # robot-facing view, a lever pointing toward the right hinge must
         # turn the gripper right (branch 1); a lever pointing left must
@@ -508,26 +456,18 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
             float(np.dot(lever_free_end_direction, self.door_normal)) * self.door_normal
         )
         lever_free_end_direction[2] = 0.0
-        lever_free_end_direction /= max(
-            float(np.linalg.norm(lever_free_end_direction)), 1.0e-8
-        )
+        lever_free_end_direction /= max(float(np.linalg.norm(lever_free_end_direction)), 1.0e-8)
         free_end_right = float(np.dot(lever_free_end_direction, viewer_right)) > 0.0
         selected_candidate = 1 if free_end_right else 0
         self.grasp_branch = selected_candidate
         self.grasp_orientation_quat = grasp_candidates[selected_candidate]
-        target_gripper_axis_world = _quat_rotate_np(
-            self.grasp_orientation_quat, gripper_axis_local
-        )
+        target_gripper_axis_world = _quat_rotate_np(self.grasp_orientation_quat, gripper_axis_local)
         target_joint_axis_world = _quat_rotate_np(
             self.grasp_orientation_quat,
             np.array([0.0, 1.0, 0.0], dtype=np.float32),
         )
-        gripper_axis_alignment = float(
-            np.dot(target_gripper_axis_world, desired_axis_world)
-        )
-        joint_axis_alignment = abs(
-            float(np.dot(target_joint_axis_world, handle_axis_world))
-        )
+        gripper_axis_alignment = float(np.dot(target_gripper_axis_world, desired_axis_world))
+        joint_axis_alignment = abs(float(np.dot(target_joint_axis_world, handle_axis_world)))
         if gripper_axis_alignment < 1.0 - 1.0e-5:
             raise RuntimeError(
                 "grasp orientation does not align the gripper shaft with "
@@ -552,32 +492,20 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
         final_offsets_world = _quat_rotate_points_np(
             self.grasp_orientation_quat, all_gripper_points_local
         )
-        final_min_normal_offset = float(
-            (final_offsets_world @ self.door_normal).min()
-        )
+        final_min_normal_offset = float((final_offsets_world @ self.door_normal).min())
         self.final_min_normal_offset = final_min_normal_offset
-        final_fixed_offsets_world = _quat_rotate_points_np(
-            self.grasp_orientation_quat, fixed_local
-        )
-        fixed_distal_normal_offset = float(
-            (final_fixed_offsets_world @ self.door_normal).min()
-        )
-        fixed_inner_offset_world = _quat_rotate_np(
-            self.grasp_orientation_quat, fixed_inner_center
-        )
+        final_fixed_offsets_world = _quat_rotate_points_np(self.grasp_orientation_quat, fixed_local)
+        fixed_distal_normal_offset = float((final_fixed_offsets_world @ self.door_normal).min())
+        fixed_inner_offset_world = _quat_rotate_np(self.grasp_orientation_quat, fixed_inner_center)
         fixed_is_upper = bool(fixed_inner_offset_world[2] > 0.0)
         fixed_surface_target_z = float(
-            self.grasp_center_pos[2]
-            + (handle_radius + 0.013) * (1.0 if fixed_is_upper else -1.0)
+            self.grasp_center_pos[2] + (handle_radius + 0.013) * (1.0 if fixed_is_upper else -1.0)
         )
         self.fixed_inner_center_local = fixed_inner_center.copy()
         self.fixed_surface_target_z = fixed_surface_target_z
-        fixed_anchored_ee_z = float(
-            fixed_surface_target_z - fixed_inner_offset_world[2]
-        )
+        fixed_anchored_ee_z = float(fixed_surface_target_z - fixed_inner_offset_world[2])
         self.grasp_waypoint_world = _effective_grasp_target(
-            self,
-            self.grasp_center_pos, self.grasp_orientation_quat
+            self, self.grasp_center_pos, self.grasp_orientation_quat
         )
         self.grasp_waypoint_world[2] = fixed_anchored_ee_z
         # Both wrist-roll branches use the same collider-derived target.
@@ -586,8 +514,7 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
         # randomized arm states or handle heights.
         self.center_insert_waypoint_world = self.grasp_waypoint_world.copy()
         self.center_standoff_ee_world = _effective_grasp_target(
-            self,
-            self.target_tip_mid_world, self.grasp_orientation_quat
+            self, self.target_tip_mid_world, self.grasp_orientation_quat
         )
         self.center_standoff_ee_world[2] = fixed_anchored_ee_z
         center_standoff_projection = obstacle_front + 0.03 - final_min_normal_offset
@@ -605,7 +532,9 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
         self.reachable_grasp_orientation_quat = self.grasp_orientation_quat.copy()
         tip_separation_local = tip_sep_local
         insertion_local = depth_local
-        self.grasp_ee_offset_world = _quat_rotate_np(self.grasp_orientation_quat, tip_capture_center)
+        self.grasp_ee_offset_world = _quat_rotate_np(
+            self.grasp_orientation_quat, tip_capture_center
+        )
         separation_world = _quat_rotate_np(self.grasp_orientation_quat, tip_separation_local)
         measured_sep_world = separation_world / max(float(np.linalg.norm(separation_world)), 1.0e-8)
         target_sep_world = _quat_rotate_np(self.grasp_orientation_quat, tip_separation_local)
@@ -616,7 +545,8 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
             f"[doorman][geometry] capture_center_local={capture_center.round(4).tolist()} "
             f"pocket_center_local={pocket_capture_center.round(4).tolist()} "
             f"pocket_depth={pocket_depth:.4f} "
-            f"depth_local={depth_local.round(4).tolist()} separation_local={separation_local.round(4).tolist()} "
+            f"depth_local={depth_local.round(4).tolist()} "
+            f"separation_local={separation_local.round(4).tolist()} "
             f"offset_grasp_world={self.grasp_ee_offset_world.round(4).tolist()} "
             f"measured_sep_world={measured_sep_world.round(4).tolist()} "
             f"direct_sep_world={direct_sep_world.round(4).tolist()} "
@@ -627,6 +557,7 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
             f"fixed_distal_normal_offset={fixed_distal_normal_offset:.4f}",
             flush=True,
         )
+
         # Keep an explicit, serializable snapshot of the physical capture
         # geometry.  This is a diagnostic truth source, not an IK target
         # guessed from a rigid-body origin.
@@ -649,8 +580,12 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
         handle_axis_world = _quat_rotate_np(handle_state[3:7], self.handle_axis_local)
         handle_axis_world /= max(float(np.linalg.norm(handle_axis_world)), 1.0e-8)
         handle_endpoints = [
-            (handle_center_world - self.handle_half_length * handle_axis_world).astype(float).tolist(),
-            (handle_center_world + self.handle_half_length * handle_axis_world).astype(float).tolist(),
+            (handle_center_world - self.handle_half_length * handle_axis_world)
+            .astype(float)
+            .tolist(),
+            (handle_center_world + self.handle_half_length * handle_axis_world)
+            .astype(float)
+            .tolist(),
         ]
         self.geometry_report = {
             "handle": {
@@ -685,10 +620,12 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
                     "upper_inner_world": upper_world.astype(float).tolist(),
                     "lower_inner_world": lower_world.astype(float).tolist(),
                     "vertical_opening_m": float(abs(upper_world[2] - lower_world[2])),
-                    "horizontal_projection_error_m": float(max(
-                        np.linalg.norm((upper_world - handle_center_world)[:2]),
-                        np.linalg.norm((lower_world - handle_center_world)[:2]),
-                    )),
+                    "horizontal_projection_error_m": float(
+                        max(
+                            np.linalg.norm((upper_world - handle_center_world)[:2]),
+                            np.linalg.norm((lower_world - handle_center_world)[:2]),
+                        )
+                    ),
                 },
                 "tcp_capture_offset_local": pocket_capture_center.astype(float).tolist(),
                 "inner_surface_centroid_offset_local": capture_center.astype(float).tolist(),
@@ -699,17 +636,26 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
                     "tip_midpoint": tip_capture_center.astype(float).tolist(),
                 },
                 "finger_depth_ranges_from_tcp_m": {
-                    "fixed": [float((fixed_local @ depth_local).min()), float((fixed_local @ depth_local).max())],
-                    "moving": [float((moving_local @ depth_local).min()), float((moving_local @ depth_local).max())],
+                    "fixed": [
+                        float((fixed_local @ depth_local).min()),
+                        float((fixed_local @ depth_local).max()),
+                    ],
+                    "moving": [
+                        float((moving_local @ depth_local).min()),
+                        float((moving_local @ depth_local).max()),
+                    ],
                 },
                 "joint_gripper_from_tcp": {
                     "position_local_m": [-0.086, 0.0, 0.0],
                     "axis_local": [0.0, 1.0, 0.0],
-                    "source": "URDF fixed transforms: link06->stator 0.051 m, stator->joint 0.049 m, stator->TCP 0.135 m",
+                    "source": "URDF fixed transforms: link06->stator 0.051 m, "
+                    "stator->joint 0.049 m, stator->TCP 0.135 m",
                 },
                 "insertion_axis_world": (-self.door_normal).astype(float).tolist(),
                 "rotation_sweep_radius_m": rotation_sweep_radius,
-                "orientation_standoff_ee_world": self.orientation_standoff_ee_world.astype(float).tolist(),
+                "orientation_standoff_ee_world": self.orientation_standoff_ee_world.astype(
+                    float
+                ).tolist(),
                 "pregrasp_target_ee_world": self.pregrasp_target_world.astype(float).tolist(),
                 "center_standoff_ee_world": self.center_standoff_ee_world.astype(float).tolist(),
                 "center_insert_ee_world": self.center_insert_waypoint_world.astype(float).tolist(),
@@ -738,11 +684,13 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
             flush=True,
         )
     else:
-        raise RuntimeError("robot body/EE state unavailable while building the open-gripper collider template")
+        raise RuntimeError(
+            "robot body/EE state unavailable while building the open-gripper collider template"
+        )
     _initialize_panel_push_tcp(self)
     # Geometry above is intentionally measured at q_open.  Once that
     # template is cached, start the actual episode with the jaw closed;
-    # PREGRASP opens it only after the arm is aligned and stationary.
+    # MOVE_TO_PREGRASP opens it only after the arm is aligned and stationary.
     gripper_joint_id = int(self.env.gripper_joint_ids[0].item())
     if close_gripper:
         joint_pos = self.env.robot.data.joint_pos.clone()
@@ -756,7 +704,8 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
     print(
         f"[doorman] RESET physical_handle={self.handle_pos.tolist()} "
         f"grasp_center={self.grasp_center_pos.tolist()} station={self.station_xy.tolist()} "
-        f"normal={self.door_normal.tolist()} forward={self.door_forward.tolist()} side={self.robot_side}",
+        f"normal={self.door_normal.tolist()} forward={self.door_forward.tolist()} "
+        f"side={self.robot_side}",
         flush=True,
     )
     return state

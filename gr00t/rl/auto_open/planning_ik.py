@@ -1,12 +1,11 @@
 """Replay the existing candidate IK math without per-operation host dispatch."""
 
-from collections import OrderedDict
 import threading
+from collections import OrderedDict
 
 import torch
 
 from gr00t.rl.envs.door.b2z1_reset_geometry import solve_b2z1_arm_ik as _solve_ik
-
 
 _CACHE = OrderedDict()
 _LOCK = threading.Lock()
@@ -25,7 +24,9 @@ class _CandidateIKGraph:
         def compute():
             self.status.zero_()
             return _solve_ik(
-                *self.inputs, iterations=iterations, damping=damping,
+                *self.inputs,
+                iterations=iterations,
+                damping=damping,
                 error_status=self.status,
             )
 
@@ -57,7 +58,8 @@ def solve_candidate_ik(*inputs, iterations=80, damping=0.03):
         return _solve_ik(*inputs, iterations=iterations, damping=damping)
     key = (
         tuple((value.device, value.dtype, tuple(value.shape), value.stride()) for value in inputs),
-        int(iterations), float(damping),
+        int(iterations),
+        float(damping),
     )
     with _LOCK:
         entry = _CACHE.get(key)

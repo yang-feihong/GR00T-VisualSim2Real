@@ -3,14 +3,16 @@ import xml.etree.ElementTree as ElementTree
 import numpy as np
 
 from gr00t.rl.utils.b2z1_asset import (
-    BOX_MOUNT_XYZ, ROBOT_RESOURCES, ROBOT_URDF, ROBOT_USD, read_arm_mount,
+    BOX_MOUNT_XYZ,
+    ROBOT_RESOURCES,
+    ROBOT_URDF,
+    ROBOT_USD,
+    read_arm_mount,
 )
 
 
 def test_production_assembly_preserves_joint_and_physics_contract():
-    original = ElementTree.parse(
-        ROBOT_RESOURCES / "urdf/b2z1_base.urdf"
-    ).getroot()
+    original = ElementTree.parse(ROBOT_RESOURCES / "urdf/b2z1_base.urdf").getroot()
     robot = ElementTree.parse(ROBOT_URDF).getroot()
     source_joints = {joint.get("name"): joint for joint in original.findall("joint")}
     joints = {joint.get("name"): joint for joint in robot.findall("joint")}
@@ -31,15 +33,21 @@ def test_production_assembly_preserves_joint_and_physics_contract():
         assert (None if inertial is None else ElementTree.tostring(inertial)) == (
             None if original_inertial is None else ElementTree.tostring(original_inertial)
         )
-        original_collisions = [collision for collision in link.findall("collision")
-                               if not collision.get("name", "").startswith("back_box_")]
+        original_collisions = [
+            collision
+            for collision in link.findall("collision")
+            if not collision.get("name", "").startswith("back_box_")
+        ]
         assert len(original_collisions) == len(source.findall("collision"))
 
 
 def test_box_has_wall_and_floor_colliders():
     robot = ElementTree.parse(ROBOT_URDF).getroot()
-    colliders = [collision for collision in robot.findall("link[@name='base_link']/collision")
-                 if collision.get("name", "").startswith("back_box_")]
+    colliders = [
+        collision
+        for collision in robot.findall("link[@name='base_link']/collision")
+        if collision.get("name", "").startswith("back_box_")
+    ]
     assert len(colliders) == 63
     for collider in colliders:
         size = np.fromstring(collider.find("geometry/box").get("size"), sep=" ")

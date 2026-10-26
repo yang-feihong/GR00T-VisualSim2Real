@@ -188,12 +188,8 @@ class EpisodeTargetNoise:
         key = f"pose:{label}"
         sample = self._samples.get(key)
         if sample is None:
-            position_delta = self._signed_vector(
-                f"{key}:position", position_bounds
-            )
-            rotation_delta = self._signed_vector(
-                f"{key}:rotation", rotation_bounds
-            )
+            position_delta = self._signed_vector(f"{key}:position", position_bounds)
+            rotation_delta = self._signed_vector(f"{key}:rotation", rotation_bounds)
             sample = {
                 **{
                     f"{name}_delta": float(value)
@@ -207,9 +203,7 @@ class EpisodeTargetNoise:
                 "semantic_rotation_delta": rotation_delta,
             }
             self._samples[key] = sample
-        position_axes = np.asarray(
-            semantic_axes_world, dtype=np.float64
-        ).reshape(3, 3)
+        position_axes = np.asarray(semantic_axes_world, dtype=np.float64).reshape(3, 3)
         rotation_axes = np.asarray(
             semantic_axes_world
             if rotation_semantic_axes_world is None
@@ -231,9 +225,7 @@ class EpisodeTargetNoise:
         key = f"positive:{label}"
         sample = self._samples.get(key)
         if sample is None:
-            sample = {
-                "delta": float(self._rng_for_key(key).uniform(0.0, maximum))
-            }
+            sample = {"delta": float(self._rng_for_key(key).uniform(0.0, maximum))}
             self._samples[key] = sample
         return float(sample["delta"])
 

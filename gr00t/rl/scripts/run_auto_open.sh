@@ -72,7 +72,7 @@ else
     MAX_STEPS="${MAX_STEPS:-4000}"
 fi
 if [[ -z "${STOP_AFTER_STAGE:-}" ]]; then
-    STOP_AFTER_STAGE=THROUGH
+    STOP_AFTER_STAGE=PASS_THROUGH_DOORWAY
 fi
 FORMAL_DATA_ROOT="${REPO_ROOT}/datasets/auto_open"
 RELEASE_VERSION="v1"
@@ -132,17 +132,20 @@ if [[ "${DOOR_MOTION}" != push && "${DOOR_MOTION}" != pull ]]; then
     echo "DOOR_MOTION must be push or pull." >&2
     exit 2
 fi
-if [[ "${STOP_AFTER_STAGE}" != THROUGH && "${STOP_AFTER_STAGE}" != RESTORE_GRIPPER \
-      && "${STOP_AFTER_STAGE}" != PULL_CLEAR_SWEEP && "${STOP_AFTER_STAGE}" != PULL_INSERT \
-      && "${STOP_AFTER_STAGE}" != PULL_OPEN && "${STOP_AFTER_STAGE}" != PULL_BASE_ADVANCE ]]; then
-    echo "STOP_AFTER_STAGE must be THROUGH, RESTORE_GRIPPER, PULL_CLEAR_SWEEP, PULL_INSERT, PULL_OPEN, or PULL_BASE_ADVANCE." >&2
+if [[ "${STOP_AFTER_STAGE}" != PASS_THROUGH_DOORWAY && "${STOP_AFTER_STAGE}" != STOW_ARM_AND_CLOSE_GRIPPER \
+      && "${STOP_AFTER_STAGE}" != MOVE_TO_GAP_STATION && "${STOP_AFTER_STAGE}" != INSERT_INTO_DOOR_GAP \
+      && "${STOP_AFTER_STAGE}" != PRY_DOOR_OPEN && "${STOP_AFTER_STAGE}" != FOLLOW_WALL_TO_PANEL ]]; then
+    echo "STOP_AFTER_STAGE must be PASS_THROUGH_DOORWAY, STOW_ARM_AND_CLOSE_GRIPPER, MOVE_TO_GAP_STATION, INSERT_INTO_DOOR_GAP, PRY_DOOR_OPEN, or FOLLOW_WALL_TO_PANEL." >&2
     exit 2
 fi
-if [[ "${DOOR_MOTION}" == push && "${STOP_AFTER_STAGE}" == PULL_* ]]; then
-    echo "PULL_* terminal stages require DOOR_MOTION=pull." >&2
+if [[ "${DOOR_MOTION}" == push && ( "${STOP_AFTER_STAGE}" == MOVE_TO_GAP_STATION \
+      || "${STOP_AFTER_STAGE}" == INSERT_INTO_DOOR_GAP \
+      || "${STOP_AFTER_STAGE}" == PRY_DOOR_OPEN \
+      || "${STOP_AFTER_STAGE}" == FOLLOW_WALL_TO_PANEL ) ]]; then
+    echo "Gap-station, gap-insertion, prying, and wall-following terminal stages require DOOR_MOTION=pull." >&2
     exit 2
 fi
-if [[ "${AUTO_OPEN_MODE}" == official && "${STOP_AFTER_STAGE}" != THROUGH ]]; then
+if [[ "${AUTO_OPEN_MODE}" == official && "${STOP_AFTER_STAGE}" != PASS_THROUGH_DOORWAY ]]; then
     echo "Partial workflows cannot be published as official datasets; use canonical or debug." >&2
     exit 2
 fi
@@ -416,7 +419,7 @@ strict_accepted = sorted(
 if len(strict_accepted) != int(report.get("accepted_episodes", -1)):
     raise SystemExit("debug accepted seed extraction disagrees with aggregate report")
 terminal_stage = os.environ["STOP_AFTER_STAGE"]
-if terminal_stage == "THROUGH":
+if terminal_stage == "PASS_THROUGH_DOORWAY":
     completed = strict_accepted
     result_label = "strict_acceptance"
     seed_file = "accepted_seeds.txt"
@@ -466,7 +469,7 @@ else:
 print(len(completed))
 PY
 )"
-    if [[ "${STOP_AFTER_STAGE}" == THROUGH ]]; then
+    if [[ "${STOP_AFTER_STAGE}" == PASS_THROUGH_DOORWAY ]]; then
         debug_result_tag="episodes${debug_result_count}"
     else
         debug_result_tag="terminal_${STOP_AFTER_STAGE,,}_success${debug_result_count}"
@@ -488,7 +491,7 @@ from gr00t.rl.data_collection.auto_open_writer import write_six_camera_mosaics
 manifest = write_six_camera_mosaics(Path(sys.argv[1]))
 print(f"[workflow] six-camera mosaics completed: {len(manifest)} episodes")
 PY
-    if [[ "${STOP_AFTER_STAGE}" == THROUGH ]]; then
+    if [[ "${STOP_AFTER_STAGE}" == PASS_THROUGH_DOORWAY ]]; then
         echo "[workflow] debug strict acceptance: ${debug_result_count}/${#ALL_SEEDS[@]}"
     else
         echo "[workflow] debug ${STOP_AFTER_STAGE} completion: ${debug_result_count}/${#ALL_SEEDS[@]}"
@@ -514,7 +517,7 @@ else
     echo "[workflow] phase 1/2: canonical no-camera collection (${#ALL_SEEDS[@]} seeds)"
 fi
 run_phase "${canonical_root}" none "" ALL_SEEDS
-if [[ "${STOP_AFTER_STAGE}" != THROUGH ]]; then
+if [[ "${STOP_AFTER_STAGE}" != PASS_THROUGH_DOORWAY ]]; then
     python - "${canonical_root}" "${STOP_AFTER_STAGE}" <<'PY'
 import json
 import sys

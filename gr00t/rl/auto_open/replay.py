@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
 import re
 import sys
@@ -12,7 +12,6 @@ from typing import Any
 
 import numpy as np
 import torch
-
 from legged_gym.scripts.manip_loco_interface import ManipLoco_Policy
 
 from gr00t.rl.auto_open.geometry import _resolved_door_prim_path
@@ -125,9 +124,7 @@ def _first_scene_mismatch(actual: Any, expected: Any, path="scene"):
         for key, expected_value in expected.items():
             if key not in actual:
                 return f"{path}.{key}: missing"
-            mismatch = _first_scene_mismatch(
-                actual[key], expected_value, f"{path}.{key}"
-            )
+            mismatch = _first_scene_mismatch(actual[key], expected_value, f"{path}.{key}")
             if mismatch is not None:
                 return mismatch
         return None
@@ -135,8 +132,7 @@ def _first_scene_mismatch(actual: Any, expected: Any, path="scene"):
         if not isinstance(actual, list) or len(actual) != len(expected):
             detail = ""
             if isinstance(actual, list) and all(
-                isinstance(item, dict) and "path" in item
-                for item in actual + expected
+                isinstance(item, dict) and "path" in item for item in actual + expected
             ):
                 actual_paths = {item["path"] for item in actual}
                 expected_paths = {item["path"] for item in expected}
@@ -150,9 +146,7 @@ def _first_scene_mismatch(actual: Any, expected: Any, path="scene"):
                 f"!= list/{len(expected)}{detail}"
             )
         for index, (actual_item, expected_item) in enumerate(zip(actual, expected)):
-            mismatch = _first_scene_mismatch(
-                actual_item, expected_item, f"{path}[{index}]"
-            )
+            mismatch = _first_scene_mismatch(actual_item, expected_item, f"{path}[{index}]")
             if mismatch is not None:
                 return mismatch
         return None
@@ -188,12 +182,8 @@ def _assert_source_scene(env, env_id: int, source_episode: dict, seed: int):
             f"actual_visual={actual.get('visual')!r}; "
             f"expected_visual={expected.get('visual')!r}"
         )
-    actual_asset = _normalize_scene_paths(
-        door_asset_stage_snapshot(env.sim.stage, prim), env_id
-    )
-    expected_asset = _normalize_scene_paths(
-        source_episode["provenance"]["door_asset"], 0
-    )
+    actual_asset = _normalize_scene_paths(door_asset_stage_snapshot(env.sim.stage, prim), env_id)
+    expected_asset = _normalize_scene_paths(source_episode["provenance"]["door_asset"], 0)
     actual_asset["prims"].sort(key=lambda item: item["path"])
     expected_asset["prims"].sort(key=lambda item: item["path"])
     if not _metadata_contains(actual_asset, expected_asset):
@@ -227,9 +217,7 @@ def _write_replayed_episode(
         {
             "images_enabled": True,
             "camera_mode": args.collection_camera_mode,
-            "camera_mount_randomization": dict(
-                args.camera_mount_randomizations[int(seed)]
-            ),
+            "camera_mount_randomization": dict(args.camera_mount_randomizations[int(seed)]),
             "trajectory_replay": {
                 "source_dataset": str(source_root),
                 "recorded_state_written_before_each_render": True,
@@ -304,8 +292,7 @@ def run_trajectory_replay(args):
 
     loaded = [_load_source_episode(source_root, seed) for seed in seeds]
     args.doorman_source_asset_snapshots = [
-        episode["provenance"]["door_asset"]
-        for _, _, _, episode in loaded
+        episode["provenance"]["door_asset"] for _, _, _, episode in loaded
     ]
     runner = ManipLoco_Policy(args)
     env = runner.env
@@ -313,10 +300,7 @@ def run_trajectory_replay(args):
     if manager is None or not manager.enabled:
         raise RuntimeError("trajectory replay requires initialized RGB cameras")
     manager.set_episode_camera_configs(
-        {
-            env_id: args.episode_camera_configs[seed]
-            for env_id, seed in enumerate(seeds)
-        }
+        {env_id: args.episode_camera_configs[seed] for env_id, seed in enumerate(seeds)}
     )
     env.reset()
     env.robot.update(0.0)
@@ -347,14 +331,17 @@ def run_trajectory_replay(args):
         source_initial = np.asarray(audit["root_position_world"][0])
         translations.append(
             np.asarray(
-                [current_initial[0] - source_initial[0], current_initial[1] - source_initial[1], 0.0],
+                [
+                    current_initial[0] - source_initial[0],
+                    current_initial[1] - source_initial[1],
+                    0.0,
+                ],
                 dtype=np.float32,
             )
         )
     render_pool_size = min(int(args.replay_render_batch_size), len(seeds))
     slot_queues = [
-        iter(range(slot, len(seeds), render_pool_size))
-        for slot in range(render_pool_size)
+        iter(range(slot, len(seeds), render_pool_size)) for slot in range(render_pool_size)
     ]
     active_by_slot = {}
     frame_by_env = {}
@@ -381,12 +368,9 @@ def run_trajectory_replay(args):
             )
             for stream in streams.values()
         }
-        sampled_frame_hashes[env_id] = {
-            stream["key"]: [] for stream in streams.values()
-        }
+        sampled_frame_hashes[env_id] = {stream["key"]: [] for stream in streams.values()}
         print(
-            f"[replay] slot={slot} start seed={seeds[env_id]} "
-            f"frames={lengths[env_id]}",
+            f"[replay] slot={slot} start seed={seeds[env_id]} frames={lengths[env_id]}",
             flush=True,
         )
 
@@ -395,19 +379,13 @@ def run_trajectory_replay(args):
             encoder.close()
         seed = seeds[env_id]
         for key, samples in sampled_frame_hashes[env_id].items():
-            second_half = {
-                digest
-                for frame, digest in samples
-                if frame >= lengths[env_id] // 2
-            }
+            second_half = {digest for frame, digest in samples if frame >= lengths[env_id] // 2}
             if len(second_half) < 2:
                 raise RuntimeError(
                     f"seed {seed} camera {key} is temporally frozen in the "
                     f"second half ({len(second_half)} unique sampled frames)"
                 )
-        source_episode_root, source_paths, source_tables, source_episode = loaded[
-            env_id
-        ]
+        source_episode_root, source_paths, source_tables, source_episode = loaded[env_id]
         _write_replayed_episode(
             args,
             runner,
@@ -444,10 +422,7 @@ def run_trajectory_replay(args):
             for env_id in active_env_ids:
                 audit = audits[env_id]
                 frame = frame_by_env[env_id]
-                position = (
-                    np.asarray(audit["root_position_world"][frame])
-                    + translations[env_id]
-                )
+                position = np.asarray(audit["root_position_world"][frame]) + translations[env_id]
                 quaternion_xyzw = np.asarray(audit["root_quaternion_xyzw"][frame])
                 root_pose[env_id, :3] = torch.as_tensor(position, device=env.device)
                 root_pose[env_id, 3:7] = torch.as_tensor(
@@ -471,25 +446,13 @@ def run_trajectory_replay(args):
                 robot_velocity[env_id, b2_indices] = torch.as_tensor(
                     audit["b2_joint_velocity"][frame], device=env.device
                 )
-                robot_position[env_id, gripper_index] = float(
-                    audit["gripper_feedback"][frame]
-                )
+                robot_position[env_id, gripper_index] = float(audit["gripper_feedback"][frame])
                 robot_velocity[env_id, gripper_index] = 0.0
-                door_position[env_id, hinge_index] = float(
-                    audit["door_hinge_position"][frame]
-                )
-                door_velocity[env_id, hinge_index] = float(
-                    audit["door_hinge_velocity"][frame]
-                )
-                door_position[env_id, handle_index] = float(
-                    audit["handle_position"][frame]
-                )
-                door_velocity[env_id, handle_index] = float(
-                    audit["handle_velocity"][frame]
-                )
-                door_position[env_id, latch_index] = float(
-                    audit["door_latch_position"][frame]
-                )
+                door_position[env_id, hinge_index] = float(audit["door_hinge_position"][frame])
+                door_velocity[env_id, hinge_index] = float(audit["door_hinge_velocity"][frame])
+                door_position[env_id, handle_index] = float(audit["handle_position"][frame])
+                door_velocity[env_id, handle_index] = float(audit["handle_velocity"][frame])
+                door_position[env_id, latch_index] = float(audit["door_latch_position"][frame])
                 door_velocity[env_id, latch_index] = 0.0
 
             env.robot.write_root_pose_to_sim(root_pose)

@@ -12,15 +12,27 @@ import pytest
 LAUNCHER = Path(__file__).resolve().parents[1] / "scripts" / "run_auto_open.sh"
 
 
-def _run_phase(tmp_path, *, status=0, force_fork=False, missing=False, missing_summary=False, aggregate_status=0, all_fail=False):
+def _run_phase(
+    tmp_path,
+    *,
+    status=0,
+    force_fork=False,
+    missing=False,
+    missing_summary=False,
+    aggregate_status=0,
+    all_fail=False,
+):
     source = LAUNCHER.read_text()
-    phase = "run_phase() {\n" + source.split("run_phase() {\n", 1)[1].split(
-        '\nif [[ "${AUTO_OPEN_MODE}" == debug ]]; then\n', 1
-    )[0]
+    phase = (
+        "run_phase() {\n"
+        + source.split("run_phase() {\n", 1)[1].split(
+            '\nif [[ "${AUTO_OPEN_MODE}" == debug ]]; then\n', 1
+        )[0]
+    )
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     python = bin_dir / "python"
-    python.write_text('''#!/bin/bash
+    python.write_text("""#!/bin/bash
 set -euo pipefail
 if [[ "$1" == - ]]; then
     cat >/dev/null
@@ -58,7 +70,7 @@ if [[ "${STUB_MISSING_SUMMARY}" != 1 || "${CUDA_VISIBLE_DEVICES}" != 1 ]]; then
     mkdir -p "${output_dir}"
     printf '{}\n' >"${output_dir}/summary.json"
 fi
-''')
+""")
     python.chmod(0o755)
     if force_fork:
         real_setsid = shutil.which("setsid")
@@ -67,29 +79,42 @@ fi
         wrapper.write_text(f'#!/bin/bash\nexec {shlex.quote(real_setsid)} --fork "$@"\n')
         wrapper.chmod(0o755)
     harness = tmp_path / "phase.sh"
-    harness.write_text('''set -euo pipefail
+    harness.write_text(
+        """set -euo pipefail
 REPO_ROOT="$STUB_ROOT"
 ENTRY=stub-entry
 MAX_STEPS=1
 DOOR_OPEN_IO=in
-STOP_AFTER_STAGE=THROUGH
+STOP_AFTER_STAGE=PASS_THROUGH_DOORWAY
 AUTO_OPEN_MODE=canonical
 GPU_IDS_ARRAY=(0 1 2 3)
 ALL_SEEDS=(10 11 12 13 14 15 16 17)
 ACTIVE_PIDS=()
 ACTIVE_MONITOR_PID=""
 sleep() { command sleep 0.02; }
-''' + phase + '''
+"""
+        + phase
+        + """
 run_phase "$STUB_ROOT/phase" none "" ALL_SEEDS
 touch "$STUB_ROOT/continued"
-''')
+"""
+    )
     return subprocess.run(
-        ["bash", str(harness)], capture_output=True, text=True, timeout=15,
-        env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}",
-             "STUB_ROOT": str(tmp_path), "STUB_STATUS": str(status),
-             "STUB_MISSING": str(int(missing)), "STUB_ALL_FAIL": str(int(all_fail)),
-             "STUB_MISSING_SUMMARY": str(int(missing_summary)),
-             "STUB_AGGREGATE_STATUS": str(aggregate_status)},
+        ["bash", str(harness)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "STUB_ROOT": str(tmp_path),
+            "STUB_STATUS": str(status),
+            "STUB_MISSING": str(int(missing)),
+            "STUB_ALL_FAIL": str(int(all_fail)),
+            "STUB_MISSING_SUMMARY": str(int(missing_summary)),
+            "PULL_PANEL_CONTACT_BASELINE": "trunk_front_minus10",
+            "STUB_AGGREGATE_STATUS": str(aggregate_status),
+        },
     )
 
 

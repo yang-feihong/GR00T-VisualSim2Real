@@ -11,7 +11,7 @@ SCRIPT_ROOT = Path(__file__).resolve().parents[1]
 LOWLEVEL_ROOT = SCRIPT_ROOT / "third_party" / "visual_wholebody_lowlevel"
 
 # [x, y, z, roll, pitch, yaw] in the B2Z1 goal-reference frame.  This is the
-# shared physical endpoint for RESTORE_GRIPPER and PUSH_ARM_RETRACT.
+# shared physical endpoint for STOW_ARM_AND_CLOSE_GRIPPER and STOW_ARM_AFTER_PUSH.
 DEFAULT_ARM_RETRACT_POSE_LOCAL = (
     0.30,
     0.0,
@@ -22,6 +22,7 @@ DEFAULT_ARM_RETRACT_POSE_LOCAL = (
 )
 DEFAULT_ARM_RETRACT_POSITION_NOISE_RADIUS_M = 0.01
 DEFAULT_ARM_RETRACT_ROTATION_NOISE_DEG = 1.0
+
 
 def _parser() -> argparse.ArgumentParser:
     parser = build_common_arg_parser()
@@ -68,8 +69,8 @@ def _parser() -> argparse.ArgumentParser:
         default=DEFAULT_ARM_RETRACT_POSE_LOCAL,
         metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW"),
         help=(
-            "Shared six-DoF EE endpoint for RESTORE_GRIPPER and "
-            "PUSH_ARM_RETRACT, expressed in the B2Z1 goal-reference frame."
+            "Shared six-DoF EE endpoint for STOW_ARM_AND_CLOSE_GRIPPER and "
+            "STOW_ARM_AFTER_PUSH, expressed in the B2Z1 goal-reference frame."
         ),
     )
     parser.add_argument(
@@ -78,7 +79,7 @@ def _parser() -> argparse.ArgumentParser:
         default=DEFAULT_ARM_RETRACT_POSITION_NOISE_RADIUS_M,
         help=(
             "Per-entry uniform-volume position randomization radius for "
-            "RESTORE_GRIPPER and PUSH_ARM_RETRACT."
+            "STOW_ARM_AND_CLOSE_GRIPPER and STOW_ARM_AFTER_PUSH."
         ),
     )
     parser.add_argument(
@@ -87,7 +88,7 @@ def _parser() -> argparse.ArgumentParser:
         default=DEFAULT_ARM_RETRACT_ROTATION_NOISE_DEG,
         help=(
             "Per-entry independent absolute XYZ Euler randomization bound "
-            "for RESTORE_GRIPPER and PUSH_ARM_RETRACT."
+            "for STOW_ARM_AND_CLOSE_GRIPPER and STOW_ARM_AFTER_PUSH."
         ),
     )
     parser.add_argument("--output_dir", type=Path, required=True)
@@ -168,12 +169,19 @@ def _parser() -> argparse.ArgumentParser:
         "--pitch_probe_output",
         type=str,
         default=None,
-        help="Debug-only JSON output; stop after PREGRASP pitch selection.",
+        help="Debug-only JSON output; stop after MOVE_TO_PREGRASP pitch selection.",
     )
     parser.add_argument(
         "--terminal_stage",
-        choices=("THROUGH", "RESTORE_GRIPPER", "PULL_CLEAR_SWEEP", "PULL_INSERT", "PULL_OPEN", "PULL_BASE_ADVANCE"),
-        default="THROUGH",
+        choices=(
+            "PASS_THROUGH_DOORWAY",
+            "STOW_ARM_AND_CLOSE_GRIPPER",
+            "MOVE_TO_GAP_STATION",
+            "INSERT_INTO_DOOR_GAP",
+            "PRY_DOOR_OPEN",
+            "FOLLOW_WALL_TO_PANEL",
+        ),
+        default="PASS_THROUGH_DOORWAY",
         help="Stage whose completed acceptance terminates the requested workflow.",
     )
     parser.add_argument(
@@ -200,7 +208,11 @@ def _parser() -> argparse.ArgumentParser:
         default="positive_x",
         help="Side of the door where the robot starts; positive_x is the default collection setup.",
     )
-    parser.add_argument("--position_only_center", action="store_true", help="Keep EE orientation fixed during CENTER_HANDLE.")
+    parser.add_argument(
+        "--position_only_center",
+        action="store_true",
+        help="Keep EE orientation fixed during INSERT_AROUND_HANDLE.",
+    )
     parser.add_argument(
         "--disable_push_base_assist",
         action="store_true",
@@ -225,9 +237,7 @@ def _resolve_runtime_camera_config(
     )
 
     nominal_camera_config = Path(nominal_camera_config)
-    nominal_config = json.loads(
-        nominal_camera_config.read_text(encoding="utf-8")
-    )
+    nominal_config = json.loads(nominal_camera_config.read_text(encoding="utf-8"))
     seeds = (
         [int(seed) for seed in args.episode_seeds]
         if args.episode_seeds is not None
@@ -248,9 +258,7 @@ def _resolve_runtime_camera_config(
         )
         runtime_config = Path(args.output_dir) / f"runtime_rgb_cameras_seed{seed}.json"
         runtime_config.parent.mkdir(parents=True, exist_ok=True)
-        runtime_config.write_text(
-            json.dumps(actual_config, indent=2), encoding="utf-8"
-        )
+        runtime_config.write_text(json.dumps(actual_config, indent=2), encoding="utf-8")
         runtime_configs[seed] = actual_config
         randomizations[seed] = camera_randomization
         runtime_paths[seed] = str(runtime_config)
@@ -264,13 +272,20 @@ def _resolve_runtime_camera_config(
 
 def _default_paths(args):
     repo = SCRIPT_ROOT.parent.parent
-    run_dir = repo / "ckpt" / "b2z1-low" / "20260918_102500_is-dc7zasdnsm4oadn4-devmachine-0_gpu2_agent1_uhryvo2cn"
+    run_dir = (
+        repo
+        / "ckpt"
+        / "b2z1-low"
+        / "20260918_102500_is-dc7zasdnsm4oadn4-devmachine-0_gpu2_agent1_uhryvo2cn"
+    )
     if not args.ckpt_path:
         args.ckpt_path = str(run_dir / "model_54000.pt")
     if not args.run_metadata_path:
         args.run_metadata_path = str(run_dir / "run_metadata.json")
     if not args.robot_usd_path:
-        args.robot_usd_path = str(repo / "gr00t" / "rl" / "data" / "robots" / "b2z1_lab30" / "b2z1.usd")
+        args.robot_usd_path = str(
+            repo / "gr00t" / "rl" / "data" / "robots" / "b2z1_lab30" / "b2z1.usd"
+        )
     from gr00t.rl.utils.b2z1_asset import set_robot_usd
 
     set_robot_usd(args.robot_usd_path)
@@ -309,9 +324,7 @@ def _default_paths(args):
         nominal_camera_config = Path(
             args.rgb_camera_config
             if args.rgb_camera_config
-            else (
-                LOWLEVEL_ROOT / "legged_gym" / "scripts" / "rgb_cameras.json"
-            )
+            else (LOWLEVEL_ROOT / "legged_gym" / "scripts" / "rgb_cameras.json")
         )
         _resolve_runtime_camera_config(
             args,

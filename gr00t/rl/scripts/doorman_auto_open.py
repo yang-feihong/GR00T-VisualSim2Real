@@ -13,20 +13,17 @@ import os
 import signal
 import sys
 import traceback
-from collections import deque
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
 from typing import Optional, Tuple
 
-if (
-    __name__ == "__main__"
-    and os.environ.get("AUTO_OPEN_FIXED_ENTRY")
-    not in {"run_auto_open.sh", "run_auto_open_pitch_probe.sh"}
-):
+if __name__ == "__main__" and os.environ.get("AUTO_OPEN_FIXED_ENTRY") not in {
+    "run_auto_open.sh",
+    "run_auto_open_pitch_probe.sh",
+}:
     raise SystemExit(
-        "Direct AutoOpen invocation is disabled. Use a maintained entry in "
-        "gr00t/rl/scripts/."
+        "Direct AutoOpen invocation is disabled. Use a maintained entry in gr00t/rl/scripts/."
     )
 
 import numpy as np
@@ -40,8 +37,9 @@ LOWLEVEL_ROOT = SCRIPT_ROOT / "third_party" / "visual_wholebody_lowlevel"
 sys.path.insert(0, str(LOWLEVEL_ROOT))
 
 from legged_gym.scripts.manip_loco_interface import ManipLoco_Policy  # noqa: E402
-from legged_gym.utils.ee_steady_state import B2Z1SteadyEeForwardModel  # noqa: E402
 from legged_gym.utils.isaaclab_app import launch_app  # noqa: E402
+
+from gr00t.rl.auto_open.arm_model import read_arm_joint_limits  # noqa: E402
 from gr00t.rl.auto_open.cli import (  # noqa: E402
     DEFAULT_ARM_RETRACT_POSE_LOCAL,
     DEFAULT_ARM_RETRACT_POSITION_NOISE_RADIUS_M,
@@ -49,7 +47,6 @@ from gr00t.rl.auto_open.cli import (  # noqa: E402
     _default_paths,
     _parser,
 )
-from gr00t.rl.auto_open.control import _arm_drive_stiffness  # noqa: E402
 from gr00t.rl.auto_open.geometry import _resolved_door_prim_path  # noqa: E402
 from gr00t.rl.auto_open.target_noise import (  # noqa: E402
     EpisodeTargetNoise,
@@ -58,28 +55,28 @@ from gr00t.rl.auto_open.target_noise import (  # noqa: E402
 
 
 class Stage(IntEnum):
-    APPROACH = 1
-    PREGRASP = 2
+    APPROACH_HANDLE = 1
+    MOVE_TO_PREGRASP = 2
     OPEN_GRIPPER = 3
-    CENTER_HANDLE = 4
+    INSERT_AROUND_HANDLE = 4
     GRASP_HANDLE = 5
     PRESS_HANDLE = 6
-    PUSH_PULL_DOOR = 7
-    RETURN_HANDLE = 8
-    OPEN_AND_CLEAR = 9
-    RETREAT_ARM = 10
-    RESTORE_GRIPPER = 11
-    PULL_CLEAR_SWEEP = 20
-    PULL_INSERT = 21
-    PULL_OPEN = 22
-    PULL_ARM_RETRACT = 23
-    PULL_BASE_ADVANCE = 24
-    ALIGN_PANEL = 12
-    CONTACT_PANEL = 13
-    PUSH_OPEN = 14
-    PUSH_ARM_RETRACT = 15
-    BASE_ADVANCE = 16
-    THROUGH = 17
+    OPEN_DOOR_WITH_HANDLE = 7
+    RESET_HANDLE = 8
+    RELEASE_HANDLE = 9
+    WITHDRAW_FROM_HANDLE = 10
+    STOW_ARM_AND_CLOSE_GRIPPER = 11
+    MOVE_TO_GAP_STATION = 20
+    INSERT_INTO_DOOR_GAP = 21
+    PRY_DOOR_OPEN = 22
+    STOW_ARM_AFTER_PULL = 23
+    FOLLOW_WALL_TO_PANEL = 24
+    MOVE_TO_PANEL_STATION = 12
+    MOVE_TO_PANEL_STANDOFF = 13
+    PUSH_PANEL_OPEN = 14
+    STOW_ARM_AFTER_PUSH = 15
+    ADVANCE_TO_NEXT_PUSH_STATION = 16
+    PASS_THROUGH_DOORWAY = 17
     SUCCESS = 18
     FAILURE = 19
 
@@ -95,13 +92,13 @@ class StageSpec:
 # This is the executable AutoOpen stage graph. DoorController derives timeout
 # budgets from it and validates every runtime stage transition against it.
 STAGE_SPECS = {
-    Stage.APPROACH: StageSpec(
+    Stage.APPROACH_HANDLE: StageSpec(
         "track the door-relative base station; hold the initial arm pose",
         "base pose and measured velocity remain inside the approach window",
         1000,
-        (Stage.PREGRASP,),
+        (Stage.MOVE_TO_PREGRASP,),
     ),
-    Stage.PREGRASP: StageSpec(
+    Stage.MOVE_TO_PREGRASP: StageSpec(
         "hold the base station; follow the planned pregrasp EE path",
         "path complete and the measured EE/base pose is stable and contact-free",
         500,
@@ -111,9 +108,9 @@ STAGE_SPECS = {
         "hold the pregrasp EE pose and command the gripper open",
         "pregrasp remains valid and measured gripper opening is stable",
         100,
-        (Stage.CENTER_HANDLE,),
+        (Stage.INSERT_AROUND_HANDLE,),
     ),
-    Stage.CENTER_HANDLE: StageSpec(
+    Stage.INSERT_AROUND_HANDLE: StageSpec(
         "follow the planned insertion path with the gripper open",
         "handle is centered in the capture pocket/channel and EE pose is stable",
         800,
@@ -129,99 +126,105 @@ STAGE_SPECS = {
         "rotate the grasped handle until the latch releases",
         "the measured latch angle reaches the release threshold",
         900,
-        (Stage.PUSH_PULL_DOOR,),
+        (Stage.OPEN_DOOR_WITH_HANDLE,),
     ),
-    Stage.PUSH_PULL_DOOR: StageSpec(
+    Stage.OPEN_DOOR_WITH_HANDLE: StageSpec(
         "push or pull the grasped handle along the door-hinge arc",
         "door gap and slow-hinge release conditions hold while grasp is retained",
         900,
-        (Stage.RETURN_HANDLE,),
+        (Stage.RESET_HANDLE,),
     ),
-    Stage.RETURN_HANDLE: StageSpec(
+    Stage.RESET_HANDLE: StageSpec(
         "return the handle along its release path while retaining the grasp",
         "handle has returned horizontally and remained stable",
         150,
-        (Stage.OPEN_AND_CLEAR,),
+        (Stage.RELEASE_HANDLE,),
     ),
-    Stage.OPEN_AND_CLEAR: StageSpec(
-        "open the gripper and move clear of the handle",
-        "gripper is open and physical handle contact is absent",
+    Stage.RELEASE_HANDLE: StageSpec(
+        "open the gripper to release the handle",
+        "gripper is open and blocking handle contacts on both jaws are absent",
         100,
-        (Stage.RETREAT_ARM,),
+        (Stage.WITHDRAW_FROM_HANDLE,),
     ),
-    Stage.RETREAT_ARM: StageSpec(
+    Stage.WITHDRAW_FROM_HANDLE: StageSpec(
         "follow the planned arm retreat path",
         "retreat path is complete and EE motion is stable",
         200,
-        (Stage.RESTORE_GRIPPER,),
+        (Stage.STOW_ARM_AND_CLOSE_GRIPPER,),
     ),
-    Stage.RESTORE_GRIPPER: StageSpec(
+    Stage.STOW_ARM_AND_CLOSE_GRIPPER: StageSpec(
         "restore the arm/gripper posture along the planned path",
         "restore path is complete and measured arm pose is stable",
         300,
-        (Stage.ALIGN_PANEL, Stage.PULL_CLEAR_SWEEP),
+        (Stage.MOVE_TO_PANEL_STATION, Stage.MOVE_TO_GAP_STATION),
     ),
-    Stage.PULL_CLEAR_SWEEP: StageSpec(
-        "back up 0.20 m at entry heading, then move to a clearance- and insertion-validated station while holding restored arm joints",
+    Stage.MOVE_TO_GAP_STATION: StageSpec(
+        "back up 0.20 m at entry heading, then move to a clearance- and insertion-validated "
+        "station while holding restored arm joints",
         "base is stable at its sampled station and its collider projection clears the frame",
         1000,
-        (Stage.PULL_INSERT,),
+        (Stage.INSERT_INTO_DOOR_GAP,),
     ),
-    Stage.PULL_INSERT: StageSpec(
+    Stage.INSERT_INTO_DOOR_GAP: StageSpec(
         "hold the base and insert closed jaws behind the free panel edge",
         "closed jaws settle at the inner-panel standoff; physical contact is not required",
         900,
-        (Stage.PULL_OPEN, Stage.PULL_ARM_RETRACT, Stage.PULL_CLEAR_SWEEP),
+        (Stage.PRY_DOOR_OPEN, Stage.STOW_ARM_AFTER_PULL, Stage.MOVE_TO_GAP_STATION),
     ),
-    Stage.PULL_OPEN: StageSpec(
-        "hold the base, follow a hinge-centered position arc with speed feedback, and hold world orientation",
-        "door is at least 30 degrees open and reaches the opening goal or the arm comfort-workspace boundary",
+    Stage.PRY_DOOR_OPEN: StageSpec(
+        "hold the base, follow a hinge-centered position arc with speed feedback, "
+        "and hold world orientation",
+        "door is at least 30 degrees open and reaches the opening goal "
+        "or the arm comfort-workspace boundary",
         900,
-        (Stage.PULL_ARM_RETRACT,),
+        (Stage.STOW_ARM_AFTER_PULL,),
     ),
-    Stage.PULL_ARM_RETRACT: StageSpec(
+    Stage.STOW_ARM_AFTER_PULL: StageSpec(
         "hold the base and retract closed jaws along the shared restore planner",
         "restore path is complete and measured arm pose is stable",
         300,
-        (Stage.PULL_BASE_ADVANCE, Stage.THROUGH),
+        (Stage.FOLLOW_WALL_TO_PANEL, Stage.PASS_THROUGH_DOORWAY),
     ),
-    Stage.PULL_BASE_ADVANCE: StageSpec(
-        "hold retracted joints and follow the precomputed near-wall shoulder/arcsin-heading curve; advance samples only while the published heading angle is below the door angle",
-        "door-angle gate holds the reference and base settles with door speed below 2 deg/s throughout the shared stability window, or the door reaches the opening threshold and enters THROUGH directly",
+    Stage.FOLLOW_WALL_TO_PANEL: StageSpec(
+        "hold retracted joints and follow the precomputed near-wall shoulder/arcsin-heading "
+        "curve; advance samples only while the published heading angle is below the door angle",
+        "door-angle gate holds the reference and base settles with door speed below 2 deg/s "
+        "throughout the shared stability window, or the door reaches the opening threshold "
+        "and enters PASS_THROUGH_DOORWAY directly",
         1000,
-        (Stage.CONTACT_PANEL, Stage.THROUGH),
+        (Stage.MOVE_TO_PANEL_STANDOFF, Stage.PASS_THROUGH_DOORWAY),
     ),
-    Stage.ALIGN_PANEL: StageSpec(
+    Stage.MOVE_TO_PANEL_STATION: StageSpec(
         "track the panel-aligned base station while holding arm joints",
         "base reaches and stabilizes at the panel station",
         400,
-        (Stage.CONTACT_PANEL,),
+        (Stage.MOVE_TO_PANEL_STANDOFF,),
     ),
-    Stage.CONTACT_PANEL: StageSpec(
+    Stage.MOVE_TO_PANEL_STANDOFF: StageSpec(
         "hold the base and slew the EE to the selected panel standoff",
         "panel-relative EE standoff pose is reached and stable",
         400,
-        (Stage.PUSH_OPEN, Stage.THROUGH),
+        (Stage.PUSH_PANEL_OPEN, Stage.PASS_THROUGH_DOORWAY),
     ),
-    Stage.PUSH_OPEN: StageSpec(
+    Stage.PUSH_PANEL_OPEN: StageSpec(
         "advance the EE push target while holding the base",
         "door opens sufficiently, or arm extension requests repositioning",
         900,
-        (Stage.PUSH_ARM_RETRACT, Stage.THROUGH, Stage.PULL_ARM_RETRACT),
+        (Stage.STOW_ARM_AFTER_PUSH, Stage.PASS_THROUGH_DOORWAY, Stage.STOW_ARM_AFTER_PULL),
     ),
-    Stage.PUSH_ARM_RETRACT: StageSpec(
+    Stage.STOW_ARM_AFTER_PUSH: StageSpec(
         "retract the arm from the panel while holding the base",
         "arm is clear and stable for base repositioning",
         300,
-        (Stage.BASE_ADVANCE, Stage.THROUGH),
+        (Stage.ADVANCE_TO_NEXT_PUSH_STATION, Stage.PASS_THROUGH_DOORWAY),
     ),
-    Stage.BASE_ADVANCE: StageSpec(
+    Stage.ADVANCE_TO_NEXT_PUSH_STATION: StageSpec(
         "advance toward the monotonic shoulder-safe recontact station",
         "base is stable and the panel contact point is back in arm reach",
         900,
-        (Stage.CONTACT_PANEL, Stage.THROUGH),
+        (Stage.MOVE_TO_PANEL_STANDOFF, Stage.PASS_THROUGH_DOORWAY),
     ),
-    Stage.THROUGH: StageSpec(
+    Stage.PASS_THROUGH_DOORWAY: StageSpec(
         "track the door-frame-relative tail-clear target while restoring the arm",
         "tail clearance, pose, robot, arm, gripper, and door speeds are stable",
         1100,
@@ -235,22 +238,22 @@ STAGE_SPECS = {
 # target owned by the preceding movement stage.
 BASE_HOLD_STAGES = frozenset(
     {
-        Stage.PREGRASP,
+        Stage.MOVE_TO_PREGRASP,
         Stage.OPEN_GRIPPER,
-        Stage.CENTER_HANDLE,
+        Stage.INSERT_AROUND_HANDLE,
         Stage.GRASP_HANDLE,
         Stage.PRESS_HANDLE,
-        Stage.PUSH_PULL_DOOR,
-        Stage.RETURN_HANDLE,
-        Stage.OPEN_AND_CLEAR,
-        Stage.RETREAT_ARM,
-        Stage.RESTORE_GRIPPER,
-        Stage.CONTACT_PANEL,
-        Stage.PUSH_OPEN,
-        Stage.PUSH_ARM_RETRACT,
-        Stage.PULL_INSERT,
-        Stage.PULL_OPEN,
-        Stage.PULL_ARM_RETRACT,
+        Stage.OPEN_DOOR_WITH_HANDLE,
+        Stage.RESET_HANDLE,
+        Stage.RELEASE_HANDLE,
+        Stage.WITHDRAW_FROM_HANDLE,
+        Stage.STOW_ARM_AND_CLOSE_GRIPPER,
+        Stage.MOVE_TO_PANEL_STANDOFF,
+        Stage.PUSH_PANEL_OPEN,
+        Stage.STOW_ARM_AFTER_PUSH,
+        Stage.INSERT_INTO_DOOR_GAP,
+        Stage.PRY_DOOR_OPEN,
+        Stage.STOW_ARM_AFTER_PULL,
     }
 )
 
@@ -287,7 +290,7 @@ class DoorController:
         position_only_center: bool = False,
         disable_push_base_assist: bool = False,
         env_id: int = 0,
-        shared_steady_model=None,
+        shared_arm_joint_limits=None,
         shared_robot_geometry=None,
         target_noise_seed=0,
         target_noise_config=None,
@@ -305,22 +308,16 @@ class DoorController:
         self.target_noise = EpisodeTargetNoise(
             seed=int(target_noise_seed), config=target_noise_config
         )
-        self.arm_retract_pose_local = np.asarray(
-            arm_retract_pose_local, dtype=np.float32
-        )
-        if self.arm_retract_pose_local.shape != (6,) or not np.isfinite(
-            self.arm_retract_pose_local
-        ).all():
+        self.arm_retract_pose_local = np.asarray(arm_retract_pose_local, dtype=np.float32)
+        if (
+            self.arm_retract_pose_local.shape != (6,)
+            or not np.isfinite(self.arm_retract_pose_local).all()
+        ):
             raise ValueError(
-                "arm_retract_pose_local must contain six finite values: "
-                "x, y, z, roll, pitch, yaw"
+                "arm_retract_pose_local must contain six finite values: x, y, z, roll, pitch, yaw"
             )
-        self.arm_retract_position_noise_radius_m = float(
-            arm_retract_position_noise_radius_m
-        )
-        self.arm_retract_rotation_noise_deg = float(
-            arm_retract_rotation_noise_deg
-        )
+        self.arm_retract_position_noise_radius_m = float(arm_retract_position_noise_radius_m)
+        self.arm_retract_rotation_noise_deg = float(arm_retract_rotation_noise_deg)
         if self.arm_retract_position_noise_radius_m < 0.0:
             raise ValueError("arm retract position noise radius must be non-negative")
         if not 0.0 <= self.arm_retract_rotation_noise_deg <= 180.0:
@@ -330,10 +327,8 @@ class DoorController:
         self.arm_retract_randomization_records = []
         self.active_arm_retract_pose_local = self.arm_retract_pose_local.copy()
         self.restore_retract_pose_sampled = False
-        self.grasp_semantic_position_delta_world = np.zeros(
-            3, dtype=np.float32
-        )
-        self.stage = Stage.APPROACH
+        self.grasp_semantic_position_delta_world = np.zeros(3, dtype=np.float32)
+        self.stage = Stage.APPROACH_HANDLE
         self.stage_steps = 0
         self.stage_limits = {
             stage: spec.budget_steps
@@ -398,8 +393,6 @@ class DoorController:
         self.panel_contact_inverse_command_orientation_world = None
         self.prepared_panel_contact_command = None
         self.batched_panel_finger_clearance = None
-        self.defer_steady_inverse = False
-        self.defer_path_solve = False
         self.panel_contact_orientation = None
         self.panel_contact_settle_steps = 0
         self.panel_station_xy = None
@@ -432,8 +425,9 @@ class DoorController:
         self.push_speed_kp = 0.45
         self.push_speed_ki = 0.50
         self.push_speed_integral_limit = math.radians(8.0)
-        self.push_max_angular_lead = math.radians(2.0)  # Initial PULL_OPEN arc only.
+        self.push_max_angular_lead = math.radians(2.0)  # Initial PRY_DOOR_OPEN arc only.
         from gr00t.rl.auto_open.panel_motion import PUSH_TIP_MAX_ANGULAR_LEAD_RAD
+
         self.push_tip_max_angular_lead = PUSH_TIP_MAX_ANGULAR_LEAD_RAD
         self.push_max_ee_step = 0.003
         self.push_speed_error_integral = 0.0
@@ -475,9 +469,7 @@ class DoorController:
         self.through_stability_failure_counts = {}
         self.through_motion_ready = False
         self.through_entry_stable_steps = 0
-        self.through_min_base_height = float(
-            self.env.cfg.rewards.base_height_target_min
-        )
+        self.through_min_base_height = float(self.env.cfg.rewards.base_height_target_min)
         self.hinge_world = None
         self.hinge_axis_sign = None
         self.final_min_normal_offset = None
@@ -548,27 +540,12 @@ class DoorController:
         self.rotation_sweep_radius = None
         self.geometry_report = None
         self.center_metrics = {}
-        steady_urdf = (
-            LOWLEVEL_ROOT
-            / "resources/robots/b2z1/urdf"
-            / "b2z1.urdf"
+        arm_urdf = LOWLEVEL_ROOT / "resources/robots/b2z1/urdf" / "b2z1.urdf"
+        self.arm_joint_limits = (
+            read_arm_joint_limits(arm_urdf)
+            if shared_arm_joint_limits is None
+            else shared_arm_joint_limits
         )
-        arm_drive_stiffness = _arm_drive_stiffness(self.env)
-        if shared_steady_model is not None:
-            if not np.array_equal(
-                shared_steady_model.stiffness, arm_drive_stiffness
-            ):
-                raise RuntimeError(
-                    "shared steady EE model stiffness does not match the active "
-                    f"arm actuator: model={shared_steady_model.stiffness.tolist()} "
-                    f"actuator={arm_drive_stiffness.tolist()}"
-                )
-            self.ee_steady_model = shared_steady_model
-        else:
-            self.ee_steady_model = B2Z1SteadyEeForwardModel(
-                steady_urdf,
-                stiffness=arm_drive_stiffness,
-            )
         self.arm_align_command_world = None
         self.arm_align_command_quat = None
         self.arm_align_command_path = None
@@ -583,21 +560,14 @@ class DoorController:
         self.arm_forward_orientation_path = None
         self.arm_forward_path_index = 0
         self.center_vertical_plan = None
-        self.arm_stability_window = deque(maxlen=15)
         self.failure_reason = None
         self.failure_stage = None
         self.last_acceptance_diagnostics = {}
         self.last_stability_diagnostics = {}
         self.stage_exit_diagnostics = {}
-        self.precomputed_steady_paths = {}
         self.gpu_geometry_uses = 0
         self.gpu_geometry_fallbacks = 0
-        self.batched_stability_result = None
-        self.gpu_stability_uses = 0
-        self.gpu_stability_fallbacks = 0
         self.batched_handle_center = None
-        self.defer_batched_orientation_delta = False
-        self.batched_default_base_command = None
         self.replan_counter = 0
         robot_body_names = [name.lower() for name in self.env.body_names]
         self.front_shoulder_body_indices = np.asarray(
@@ -622,7 +592,13 @@ class DoorController:
         handle_body_idx = body_name_to_idx.get("door_handle", body_name_to_idx.get("handle"))
         grasp_target_body_idx = body_name_to_idx.get("grasp_target")
         panel_body_idx = body_name_to_idx.get("door_panel")
-        if not hinge or not handle or not latch or handle_body_idx is None or panel_body_idx is None:
+        if (
+            not hinge
+            or not handle
+            or not latch
+            or handle_body_idx is None
+            or panel_body_idx is None
+        ):
             raise RuntimeError(
                 "Unable to resolve DoorMan articulation names. "
                 f"joints={self.door_joint_names}, bodies={self.door_body_names}"
@@ -637,7 +613,8 @@ class DoorController:
         print(
             f"[doorman] hinge={self.hinge_idx}, handle_joint={self.handle_joint_idx}, "
             f"latch_joint={self.latch_joint_idx}, "
-            f"physical_handle_body={self.handle_body_idx}, grasp_reference_body={self.grasp_target_body_idx}, "
+            f"physical_handle_body={self.handle_body_idx}, "
+            f"grasp_reference_body={self.grasp_target_body_idx}, "
             f"panel_body={self.panel_body_idx}"
         )
 
@@ -645,20 +622,20 @@ class DoorController:
         return _resolved_door_prim_path(self.env, self.env_id)
 
 
-
-
 def main():
     args = _parser().parse_args()
     try:
-        args.target_noise_config = SemanticTargetNoiseConfig.from_assignments(
-            args.target_noise
-        )
+        args.target_noise_config = SemanticTargetNoiseConfig.from_assignments(args.target_noise)
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     if args.max_steps < 1:
         raise SystemExit("--max_steps must be positive")
     _default_paths(args)
-    for label, path in (("checkpoint", args.ckpt_path), ("run metadata", args.run_metadata_path), ("robot USD", args.robot_usd_path)):
+    for label, path in (
+        ("checkpoint", args.ckpt_path),
+        ("run metadata", args.run_metadata_path),
+        ("robot USD", args.robot_usd_path),
+    ):
         if path and not Path(path).is_file():
             raise SystemExit(f"{label} not found: {path}")
     if args.rgb_camera_config and not Path(args.rgb_camera_config).is_file():
@@ -670,9 +647,7 @@ def main():
         )
     if args.episode_seeds is not None:
         if len(args.episode_seeds) != args.batched_envs:
-            raise SystemExit(
-                "--episode_seeds must contain exactly --batched_envs values"
-            )
+            raise SystemExit("--episode_seeds must contain exactly --batched_envs values")
         if len(set(args.episode_seeds)) != len(args.episode_seeds):
             raise SystemExit("--episode_seeds must not contain duplicates")
     if args.replay_source_dataset_dir is not None:
@@ -693,7 +668,9 @@ def main():
         or args.camera_distortion_noise_fraction > 0.0
     )
     if camera_mount_noise_enabled and args.standard_dataset_dir is None:
-        raise SystemExit("camera mount randomization is only supported for standard data collection")
+        raise SystemExit(
+            "camera mount randomization is only supported for standard data collection"
+        )
     try:
         args.output_dir.mkdir(parents=True, exist_ok=True)
     except PermissionError as exc:

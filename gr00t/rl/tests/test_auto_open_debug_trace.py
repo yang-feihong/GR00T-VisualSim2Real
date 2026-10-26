@@ -58,9 +58,7 @@ def test_debug_trace_writer_preserves_raw_rows_and_events(tmp_path):
     summary = write_debug_trace(tmp_path, rows, events)
     restored = [
         json.loads(line)
-        for line in (tmp_path / "acceptance_trace.jsonl")
-        .read_text(encoding="utf-8")
-        .splitlines()
+        for line in (tmp_path / "acceptance_trace.jsonl").read_text(encoding="utf-8").splitlines()
     ]
     assert restored == rows
     assert summary["rows"] == 1

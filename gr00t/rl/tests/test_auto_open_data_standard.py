@@ -45,9 +45,9 @@ def _yaw_quaternion(yaw):
 
 
 def _fsm_stage_names(frames, stage2_start, stage3_start):
-    stages = np.full(frames, "APPROACH", dtype=object)
-    stages[stage2_start:stage3_start] = "PREGRASP"
-    stages[stage3_start:] = "ALIGN_PANEL"
+    stages = np.full(frames, "APPROACH_HANDLE", dtype=object)
+    stages[stage2_start:stage3_start] = "MOVE_TO_PREGRASP"
+    stages[stage3_start:] = "MOVE_TO_PANEL_STATION"
     return stages
 
 
@@ -85,9 +85,7 @@ def test_six_camera_debug_mosaic_is_published_per_seed(tmp_path):
         encoder = StreamingVideoEncoder(path, (16, 16, 3))
         try:
             for frame in range(2):
-                encoder.append(
-                    np.full((16, 16, 3), index * 30 + frame, dtype=np.uint8)
-                )
+                encoder.append(np.full((16, 16, 3), index * 30 + frame, dtype=np.uint8))
         finally:
             encoder.close()
 
@@ -112,9 +110,7 @@ def test_six_camera_debug_mosaic_is_published_per_seed(tmp_path):
     ]
     output = root / manifest[0]["path"]
     _verify_video(output, (720, 1440, 3), 2)
-    saved_manifest = json.loads(
-        (root / "six_camera_mosaics/manifest.json").read_text()
-    )
+    saved_manifest = json.loads((root / "six_camera_mosaics/manifest.json").read_text())
     assert saved_manifest == {"episodes": manifest}
 
 
@@ -144,9 +140,7 @@ def test_dataset_tool_pose_uses_single_offset_and_no_fixed_mesh_axis_roll():
             0.0,
         )
     )
-    dataset_quaternion = dataset_tool_quaternion_from_gripper_quaternion(
-        production_quaternion
-    )
+    dataset_quaternion = dataset_tool_quaternion_from_gripper_quaternion(production_quaternion)
     np.testing.assert_allclose(dataset_quaternion, (1.0, 0.0, 0.0, 0.0), atol=1.0e-12)
 
 
@@ -208,10 +202,7 @@ def test_height_invariant_pose_removes_global_xy_and_yaw_only():
         local_rotation,
     )
     global_yaw = 1.2
-    rotated_position = (
-        np.asarray((8.0, -4.0, 0.0))
-        + _yaw_matrix(global_yaw) @ local_position
-    )
+    rotated_position = np.asarray((8.0, -4.0, 0.0)) + _yaw_matrix(global_yaw) @ local_position
     transformed = height_invariant_pose(
         np.asarray((8.0, -4.0, 0.48)),
         _yaw_quaternion(global_yaw),
@@ -238,11 +229,7 @@ def test_batched_target_pose_matches_scalar_collector_semantics():
     scalar = []
     collector = object.__new__(AutoOpenStandardEpisodeCollector)
     for root, arm in zip(roots, arms):
-        scalar.append(
-            collector._target_height_invariant_pose(
-                {"root": root}, arm
-            )
-        )
+        scalar.append(collector._target_height_invariant_pose({"root": root}, arm))
     np.testing.assert_array_equal(batched, np.asarray(scalar))
 
 
@@ -269,14 +256,10 @@ def test_camera_transform_has_exact_keys_shapes_and_rotation():
     base = np.arange(480 * 640 * 3, dtype=np.uint32).reshape(480, 640, 3)
     base = (base % 251).astype(np.uint8)
     wrist = np.zeros((480, 640, 3), dtype=np.uint8)
-    transformed = transform_dataset_images(
-        {"base_0_rgb": base, "left_wrist_0_rgb": wrist}
-    )
+    transformed = transform_dataset_images({"base_0_rgb": base, "left_wrist_0_rgb": wrist})
     assert transformed["observation.images.base_0_rgb"].shape == (640, 480, 3)
     assert transformed["observation.images.left_wrist_0_rgb"].shape == (480, 640, 3)
-    np.testing.assert_array_equal(
-        transformed["observation.images.base_0_rgb"], np.rot90(base, 1)
-    )
+    np.testing.assert_array_equal(transformed["observation.images.base_0_rgb"], np.rot90(base, 1))
 
 
 def test_streaming_video_encoder_preserves_frame_count_with_background_worker(tmp_path):
@@ -398,9 +381,7 @@ def test_short_round_trip_audit_detects_a_jump_returning_within_100ms():
         return_tolerance=0.03,
         require_sign_reversal=True,
     )
-    assert events == [
-        {"frame": 4, "return_frame": 6, "component": 1, "jump": pytest.approx(0.4)}
-    ]
+    assert events == [{"frame": 4, "return_frame": 6, "component": 1, "jump": pytest.approx(0.4)}]
 
 
 def test_arm_round_trip_audit_does_not_flag_sustained_motion_then_retraction():
@@ -439,26 +420,37 @@ def test_contact_classifier_rejects_non_foot_ground_contact():
         ),
     )
     summary = _contact_acceptance_summary(
-        episode, np.full(10, "THROUGH", dtype=object)
+        episode, np.full(10, "PASS_THROUGH_DOORWAY", dtype=object)
     )
     assert len(summary["abnormal"]) == 1
     assert summary["abnormal"][0]["reason"] == "non_foot_robot_ground_contact"
 
 
-@pytest.mark.parametrize('stage', ['PULL_INSERT', 'PULL_OPEN', 'PULL_ARM_RETRACT'])
-@pytest.mark.parametrize('penetration', [.002, .004])
+@pytest.mark.parametrize("stage", ["INSERT_INTO_DOOR_GAP", "PRY_DOOR_OPEN", "STOW_ARM_AFTER_PULL"])
+@pytest.mark.parametrize("penetration", [0.002, 0.004])
 def test_pull_panel_contact_uses_existing_panel_penetration_limit(stage, penetration):
-    episode = AutoOpenEpisodeData(episode_index=0, seed=1700,
+    episode = AutoOpenEpisodeData(
+        episode_index=0,
+        seed=1700,
         observation_state=np.zeros((1, 58), dtype=np.float32),
-        action=np.zeros((1, 25), dtype=np.float32), images={}, raw_audit={},
-        raw_contacts=({'frame_index': 0, 'body_a_path': '/World/envs/env_0/Robot/gripperMover',
-                       'body_b_path': '/World/envs/env_0/door_left/door_panel',
-                       'max_contact_force': 50., 'max_normal_impulse': .2,
-                       'max_penetration_depth': penetration},))
+        action=np.zeros((1, 25), dtype=np.float32),
+        images={},
+        raw_audit={},
+        raw_contacts=(
+            {
+                "frame_index": 0,
+                "body_a_path": "/World/envs/env_0/Robot/gripperMover",
+                "body_b_path": "/World/envs/env_0/door_left/door_panel",
+                "max_contact_force": 50.0,
+                "max_normal_impulse": 0.2,
+                "max_penetration_depth": penetration,
+            },
+        ),
+    )
     summary = _contact_acceptance_summary(episode, np.array([stage], dtype=object))
-    assert not summary['abnormal']
-    assert summary['class_maxima']['gripper_panel']['rows'] == 1
-    assert bool(summary['penetration_violations']) == (penetration > .003)
+    assert not summary["abnormal"]
+    assert summary["class_maxima"]["gripper_panel"]["rows"] == 1
+    assert bool(summary["penetration_violations"]) == (penetration > 0.003)
 
 
 def test_contact_aggregation_drops_zero_rows_and_merges_mirrors():
@@ -521,13 +513,13 @@ def test_physical_validator_requires_standard_full_open_target():
         "arm_joint_target_dispatched": np.zeros((frames, 6), dtype=np.float32),
         "robot_clear_of_door": robot_clear,
     }
-    stages = np.full(frames, "THROUGH", dtype=object)
-    stages[:65] = "APPROACH"
-    stages[65:68] = "PREGRASP"
+    stages = np.full(frames, "PASS_THROUGH_DOORWAY", dtype=object)
+    stages[:65] = "APPROACH_HANDLE"
+    stages[65:68] = "MOVE_TO_PREGRASP"
     stages[68:72] = "OPEN_GRIPPER"
     stages[72:78] = "GRASP_HANDLE"
-    stages[78:84] = "OPEN_AND_CLEAR"
-    stages[84:90] = "RESTORE_GRIPPER"
+    stages[78:84] = "RELEASE_HANDLE"
+    stages[84:90] = "STOW_ARM_AND_CLOSE_GRIPPER"
     audit["autoopen_stage"] = stages
     raw_contacts = (
         {
@@ -563,9 +555,7 @@ def test_physical_validator_requires_standard_full_open_target():
     assert metrics["contacts"]["unique_frame_pair_rows"] == 2
 
     inconsistent_audit = dict(audit)
-    inconsistent_audit["arm_joint_position"] = np.zeros(
-        (frames, 6), dtype=np.float32
-    )
+    inconsistent_audit["arm_joint_position"] = np.zeros((frames, 6), dtype=np.float32)
     inconsistent_audit["arm_joint_position"][80:, 2] = 0.1
     inconsistent_episode = AutoOpenEpisodeData(
         **{**episode.__dict__, "raw_audit": inconsistent_audit}
@@ -579,8 +569,7 @@ def test_physical_validator_requires_standard_full_open_target():
         **{
             **episode.__dict__,
             "raw_contacts": tuple(
-                {**row, "max_contact_force": 0.0, "max_normal_impulse": 0.0}
-                for row in raw_contacts
+                {**row, "max_contact_force": 0.0, "max_normal_impulse": 0.0} for row in raw_contacts
             ),
         }
     )
@@ -590,13 +579,9 @@ def test_physical_validator_requires_standard_full_open_target():
     )
 
     moving_audit = dict(audit)
-    moving_audit["root_linear_velocity_world"] = np.zeros(
-        (frames, 3), dtype=np.float32
-    )
+    moving_audit["root_linear_velocity_world"] = np.zeros((frames, 3), dtype=np.float32)
     moving_audit["root_linear_velocity_world"][-50:, 0] = 0.08
-    moving_episode = AutoOpenEpisodeData(
-        **{**episode.__dict__, "raw_audit": moving_audit}
-    )
+    moving_episode = AutoOpenEpisodeData(**{**episode.__dict__, "raw_audit": moving_audit})
     assert "terminal_base_linear_velocity_not_stable" in _physical_acceptance_reasons(
         moving_episode, boundary
     )
@@ -665,9 +650,7 @@ def test_camera_calibration_covers_renderer_config_and_saved_pixel_transform(tmp
     )
 
     assert writer.camera_calibration["renderer_runtime_camera_config_id"] == "abc123"
-    assert writer.simulation_provenance["renderer_runtime_camera_config_id"] == (
-        "abc123"
-    )
+    assert writer.simulation_provenance["renderer_runtime_camera_config_id"] == ("abc123")
     base_transform = writer.camera_calibration["dataset_image_transforms"][
         "observation.images.base_0_rgb"
     ]
@@ -680,8 +663,9 @@ def test_camera_calibration_covers_renderer_config_and_saved_pixel_transform(tmp
         [0.0, 0.0, 1.0],
     ]
     assert len(writer.camera_calibration["calibration_id"]) == 64
-    assert writer.simulation_provenance["camera_calibration_id"] == (
-        writer.camera_calibration["calibration_id"]
+    assert (
+        writer.simulation_provenance["camera_calibration_id"]
+        == (writer.camera_calibration["calibration_id"])
     )
     assert writer.camera_calibration["calibration_id_source"] == (
         "sha256_of_effective_renderer_config_and_dataset_pixel_transforms"

@@ -3,11 +3,7 @@ from pathlib import Path
 
 import torch
 
-LOWLEVEL_ROOT = (
-    Path(__file__).resolve().parents[1]
-    / "third_party"
-    / "visual_wholebody_lowlevel"
-)
+LOWLEVEL_ROOT = Path(__file__).resolve().parents[1] / "third_party" / "visual_wholebody_lowlevel"
 sys.path.insert(0, str(LOWLEVEL_ROOT))
 
 from legged_gym.envs.manip_loco.training_doorman_scene import (
@@ -34,9 +30,7 @@ def test_episode_uniform_rows_do_not_depend_on_batch_size():
 
 def test_door_side_and_physics_seed_do_not_depend_on_batch_size():
     many_sides = [episode_door_side(1718 + env_id) for env_id in range(8)]
-    many_physics_seeds = [
-        stream_seed(1718 + env_id, "door_physics") for env_id in range(8)
-    ]
+    many_physics_seeds = [stream_seed(1718 + env_id, "door_physics") for env_id in range(8)]
     assert episode_door_side(1718) == many_sides[0]
     assert stream_seed(1718, "door_physics") == many_physics_seeds[0]
     assert episode_door_side(1723) == many_sides[5]
@@ -58,7 +52,7 @@ def test_door_visual_seed_is_deterministic_and_independent_from_physics():
         / "manip_loco"
         / "training_doorman_scene.py"
     ).read_text(encoding="utf-8")
-    assert 'visual_random_seed=stream_seed(' in source
+    assert "visual_random_seed=stream_seed(" in source
     assert 'episode_seeds[env_id], "door_visual"' in source
 
 

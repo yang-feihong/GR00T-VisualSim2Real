@@ -16,7 +16,9 @@ from gr00t.rl.envs.door.b2z1_reset_geometry import (
 def test_candidate_graph_replays_identical_math_and_refreshes_inputs(dtype, count):
     root = torch.tensor([[16.0, -24.0, 0.55]], dtype=dtype, device="cuda").expand(count, -1)
     quat = torch.tensor([[0.02, -0.01, 0.15, 0.9884]], dtype=dtype, device="cuda").expand(count, -1)
-    initial = torch.tensor([[0.0, 1.2, -1.8, -1.0, 0.0, 0.0]], dtype=dtype, device="cuda").expand(count, -1)
+    initial = torch.tensor([[0.0, 1.2, -1.8, -1.0, 0.0, 0.0]], dtype=dtype, device="cuda").expand(
+        count, -1
+    )
     lower = torch.full((6,), -3.0, dtype=dtype, device="cuda")
     upper = -lower
     prior = None

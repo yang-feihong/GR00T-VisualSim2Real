@@ -9,7 +9,6 @@ from pathlib import Path
 import numpy as np
 import torch
 
-
 SCRIPT_ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -58,9 +57,7 @@ def standard_simulation_provenance(args, runner, base_seed):
     camera_value = episode_camera_paths.get(int(base_seed), args.rgb_camera_config)
     camera_path = None if camera_value is None else Path(camera_value)
     nominal_camera_value = getattr(args, "nominal_rgb_camera_config", None)
-    nominal_camera_path = (
-        None if nominal_camera_value is None else Path(nominal_camera_value)
-    )
+    nominal_camera_path = None if nominal_camera_value is None else Path(nominal_camera_value)
     door_source = repo / "gr00t" / "rl" / "isaac_utils" / "playground" / "env_rand" / "door.py"
     camera_configuration = (
         {"audit_only": True}
@@ -87,12 +84,10 @@ def standard_simulation_provenance(args, runner, base_seed):
         "run_metadata": hashed(args.run_metadata_path),
         "camera_config": hashed(camera_path),
         "nominal_camera_config": hashed(nominal_camera_path),
-        "camera_calibration_id": (
-            None if camera_path is None else file_sha256(camera_path)
+        "camera_calibration_id": (None if camera_path is None else file_sha256(camera_path)),
+        "camera_mount_randomization": getattr(args, "camera_mount_randomizations", {}).get(
+            int(base_seed), args.camera_mount_randomization
         ),
-        "camera_mount_randomization": getattr(
-            args, "camera_mount_randomizations", {}
-        ).get(int(base_seed), args.camera_mount_randomization),
         "camera_mode": args.collection_camera_mode,
         "camera_configuration": camera_configuration,
         "camera_rotation_convention": {
@@ -220,9 +215,9 @@ def door_asset_stage_snapshot(stage, door_prim):
         "stage_prim_path": str(door_prim.GetPath()),
         "prims": prims,
     }
-    encoded = json.dumps(
-        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-    ).encode("utf-8")
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode(
+        "utf-8"
+    )
     payload["sha256"] = hashlib.sha256(encoded).hexdigest()
     return payload
 
@@ -236,9 +231,9 @@ def rgb_array(frame):
     if array.shape[-1] == 4:
         array = array[..., :3]
     if np.issubdtype(array.dtype, np.floating):
-        array = np.clip(
-            array * (255.0 if array.max(initial=0.0) <= 1.0 else 1.0), 0, 255
-        ).astype(np.uint8)
+        array = np.clip(array * (255.0 if array.max(initial=0.0) <= 1.0 else 1.0), 0, 255).astype(
+            np.uint8
+        )
     else:
         array = np.clip(array, 0, 255).astype(np.uint8)
     return array
@@ -255,9 +250,7 @@ def save_rgb_video(frames, timestamps, path: Path):
         fps = 1.0 / float(np.median(intervals)) if len(intervals) else 4.0
     else:
         fps = 4.0
-    writer = imageio.get_writer(
-        str(path), fps=fps, codec="libx264", quality=8, macro_block_size=1
-    )
+    writer = imageio.get_writer(str(path), fps=fps, codec="libx264", quality=8, macro_block_size=1)
     try:
         for frame in frames:
             writer.append_data(rgb_array(frame))
@@ -278,9 +271,7 @@ def save_rgb_mosaic_video(camera_frames, camera_timestamps, path: Path):
     camera_names = [name for name in preferred_order if camera_frames.get(name)]
     camera_names.extend(
         sorted(
-            name
-            for name, frames in camera_frames.items()
-            if frames and name not in camera_names
+            name for name, frames in camera_frames.items() if frames and name not in camera_names
         )
     )
     if not camera_names:
@@ -297,14 +288,13 @@ def save_rgb_mosaic_video(camera_frames, camera_timestamps, path: Path):
     else:
         fps = 4.0
 
-    from PIL import Image, ImageDraw
     import imageio.v2 as imageio
+    from PIL import Image, ImageDraw
 
     tile_width, tile_height = 480, 360
     canvas_width, canvas_height = 3 * tile_width, 2 * tile_height
     timestamp_arrays = {
-        name: np.asarray(camera_timestamps[name], dtype=np.float64)
-        for name in camera_names
+        name: np.asarray(camera_timestamps[name], dtype=np.float64) for name in camera_names
     }
 
     def nearest_frame(name, timestamp):
@@ -312,17 +302,11 @@ def save_rgb_mosaic_video(camera_frames, camera_timestamps, path: Path):
         index = int(np.searchsorted(timestamps, timestamp, side="left"))
         if index >= len(timestamps):
             index = len(timestamps) - 1
-        elif (
-            index > 0
-            and timestamp - timestamps[index - 1]
-            <= timestamps[index] - timestamp
-        ):
+        elif index > 0 and timestamp - timestamps[index - 1] <= timestamps[index] - timestamp:
             index -= 1
         return camera_frames[name][index]
 
-    writer = imageio.get_writer(
-        str(path), fps=fps, codec="libx264", quality=8, macro_block_size=1
-    )
+    writer = imageio.get_writer(str(path), fps=fps, codec="libx264", quality=8, macro_block_size=1)
     try:
         for timestamp in timeline:
             canvas = Image.new("RGB", (canvas_width, canvas_height), color=(0, 0, 0))
@@ -330,16 +314,12 @@ def save_rgb_mosaic_video(camera_frames, camera_timestamps, path: Path):
                 frame = rgb_array(nearest_frame(camera_name, timestamp))
                 tile = Image.fromarray(frame, mode="RGB")
                 if tile.size != (tile_width, tile_height):
-                    tile = tile.resize(
-                        (tile_width, tile_height), Image.Resampling.BILINEAR
-                    )
+                    tile = tile.resize((tile_width, tile_height), Image.Resampling.BILINEAR)
                 draw = ImageDraw.Draw(tile)
                 label_box = draw.textbbox((0, 0), camera_name)
                 label_width = label_box[2] - label_box[0]
                 label_height = label_box[3] - label_box[1]
-                draw.rectangle(
-                    (8, 8, 20 + label_width, 18 + label_height), fill=(0, 0, 0)
-                )
+                draw.rectangle((8, 8, 20 + label_width, 18 + label_height), fill=(0, 0, 0))
                 draw.text((14, 12), camera_name, fill=(255, 255, 255))
                 x = (tile_index % 3) * tile_width
                 y = (tile_index // 3) * tile_height

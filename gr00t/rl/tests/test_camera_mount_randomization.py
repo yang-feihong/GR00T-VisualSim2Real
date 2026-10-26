@@ -75,17 +75,12 @@ def test_camera_mount_samples_are_bounded_reproducible_and_non_destructive():
         assert all(0.9 <= value <= 1.1 for value in lens["distortion_relative_scale"])
         assert lens["actual_skew_px"] == 0.0
     assert actual["defaults"]["skew"] == 0.0
-    assert actual["defaults"].get("horizontal_fov") == NOMINAL["defaults"].get(
-        "horizontal_fov"
-    )
+    assert actual["defaults"].get("horizontal_fov") == NOMINAL["defaults"].get("horizontal_fov")
     for camera in actual["cameras"]:
         for key in ("fx", "fy", "cx", "cy"):
             assert camera[key] == float(np.float32(camera[key]))
         assert camera["skew"] == 0.0
-        assert all(
-            value == float(np.float32(value))
-            for value in camera["distortion_coefficients"]
-        )
+        assert all(value == float(np.float32(value)) for value in camera["distortion_coefficients"])
     assert metadata["unsupported_parameters"]["skew"]["requested_nominal_px"] == 0.96231
 
 
@@ -111,10 +106,7 @@ def test_each_camera_owns_an_independent_seeded_stream():
         distortion_relative_fraction=0.10,
     )
     assert full["mount_randomization"] == metadata
-    assert (
-        metadata["samples"]["left_wrist_0_rgb"]
-        == only_wrist["samples"]["left_wrist_0_rgb"]
-    )
+    assert metadata["samples"]["left_wrist_0_rgb"] == only_wrist["samples"]["left_wrist_0_rgb"]
 
 
 def test_diagnostic_camera_is_excluded_from_collection_randomization():
@@ -163,9 +155,9 @@ def test_zero_bounds_preserve_mount_values_exactly():
         assert randomized["skew"] == 0.0
         np.testing.assert_array_equal(
             randomized["distortion_coefficients"],
-            np.asarray(
-                NOMINAL["defaults"]["distortion_coefficients"], dtype=np.float32
-            ).astype(np.float64),
+            np.asarray(NOMINAL["defaults"]["distortion_coefficients"], dtype=np.float32).astype(
+                np.float64
+            ),
         )
 
 

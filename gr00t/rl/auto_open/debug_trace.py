@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
 import json
 import math
+from collections import defaultdict
 from pathlib import Path
+
+import numpy as np
+
+from gr00t.rl.auto_open.geometry import _quat_rotate_np
 
 
 def _finite(value):
@@ -82,7 +86,11 @@ def summarize_acceptance_trace(rows):
         def extremum(rows_to_scan, mode):
             if not rows_to_scan:
                 return None
-            row = min(rows_to_scan, key=lambda item: item["value"]) if mode == "min" else max(rows_to_scan, key=lambda item: item["value"])
+            row = (
+                min(rows_to_scan, key=lambda item: item["value"])
+                if mode == "min"
+                else max(rows_to_scan, key=lambda item: item["value"])
+            )
             return {
                 "value": _finite(row["value"]),
                 "frame_index": int(row["frame_index"]),
@@ -144,3 +152,25 @@ def write_debug_trace(root: Path, acceptance_rows, event_rows):
         encoding="utf-8",
     )
     return summary
+
+
+def apply_pregrasp_metadata(self, candidate):
+    """Commit one selected pitch and its fixed-jaw-anchored target height."""
+    orientation = np.asarray(candidate["orientation"], dtype=np.float32)
+    end_position = np.asarray(candidate["end_position"], dtype=np.float32)
+    self.pregrasp_pitch_deg = float(candidate["pitch_deg"])
+    self.grasp_orientation_quat = orientation.copy()
+    self.reachable_grasp_orientation_quat = orientation.copy()
+    self.grasp_ee_offset_world = _quat_rotate_np(
+        orientation, self.open_template["tip_capture_center"]
+    )
+    for name in (
+        "center_standoff_ee_world",
+        "center_standoff_nominal_world",
+        "center_insert_waypoint_world",
+        "center_insert_nominal_world",
+        "grasp_waypoint_world",
+        "grasp_nominal_world",
+    ):
+        target = getattr(self, name)
+        target[2] = end_position[2]

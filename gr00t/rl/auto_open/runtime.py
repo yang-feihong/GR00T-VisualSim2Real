@@ -10,18 +10,15 @@ from pathlib import Path
 
 import numpy as np
 import torch
-
-from gr00t.rl.envs.door.b2z1_reset_geometry import (
-    b2z1_gripper_pose_and_jacobian,
-)
-from gr00t.rl.third_party.visual_wholebody_lowlevel.legged_gym.utils.batch_invariant_math import (
-    fixed_norm,
-    fixed_normalize,
-)
-
 from legged_gym.scripts.manip_loco_interface import ManipLoco_Policy
-from legged_gym.utils.ee_steady_state import B2Z1SteadyEeForwardModel
+
+from gr00t.rl.auto_open.arm_model import read_arm_joint_limits
 from gr00t.rl.auto_open.cli import LOWLEVEL_ROOT
+from gr00t.rl.auto_open.control import (
+    _approach_base_target,
+    _perturb_base_target,
+)
+from gr00t.rl.auto_open.execution import TensorCommandBuffers
 from gr00t.rl.auto_open.geometry import (
     _batched_geometry_metrics_gpu,
     _batched_panel_finger_clearance_gpu,
@@ -29,21 +26,29 @@ from gr00t.rl.auto_open.geometry import (
     _resolved_door_prim_path,
     initial_approach_clearance_gpu,
 )
-from gr00t.rl.auto_open.lifecycle import reset_controller
 from gr00t.rl.auto_open.io import (
     door_asset_stage_snapshot as _door_asset_stage_snapshot,
+)
+from gr00t.rl.auto_open.io import (
     save_rgb_mosaic_video as _save_rgb_mosaic_video,
+)
+from gr00t.rl.auto_open.io import (
     save_rgb_video as _save_rgb_video,
+)
+from gr00t.rl.auto_open.io import (
     standard_simulation_provenance as _standard_simulation_provenance,
 )
-from gr00t.rl.auto_open.control import (
-    _approach_base_target,
-    _arm_drive_stiffness,
-    _perturb_base_target,
-)
-from gr00t.rl.auto_open.utils import as_numpy as _as_np
-from gr00t.rl.auto_open.tensor_fsm import TensorCommandBuffers, TensorDoorFSM
+from gr00t.rl.auto_open.lifecycle import reset_controller
+from gr00t.rl.auto_open.tensor_fsm import TensorDoorFSM
 from gr00t.rl.auto_open.tensor_planning import TensorPlanningCoordinator
+from gr00t.rl.auto_open.utils import as_numpy as _as_np
+from gr00t.rl.envs.door.b2z1_reset_geometry import (
+    b2z1_gripper_pose_and_jacobian,
+)
+from gr00t.rl.third_party.visual_wholebody_lowlevel.legged_gym.utils.batch_invariant_math import (
+    fixed_norm,
+    fixed_normalize,
+)
 
 
 def _slice_control_state(state, env_id, num_envs):
@@ -60,12 +65,11 @@ def _slice_control_state(state, env_id, num_envs):
             sliced[key] = value
     return sliced
 
+
 def _slice_all_control_states(state, num_envs):
     """Materialize rows for initialization and audit serialization."""
-    return [
-        _slice_control_state(state, env_id, num_envs)
-        for env_id in range(num_envs)
-    ]
+    return [_slice_control_state(state, env_id, num_envs) for env_id in range(num_envs)]
+
 
 def _control_state_to_host(state, num_envs):
     """Copy observations for initialization or output, never online planning."""
@@ -77,15 +81,14 @@ def _control_state_to_host(state, num_envs):
             hosted[key] = value
     return hosted
 
+
 def _target_height_invariant_poses_gpu(root_states, arm_targets):
     """Dataset poses with GPU FK and frame transforms before serialization."""
     roots = root_states.to(dtype=torch.float64)
     position, rotation, _ = b2z1_gripper_pose_and_jacobian(
         roots[:, :3], roots[:, [4, 5, 6, 3]], arm_targets.to(dtype=torch.float64)
     )
-    gripper_to_dataset = roots.new_tensor(
-        ((1.0, 0.0, 0.0), (0.0, 0.0, -1.0), (0.0, 1.0, 0.0))
-    )
+    gripper_to_dataset = roots.new_tensor(((1.0, 0.0, 0.0), (0.0, 0.0, -1.0), (0.0, 1.0, 0.0)))
     w, x, y, z = fixed_normalize(roots[:, 3:7], eps=1.0e-12).unbind(-1)
     yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
     cosine, sine = torch.cos(yaw), torch.sin(yaw)
@@ -100,9 +103,9 @@ def _target_height_invariant_poses_gpu(root_states, arm_targets):
     local_position = (world_to_yaw @ translated.unsqueeze(-1)).squeeze(-1)
     local_position -= roots.new_tensor((0.22, 0.0, 0.7))
     local_rotation = world_to_yaw @ (rotation @ gripper_to_dataset)
-    return torch.cat(
-        (local_rotation[:, :, 0], local_rotation[:, :, 1], local_position), dim=1
-    ).to(dtype=torch.float32)
+    return torch.cat((local_rotation[:, :, 0], local_rotation[:, :, 1], local_position), dim=1).to(
+        dtype=torch.float32
+    )
 
 
 def _write_stage_progress(output_dir, stage_enum, fsm, episode_step, elapsed_s):
@@ -127,9 +130,19 @@ def _write_stage_progress(output_dir, stage_enum, fsm, episode_step, elapsed_s):
 
 
 def _write_batched_episode_result(
-    args, controller, runner, state, env_id, seed, step_count, max_finger_force,
-    max_abs_hinge_speed, initial_root_state, initial_dof_position,
-    initial_policy_observation, first_low_level_action,
+    args,
+    controller,
+    runner,
+    state,
+    env_id,
+    seed,
+    step_count,
+    max_finger_force,
+    max_abs_hinge_speed,
+    initial_root_state,
+    initial_dof_position,
+    initial_policy_observation,
+    first_low_level_action,
 ):
     episode_dir = args.output_dir / f"seed_{seed}"
     episode_dir.mkdir(parents=True, exist_ok=False)
@@ -148,8 +161,7 @@ def _write_batched_episode_result(
         int(record["unreachable_candidates"]) for record in arm_retract_records
     )
     arm_retract_resampled = sum(
-        int(record["rejected_before_acceptance"])
-        for record in arm_retract_records
+        int(record["rejected_before_acceptance"]) for record in arm_retract_records
     )
     metadata = {
         "schema_version": "doorman_boundary_v1",
@@ -164,20 +176,14 @@ def _write_batched_episode_result(
         "target_noise": controller.target_noise.metadata(),
         "arm_retract_randomization": {
             "base_pose_local": controller.arm_retract_pose_local.tolist(),
-            "position_radius_m": float(
-                controller.arm_retract_position_noise_radius_m
-            ),
-            "rotation_bound_deg": float(
-                controller.arm_retract_rotation_noise_deg
-            ),
+            "position_radius_m": float(controller.arm_retract_position_noise_radius_m),
+            "rotation_bound_deg": float(controller.arm_retract_rotation_noise_deg),
             "entries": arm_retract_records,
             "evaluated_candidates": arm_retract_evaluated,
             "unreachable_candidates": arm_retract_unreachable,
             "rejected_before_acceptance": arm_retract_resampled,
             "unreachable_frequency": (
-                arm_retract_unreachable / arm_retract_evaluated
-                if arm_retract_evaluated
-                else 0.0
+                arm_retract_unreachable / arm_retract_evaluated if arm_retract_evaluated else 0.0
             ),
         },
         "camera": {"enabled": False, "names": [], "frame_count": {}},
@@ -209,9 +215,7 @@ def _write_batched_episode_result(
             "summary_only": True,
         },
     }
-    (episode_dir / "metadata.json").write_text(
-        json.dumps(metadata, indent=2), encoding="utf-8"
-    )
+    (episode_dir / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
 
 def _finish_standard_collection(
@@ -229,9 +233,13 @@ def _finish_standard_collection(
     door_asset_snapshot,
 ):
     success = controller.stage.name == "SUCCESS"
-    reasons = () if success else (
-        f"autoopen_failure:{controller.failure_stage or controller.stage.name}:"
-        f"{controller.failure_reason or 'unknown'}",
+    reasons = (
+        ()
+        if success
+        else (
+            f"autoopen_failure:{controller.failure_stage or controller.stage.name}:"
+            f"{controller.failure_reason or 'unknown'}",
+        )
     )
     episode = collector.finish(
         acceptance_reasons=reasons,
@@ -265,14 +273,10 @@ def _finish_standard_collection(
     writer = AutoOpenDatasetWriter(
         dataset_dir,
         camera_calibration=camera_calibration,
-        simulation_provenance=_standard_simulation_provenance(
-            args, runner, episode_seed
-        ),
+        simulation_provenance=_standard_simulation_provenance(args, runner, episode_seed),
     )
     writer.write_episode(episode)
     writer.finalize()
-
-
 
 
 def _run_tensor_fsm_loop(
@@ -310,7 +314,9 @@ def _run_tensor_fsm_loop(
         approach_nominal_yaw=np.asarray([target[1] for target in approach_nominal_targets]),
         terminal_stage=Stage[args.terminal_stage],
         pull_door=args.doorman_door_open_io == "out",
-        pull_panel_contact_baseline=getattr(args, "pull_panel_contact_baseline", "trunk_front_minus10"),
+        pull_panel_contact_baseline=getattr(
+            args, "pull_panel_contact_baseline", "trunk_front_minus10"
+        ),
     )
     buffers = TensorCommandBuffers.from_env(env)
     planner = TensorPlanningCoordinator(controllers, Stage)
@@ -334,16 +340,12 @@ def _run_tensor_fsm_loop(
         (num_envs, env.num_actions), torch.nan, dtype=torch.float32, device=env.device
     )
     loop_started = time.monotonic()
-    last_progress_stages = _write_stage_progress(
-        args.output_dir, Stage, fsm, 0, 0.0
-    )
+    last_progress_stages = _write_stage_progress(args.output_dir, Stage, fsm, 0, 0.0)
     debug_acceptance_rows = [[] for _ in range(num_envs)]
     debug_event_rows = [[] for _ in range(num_envs)]
 
     for step in range(args.max_steps):
-        active = (fsm.stage != int(Stage.SUCCESS)) & (
-            fsm.stage != int(Stage.FAILURE)
-        )
+        active = (fsm.stage != int(Stage.SUCCESS)) & (fsm.stage != int(Stage.FAILURE))
         if not bool(torch.any(active).item()):
             break
         step_counts[active] = step + 1
@@ -358,30 +360,33 @@ def _run_tensor_fsm_loop(
         timing["planning_s"] += time.perf_counter() - planning_start
 
         grasp_rows = torch.where(
-            (fsm.stage == int(Stage.CENTER_HANDLE))
-            | (fsm.stage == int(Stage.GRASP_HANDLE))
+            (fsm.stage == int(Stage.INSERT_AROUND_HANDLE)) | (fsm.stage == int(Stage.GRASP_HANDLE))
         )[0]
         geometry_start = time.perf_counter()
-        grasp_geometry = _batched_geometry_metrics_gpu(
-            device_state,
-            geometry_cache,
-            grasp_rows,
-            as_numpy=False,
-        ) if len(grasp_rows) else None
+        grasp_geometry = (
+            _batched_geometry_metrics_gpu(
+                device_state,
+                geometry_cache,
+                grasp_rows,
+                as_numpy=False,
+            )
+            if len(grasp_rows)
+            else None
+        )
         timing["geometry_gpu_s"] += time.perf_counter() - geometry_start
         panel_rows = torch.where(
-            (fsm.stage == int(Stage.CONTACT_PANEL))
-            | (fsm.stage == int(Stage.PUSH_OPEN))
-            | (fsm.stage == int(Stage.PUSH_ARM_RETRACT))
-            | (fsm.stage == int(Stage.BASE_ADVANCE))
+            (fsm.stage == int(Stage.MOVE_TO_PANEL_STANDOFF))
+            | (fsm.stage == int(Stage.PUSH_PANEL_OPEN))
+            | (fsm.stage == int(Stage.STOW_ARM_AFTER_PUSH))
+            | (fsm.stage == int(Stage.ADVANCE_TO_NEXT_PUSH_STATION))
         )[0]
-        clearance = torch.full(
-            (num_envs,), torch.nan, dtype=torch.float32, device=env.device
-        )
+        clearance = torch.full((num_envs,), torch.nan, dtype=torch.float32, device=env.device)
         if len(panel_rows):
             panel_start = time.perf_counter()
             clearance[panel_rows] = _batched_panel_finger_clearance_gpu(
-                device_state, geometry_cache, panel_rows,
+                device_state,
+                geometry_cache,
+                panel_rows,
                 normal_sign=fsm.panel_contact_normal_sign[panel_rows],
             )
             timing["panel_clearance_backend_s"] += time.perf_counter() - panel_start
@@ -419,13 +424,16 @@ def _run_tensor_fsm_loop(
             capture_env_ids = torch.where(active)[0].detach().cpu().tolist()
             capture_root_states = device_state["root_states"].detach().clone()
             capture_state_host = _control_state_to_host(device_state, num_envs)
-            capture_states = _slice_all_control_states(
-                capture_state_host, num_envs
+            capture_states = _slice_all_control_states(capture_state_host, num_envs)
+            high_batch = (
+                torch.cat(
+                    (buffers.base, buffers.ee_cart, buffers.ee_rpy, buffers.gripper),
+                    dim=1,
+                )
+                .detach()
+                .cpu()
+                .numpy()
             )
-            high_batch = torch.cat(
-                (buffers.base, buffers.ee_cart, buffers.ee_rpy, buffers.gripper),
-                dim=1,
-            ).detach().cpu().numpy()
             inverse_input_world = env.curr_ee_goal_cart_world.detach().clone()
             stages_before_step = fsm.stage.detach().cpu().numpy()
             standard_collectors[0].contact_audit.begin_tick()
@@ -436,9 +444,7 @@ def _run_tensor_fsm_loop(
                     stage_name=Stage(int(stages_before_step[env_id])).name,
                     begin_contact_tick=False,
                 )
-            timing["standard_capture_s"] += (
-                time.perf_counter() - standard_capture_start
-            )
+            timing["standard_capture_s"] += time.perf_counter() - standard_capture_start
 
         physics_start = time.perf_counter()
         result = runner.step_once()
@@ -449,12 +455,15 @@ def _run_tensor_fsm_loop(
             standard_complete_start = time.perf_counter()
             contacts_by_env = standard_collectors[0].contact_audit.end_tick_by_env()
             post_state_host = _control_state_to_host(result["state"], num_envs)
-            post_states = _slice_all_control_states(
-                post_state_host, num_envs
+            post_states = _slice_all_control_states(post_state_host, num_envs)
+            target_poses = (
+                _target_height_invariant_poses_gpu(
+                    capture_root_states, result["state"]["arm_position_target"]
+                )
+                .detach()
+                .cpu()
+                .numpy()
             )
-            target_poses = _target_height_invariant_poses_gpu(
-                capture_root_states, result["state"]["arm_position_target"]
-            ).detach().cpu().numpy()
             inverse_output_world, _, _ = b2z1_gripper_pose_and_jacobian(
                 capture_root_states[:, :3],
                 capture_root_states[:, [4, 5, 6, 3]],
@@ -462,9 +471,7 @@ def _run_tensor_fsm_loop(
             )
             inverse_input_host = inverse_input_world.detach().cpu().numpy()
             inverse_output_host = inverse_output_world.detach().cpu().numpy()
-            joint_modes = (
-                env.teleop_arm_joint_control_mask.detach().cpu().numpy()
-            )
+            joint_modes = env.teleop_arm_joint_control_mask.detach().cpu().numpy()
             for env_id in capture_env_ids:
                 standard_collectors[env_id].complete_after_step(
                     {"state": post_states[env_id]},
@@ -474,58 +481,52 @@ def _run_tensor_fsm_loop(
                     ee_inverse_input_world=inverse_input_host[env_id],
                     ee_inverse_output_world=inverse_output_host[env_id],
                 )
-            timing["standard_complete_s"] += (
-                time.perf_counter() - standard_complete_start
-            )
+            timing["standard_complete_s"] += time.perf_counter() - standard_complete_start
         elif args.record_video:
             manager = runner.rgb_camera_manager
             if manager is None or not manager.enabled:
                 raise RuntimeError("video regression requires enabled RGB cameras")
             timestamp = step * float(env.dt)
             for env_id in torch.where(active)[0].detach().cpu().tolist():
-                images_by_name = manager.render_images(
-                    env_id=env_id, update=False
-                )
+                images_by_name = manager.render_images(env_id=env_id, update=False)
                 for name, images in images_by_name.items():
                     if len(images) != 1:
                         raise RuntimeError(
-                            f"camera {name} returned {len(images)} frames for "
-                            f"environment {env_id}"
+                            f"camera {name} returned {len(images)} frames for environment {env_id}"
                         )
-                    video_frames.setdefault(env_id, {}).setdefault(
-                        name, []
-                    ).append(images[0])
-                    video_timestamps.setdefault(env_id, {}).setdefault(
-                        name, []
-                    ).append(timestamp)
+                    video_frames.setdefault(env_id, {}).setdefault(name, []).append(images[0])
+                    video_timestamps.setdefault(env_id, {}).setdefault(name, []).append(timestamp)
         device_state = result["state"]
         hinge_speed = device_state["door_joint_velocity"][:, fsm.hinge_idx].abs()
         max_hinge_speeds = torch.maximum(max_hinge_speeds, hinge_speed)
 
         grasp_rows = torch.where(
-            (fsm.stage == int(Stage.CENTER_HANDLE))
-            | (fsm.stage == int(Stage.GRASP_HANDLE))
+            (fsm.stage == int(Stage.INSERT_AROUND_HANDLE)) | (fsm.stage == int(Stage.GRASP_HANDLE))
         )[0]
         geometry_start = time.perf_counter()
-        grasp_geometry = _batched_geometry_metrics_gpu(
-            device_state,
-            geometry_cache,
-            grasp_rows,
-            as_numpy=False,
-        ) if len(grasp_rows) else None
+        grasp_geometry = (
+            _batched_geometry_metrics_gpu(
+                device_state,
+                geometry_cache,
+                grasp_rows,
+                as_numpy=False,
+            )
+            if len(grasp_rows)
+            else None
+        )
         timing["geometry_gpu_s"] += time.perf_counter() - geometry_start
         panel_rows = torch.where(
-            (fsm.stage == int(Stage.CONTACT_PANEL))
-            | (fsm.stage == int(Stage.PUSH_OPEN))
-            | (fsm.stage == int(Stage.PUSH_ARM_RETRACT))
-            | (fsm.stage == int(Stage.BASE_ADVANCE))
+            (fsm.stage == int(Stage.MOVE_TO_PANEL_STANDOFF))
+            | (fsm.stage == int(Stage.PUSH_PANEL_OPEN))
+            | (fsm.stage == int(Stage.STOW_ARM_AFTER_PUSH))
+            | (fsm.stage == int(Stage.ADVANCE_TO_NEXT_PUSH_STATION))
         )[0]
-        clearance = torch.full(
-            (num_envs,), torch.nan, dtype=torch.float32, device=env.device
-        )
+        clearance = torch.full((num_envs,), torch.nan, dtype=torch.float32, device=env.device)
         if len(panel_rows):
             clearance[panel_rows] = _batched_panel_finger_clearance_gpu(
-                device_state, geometry_cache, panel_rows,
+                device_state,
+                geometry_cache,
+                panel_rows,
                 normal_sign=fsm.panel_contact_normal_sign[panel_rows],
             )
 
@@ -604,8 +605,14 @@ def _run_tensor_fsm_loop(
             "seeds": [
                 {
                     "seed": int(seed),
-                    "status": "selected" if planned[index] else "failed" if failed[index] else "timeout",
-                    "pitch_deg": float(controllers[index].pregrasp_pitch_deg) if planned[index] else None,
+                    "status": "selected"
+                    if planned[index]
+                    else "failed"
+                    if failed[index]
+                    else "timeout",
+                    "pitch_deg": float(controllers[index].pregrasp_pitch_deg)
+                    if planned[index]
+                    else None,
                     "candidates": getattr(controllers[index], "pregrasp_pitch_diagnostics", None),
                 }
                 for index, seed in enumerate(episode_seeds)
@@ -656,6 +663,7 @@ def _run_tensor_fsm_loop(
         if code >= 100:
             return f"{Stage(origin).name.lower()}_acceptance_timeout"
         return failure_reason_by_code.get(code, f"unknown_failure_code_{code}")
+
     step_counts_np = step_counts.detach().cpu().numpy()
     max_forces_np = max_finger_forces.detach().cpu().numpy()
     max_hinge_np = max_hinge_speeds.detach().cpu().numpy()
@@ -671,14 +679,10 @@ def _run_tensor_fsm_loop(
     if args.debug_trace:
         from gr00t.rl.auto_open.debug_trace import summarize_acceptance_trace
 
-        debug_trace_summaries = [
-            summarize_acceptance_trace(rows) for rows in debug_acceptance_rows
-        ]
+        debug_trace_summaries = [summarize_acceptance_trace(rows) for rows in debug_acceptance_rows]
 
     def acceptance_unmet(condition):
-        return (not condition["current"]) or (
-            condition.get("window_satisfied") is False
-        )
+        return (not condition["current"]) or (condition.get("window_satisfied") is False)
 
     for env_id, controller in enumerate(controllers):
         controller.stage = Stage(int(stages[env_id]))
@@ -691,19 +695,21 @@ def _run_tensor_fsm_loop(
             origin = int(failure_from_stages[env_id])
             code = int(failure_codes[env_id])
             controller.failure_reason = failure_reason(code, origin)
-            controller.failure_stage = (
-                Stage(origin).name if origin else Stage.FAILURE.name
-            )
+            controller.failure_stage = Stage(origin).name if origin else Stage.FAILURE.name
         root = final_state["root_states"][env_id]
-        if fsm.pull_door and int(fsm.stage_visit[env_id, int(Stage.PULL_CLEAR_SWEEP)].item()):
+        if fsm.pull_door and int(fsm.stage_visit[env_id, int(Stage.MOVE_TO_GAP_STATION)].item()):
             controller.last_acceptance_diagnostics["pull_clear_sweep_plan"] = {
                 "target_xy_world_m": fsm.pull_initial_station_xy[env_id].detach().cpu().tolist(),
                 "target_yaw_rad": float(fsm.pull_initial_station_yaw[env_id].item()),
                 "gap_center_xy_world_m": fsm.pull_gap_xy[env_id].detach().cpu().tolist(),
                 "frame_free_boundary_from_hinge_m": float(fsm.pull_frame_edge[env_id].item()),
-                "planned_base_frame_clearance_m": float(fsm.pull_planned_frame_clearance[env_id].item()),
+                "planned_base_frame_clearance_m": float(
+                    fsm.pull_planned_frame_clearance[env_id].item()
+                ),
                 "wall_front_from_hinge_m": float(fsm.pull_wall_front[env_id].item()),
-                "planned_base_wall_clearance_m": float(fsm.pull_planned_wall_clearance[env_id].item()),
+                "planned_base_wall_clearance_m": float(
+                    fsm.pull_planned_wall_clearance[env_id].item()
+                ),
                 "required_wall_clearance_m": fsm.pull_station_config.wall_clearance_m,
                 "extra_planning_margin_m": fsm.pull_station_config.planning_margin_m,
                 "sampling_local_x_range_m": fsm.pull_station_config.first_x_range_m,
@@ -712,7 +718,7 @@ def _run_tensor_fsm_loop(
                 "candidate_planning": fsm.pull_initial_station_history[env_id],
                 "required_clearance_m": fsm.pull_station_config.clearance_m,
             }
-            if int(fsm.stage_visit[env_id, int(Stage.PULL_INSERT)].item()):
+            if int(fsm.stage_visit[env_id, int(Stage.INSERT_INTO_DOOR_GAP)].item()):
                 controller.last_acceptance_diagnostics["pull_panel_result"] = {
                     "cycles": fsm.pull_cycle_history[env_id],
                     "base_stations": fsm.pull_station_history[env_id],
@@ -752,9 +758,7 @@ def _run_tensor_fsm_loop(
                 "base_arrival_planar_speed_m_s": float(np.linalg.norm(root[7:9])),
                 "base_arrival_yaw_rate_rad_s": float(abs(root[12])),
                 "base_arrival_velocity_xyz_m_s": root[7:10].astype(float).tolist(),
-                "base_arrival_angular_velocity_xyz_rad_s": root[10:13]
-                .astype(float)
-                .tolist(),
+                "base_arrival_angular_velocity_xyz_rad_s": root[10:13].astype(float).tolist(),
             }
         )
         successes += int(controller.stage == Stage.SUCCESS)
@@ -775,9 +779,7 @@ def _run_tensor_fsm_loop(
         )
     if args.record_video:
         for env_id, episode_seed in enumerate(episode_seeds):
-            video_dir = (
-                args.output_dir / f"seed_{int(episode_seed)}" / "video"
-            )
+            video_dir = args.output_dir / f"seed_{int(episode_seed)}" / "video"
             video_dir.mkdir(exist_ok=True)
             env_frames = video_frames.get(env_id, {})
             env_timestamps = video_timestamps.get(env_id, {})
@@ -802,10 +804,7 @@ def _run_tensor_fsm_loop(
                 controller=controllers[env_id],
                 runner=runner,
                 episode_seed=episode_seed,
-                dataset_dir=(
-                    Path(args.standard_dataset_dir)
-                    / f"episode-seed{episode_seed}"
-                ),
+                dataset_dir=(Path(args.standard_dataset_dir) / f"episode-seed{episode_seed}"),
                 initial_root_state=initial_root_states[env_id],
                 initial_dof_position=initial_dof_positions[env_id],
                 initial_gripper_position=initial_gripper_positions[env_id],
@@ -816,9 +815,7 @@ def _run_tensor_fsm_loop(
                 from gr00t.rl.auto_open.debug_trace import write_debug_trace
 
                 trace_root = (
-                    Path(args.standard_dataset_dir)
-                    / f"episode-seed{episode_seed}"
-                    / "debug"
+                    Path(args.standard_dataset_dir) / f"episode-seed{episode_seed}" / "debug"
                 )
                 write_debug_trace(
                     trace_root,
@@ -826,17 +823,13 @@ def _run_tensor_fsm_loop(
                     debug_event_rows[env_id],
                 )
         standard_collectors[0].contact_audit.detach()
-        timing["standard_finalize_s"] += (
-            time.perf_counter() - standard_finalize_start
-        )
+        timing["standard_finalize_s"] += time.perf_counter() - standard_finalize_start
         timing.update(
             {
                 f"collector_{name}": float(value)
                 for name, value in {
                     key: sum(float(c.timing.get(key, 0.0)) for c in standard_collectors)
-                    for key in {
-                        key for c in standard_collectors for key in c.timing
-                    }
+                    for key in {key for c in standard_collectors for key in c.timing}
                 }.items()
             }
         )
@@ -866,10 +859,7 @@ def _run_tensor_fsm_loop(
             {
                 "seed": int(episode_seeds[env_id]),
                 "code": int(failure_codes[env_id]),
-                "stage": Stage(
-                    int(failure_from_stages[env_id])
-                    or int(stages[env_id])
-                ).name,
+                "stage": Stage(int(failure_from_stages[env_id]) or int(stages[env_id])).name,
                 "reason": failure_reason(
                     int(failure_codes[env_id]), int(failure_from_stages[env_id])
                 ),
@@ -892,8 +882,14 @@ def _run_tensor_fsm_loop(
             "settle_steps": fsm.panel_contact_settle_steps.detach().cpu().tolist(),
         },
         "push_terminal_diagnostics": {
-            "hinge_rad": device_state["door_joint_position"][:, fsm.hinge_idx].detach().cpu().tolist(),
-            "hinge_speed_rad_s": device_state["door_joint_velocity"][:, fsm.hinge_idx].detach().cpu().tolist(),
+            "hinge_rad": device_state["door_joint_position"][:, fsm.hinge_idx]
+            .detach()
+            .cpu()
+            .tolist(),
+            "hinge_speed_rad_s": device_state["door_joint_velocity"][:, fsm.hinge_idx]
+            .detach()
+            .cpu()
+            .tolist(),
             "command_hinge_rad": fsm.push_command_hinge_angle.detach().cpu().tolist(),
             "start_hinge_rad": fsm.push_start_hinge_angle.detach().cpu().tolist(),
             "ee_actual_world_m": device_state["ee_pos"].detach().cpu().tolist(),
@@ -912,11 +908,11 @@ def _run_tensor_fsm_loop(
                 "path": f"episode-seed{int(episode_seeds[env_id])}/debug/acceptance_trace.jsonl",
             }
             for env_id in range(num_envs)
-        } if args.debug_trace else {},
+        }
+        if args.debug_trace
+        else {},
     }
-    (args.output_dir / "summary.json").write_text(
-        json.dumps(summary, indent=2), encoding="utf-8"
-    )
+    (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
     print(
         "[doorman][batch-timing] "
         + " ".join(f"{name}={value:.3f}" for name, value in timing.items()),
@@ -960,16 +956,12 @@ def _run_batched(args, *, controller_cls, stage_enum):
             raise RuntimeError("configured collection cameras were not initialized")
         configs = getattr(args, "episode_camera_configs", {})
         manager.set_episode_camera_configs(
-            {
-                env_id: configs[int(seed)]
-                for env_id, seed in enumerate(episode_seeds)
-            }
+            {env_id: configs[int(seed)] for env_id, seed in enumerate(episode_seeds)}
         )
     door_handle_paths = [
         str(prim.GetPath())
         for prim in env.sim.stage.Traverse()
-        if prim.GetName() == "door_handle"
-        and str(prim.GetPath()).startswith("/World/envs/")
+        if prim.GetName() == "door_handle" and str(prim.GetPath()).startswith("/World/envs/")
     ]
     print(
         f"[doorman][batch-init] usd_door_handle_count={len(door_handle_paths)} "
@@ -987,12 +979,8 @@ def _run_batched(args, *, controller_cls, stage_enum):
     device_state = runner.get_control_state()
     full_state = _control_state_to_host(device_state, num_envs)
     state_rows = _slice_all_control_states(full_state, num_envs)
-    shared_steady_model = B2Z1SteadyEeForwardModel(
-        LOWLEVEL_ROOT
-        / "resources/robots/b2z1/urdf"
-        / "b2z1.urdf",
-        stiffness=_arm_drive_stiffness(env),
-        emit_tolerance_warnings=not args.summary_only,
+    shared_arm_joint_limits = read_arm_joint_limits(
+        LOWLEVEL_ROOT / "resources/robots/b2z1/urdf" / "b2z1.urdf",
     )
     controllers = []
     shared_robot_geometry = None
@@ -1010,17 +998,14 @@ def _run_batched(args, *, controller_cls, stage_enum):
                 position_only_center=args.position_only_center,
                 disable_push_base_assist=args.disable_push_base_assist,
                 env_id=env_id,
-                shared_steady_model=shared_steady_model,
+                shared_arm_joint_limits=shared_arm_joint_limits,
                 shared_robot_geometry=shared_robot_geometry,
                 target_noise_seed=episode_seeds[env_id],
                 target_noise_config=args.target_noise_config,
                 arm_retract_pose_local=args.arm_retract_pose_local,
-                arm_retract_position_noise_radius_m=(
-                    args.arm_retract_position_noise_radius_m
-                ),
+                arm_retract_position_noise_radius_m=(args.arm_retract_position_noise_radius_m),
                 arm_retract_rotation_noise_deg=args.arm_retract_rotation_noise_deg,
             )
-            controller.defer_batched_orientation_delta = True
             reset_controller(
                 controller,
                 state=sliced_state,
@@ -1032,9 +1017,8 @@ def _run_batched(args, *, controller_cls, stage_enum):
                 shared_robot_geometry = controller.center_geometry
     geometry_cache = _make_batched_geometry_cache(controllers, env.device)
 
-    # DoorController.reset() measures the open-jaw geometry and then closes
-    # the jaw before a scalar episode starts.  Do that once for the complete
-    # vectorized batch so every environment has the same initial semantics.
+    # Initialization measures open-jaw geometry. Close the complete batch
+    # before starting control so all environments share the same semantics.
     gripper_joint_id = int(env.gripper_joint_ids[0].item())
     joint_pos = env.robot.data.joint_pos.clone()
     joint_vel = env.robot.data.joint_vel.clone()
@@ -1055,16 +1039,22 @@ def _run_batched(args, *, controller_cls, stage_enum):
     initial_policy_observations = _as_np(runner.obs).copy()
     approach_clearance = initial_approach_clearance_gpu(device_state, geometry_cache)
     station_xy = torch.as_tensor(np.stack([c.station_xy for c in controllers]), device=env.device)
-    station_xy = station_xy + ((approach_clearance['approach_distance_m'] - .85)[:, None]
-                              * geometry_cache['door_normal'][:, :2]).to(station_xy.dtype)
+    station_xy = station_xy + (
+        (approach_clearance["approach_distance_m"] - 0.85)[:, None]
+        * geometry_cache["door_normal"][:, :2]
+    ).to(station_xy.dtype)
     # Materialize initialization metadata once; geometry and target math stay on GPU.
-    clearance_host = {name: value.detach().cpu().tolist() for name, value in approach_clearance.items()}
+    clearance_host = {
+        name: value.detach().cpu().tolist() for name, value in approach_clearance.items()
+    }
     stations_host = station_xy.detach().cpu().numpy()
     for env_id, controller in enumerate(controllers):
-        controller.initial_approach_clearance = {name: value[env_id] for name, value in clearance_host.items()}
-        controller.approach_distance = clearance_host['approach_distance_m'][env_id]
+        controller.initial_approach_clearance = {
+            name: value[env_id] for name, value in clearance_host.items()
+        }
+        controller.approach_distance = clearance_host["approach_distance_m"][env_id]
         controller.station_xy = stations_host[env_id].copy()
-    # panel_station_xy is a later-stage target; this rule is APPROACH-only.
+    # panel_station_xy is a later-stage target; this rule is APPROACH_HANDLE-only.
     standard_collectors = []
     standard_door_randomizations = []
     standard_door_asset_snapshots = []
@@ -1079,18 +1069,14 @@ def _run_batched(args, *, controller_cls, stage_enum):
         contact_audit = SubstepContactAudit.create(env)
         contact_audit.attach()
         for env_id, episode_seed in enumerate(episode_seeds):
-            shard_dir = (
-                Path(args.standard_dataset_dir) / f"episode-seed{episode_seed}"
-            )
+            shard_dir = Path(args.standard_dataset_dir) / f"episode-seed{episode_seed}"
             standard_collectors.append(
                 AutoOpenStandardEpisodeCollector(
                     runner,
                     controllers[env_id],
                     episode_index=0,
                     seed=episode_seed,
-                    video_staging_root=(
-                        shard_dir / ".staging" / "episode_000000"
-                    ),
+                    video_staging_root=(shard_dir / ".staging" / "episode_000000"),
                     capture_images=args.collection_camera_mode != "none",
                     camera_mode=args.collection_camera_mode,
                     env_id=env_id,
@@ -1098,12 +1084,8 @@ def _run_batched(args, *, controller_cls, stage_enum):
                     debug_diagnostics=args.debug_trace,
                 )
             )
-            door_prim = env.sim.stage.GetPrimAtPath(
-                _resolved_door_prim_path(env, env_id)
-            )
-            standard_door_randomizations.append(
-                dict(door_prim.GetMetadata("customData") or {})
-            )
+            door_prim = env.sim.stage.GetPrimAtPath(_resolved_door_prim_path(env, env_id))
+            standard_door_randomizations.append(dict(door_prim.GetMetadata("customData") or {}))
             standard_door_asset_snapshots.append(
                 _door_asset_stage_snapshot(env.sim.stage, door_prim)
             )
@@ -1115,14 +1097,10 @@ def _run_batched(args, *, controller_cls, stage_enum):
         flush=True,
     )
 
-    approach_nominal_targets = [
-        _approach_base_target(controller) for controller in controllers
-    ]
+    approach_nominal_targets = [_approach_base_target(controller) for controller in controllers]
     approach_command_targets = [
         _perturb_base_target(controller, "approach", *target)
-        for controller, target in zip(
-            controllers, approach_nominal_targets, strict=True
-        )
+        for controller, target in zip(controllers, approach_nominal_targets, strict=True)
     ]
     if controller_stdout is not None:
         controller_stdout.close()

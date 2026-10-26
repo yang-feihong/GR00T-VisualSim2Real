@@ -28,9 +28,7 @@ def _scalar_delta(jacobian, pose_error, joint_position, joint_limits, damping):
             break
         violating = indices[below | above]
         values = candidate[below | above]
-        delta[violating] = np.where(
-            values < lower[violating], lower[violating], upper[violating]
-        )
+        delta[violating] = np.where(values < lower[violating], lower[violating], upper[violating])
         free[violating] = False
     return delta
 
@@ -65,9 +63,7 @@ def test_batch_size_one_uses_identical_tensor_semantics():
     positions = torch.as_tensor(rng.uniform(-0.9, 0.9, size=(1, 6)), dtype=torch.float64)
     limits = torch.tensor([[-1.0, 1.0]] * 6, dtype=torch.float64)
 
-    single = batched_constrained_dls_delta(
-        jacobian, pose_error, positions, limits, 0.05
-    )
+    single = batched_constrained_dls_delta(jacobian, pose_error, positions, limits, 0.05)
     repeated = batched_constrained_dls_delta(
         jacobian.repeat(7, 1, 1),
         pose_error.repeat(7, 1),
@@ -81,22 +77,14 @@ def test_batch_size_one_uses_identical_tensor_semantics():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
 def test_cuda_result_is_exactly_independent_of_batch_shape():
     generator = torch.Generator(device="cuda").manual_seed(1702)
-    jacobian = torch.randn(
-        1, 6, 6, generator=generator, device="cuda", dtype=torch.float32
-    )
-    pose_error = torch.randn(
-        1, 6, generator=generator, device="cuda", dtype=torch.float32
-    )
+    jacobian = torch.randn(1, 6, 6, generator=generator, device="cuda", dtype=torch.float32)
+    pose_error = torch.randn(1, 6, generator=generator, device="cuda", dtype=torch.float32)
     positions = (
-        torch.rand(1, 6, generator=generator, device="cuda", dtype=torch.float32)
-        * 1.8
-        - 0.9
+        torch.rand(1, 6, generator=generator, device="cuda", dtype=torch.float32) * 1.8 - 0.9
     )
     limits = torch.tensor([[-1.0, 1.0]] * 6, device="cuda", dtype=torch.float32)
 
-    single = batched_constrained_dls_delta(
-        jacobian, pose_error, positions, limits, 0.05
-    )
+    single = batched_constrained_dls_delta(jacobian, pose_error, positions, limits, 0.05)
     repeated = batched_constrained_dls_delta(
         jacobian.repeat(7, 1, 1),
         pose_error.repeat(7, 1),

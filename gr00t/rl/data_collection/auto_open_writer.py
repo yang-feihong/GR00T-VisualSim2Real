@@ -98,12 +98,12 @@ HANDLE_CONTACT_STAGES = frozenset(
     {
         "GRASP_HANDLE",
         "PRESS_HANDLE",
-        "PUSH_PULL_DOOR",
-        "RETURN_HANDLE",
-        "OPEN_AND_CLEAR",
+        "OPEN_DOOR_WITH_HANDLE",
+        "RESET_HANDLE",
+        "RELEASE_HANDLE",
     }
 )
-PANEL_CONTACT_STAGES = frozenset({"PUSH_OPEN", "PUSH_ARM_RETRACT", "PULL_INSERT", "PULL_OPEN", "PULL_ARM_RETRACT"})
+PANEL_CONTACT_STAGES = frozenset({"PUSH_PANEL_OPEN", "STOW_ARM_AFTER_PUSH", "INSERT_INTO_DOOR_GAP", "PRY_DOOR_OPEN", "STOW_ARM_AFTER_PULL"})
 
 
 @dataclass
@@ -734,7 +734,7 @@ def _physical_acceptance_reasons(episode, boundary):
         audit["gripper_target_dispatched"], dtype=np.float64
     )
     stage2_entries = np.flatnonzero(
-        (stages[1:] == "PREGRASP") & (stages[:-1] == "APPROACH")
+        (stages[1:] == "MOVE_TO_PREGRASP") & (stages[:-1] == "APPROACH_HANDLE")
     ) + 1
     if len(stage2_entries) != 1:
         reasons.append(f"stage2_entry_count:{len(stage2_entries)}")
@@ -772,7 +772,7 @@ def _physical_acceptance_reasons(episode, boundary):
             f"joint={first['component'] + 1},jump={first['jump']:.6f}"
         )
     grasp_hold = np.isin(
-        stages, ("GRASP_HANDLE", "PRESS_HANDLE", "PUSH_PULL_DOOR")
+        stages, ("GRASP_HANDLE", "PRESS_HANDLE", "OPEN_DOOR_WITH_HANDLE")
     )
     if np.any(np.abs(gripper_dispatched[grasp_hold]) > 1.0e-6):
         reasons.append("grasp_hold_high_level_target_not_zero")
@@ -998,7 +998,7 @@ def _episode_acceptance_metrics(episode, boundary, reasons):
     }
     target_steps = np.abs(np.diff(arm_targets, axis=0)) if frames > 1 else np.zeros((0, 6))
     stage2_entries = np.flatnonzero(
-        (stages[1:] == "PREGRASP") & (stages[:-1] == "APPROACH")
+        (stages[1:] == "MOVE_TO_PREGRASP") & (stages[:-1] == "APPROACH_HANDLE")
     ) + 1
     stage2_entry = int(stage2_entries[0]) if len(stage2_entries) == 1 else None
     terminal_slice = slice(max(0, frames - CONTROL_HZ), frames)

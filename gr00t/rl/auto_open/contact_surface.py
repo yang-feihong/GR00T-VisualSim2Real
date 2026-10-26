@@ -41,7 +41,9 @@ def separating_rear_contact(
     distance_sq = torch.where(inside, signed.square() / normal_sq, torch.inf)
     for start, end in ((a, b), (b, c), (c, a)):
         edge = end - start
-        fraction = (fixed_dot(point - start, edge) / fixed_dot(edge, edge).clamp_min(1e-20)).clamp(0, 1)
+        fraction = (fixed_dot(point - start, edge) / fixed_dot(edge, edge).clamp_min(1e-20)).clamp(
+            0, 1
+        )
         delta = point - (start + fraction[..., None] * edge)
         distance_sq = torch.minimum(distance_sq, fixed_dot(delta, delta))
     distance = torch.sqrt(distance_sq.clamp_min(0))

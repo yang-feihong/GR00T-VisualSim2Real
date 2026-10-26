@@ -5,7 +5,8 @@ from types import ModuleType, SimpleNamespace
 
 import torch
 
-from gr00t.rl.auto_open.tensor_fsm import PaddedPathBank, TensorDoorFSM
+from gr00t.rl.auto_open.motion_targets import PaddedPathBank
+from gr00t.rl.auto_open.tensor_fsm import TensorDoorFSM
 from legged_gym.envs.manip_loco.training_doorman_scene import (
     build_training_doorman_door_cfg,
 )
@@ -50,9 +51,7 @@ def test_pull_direction_is_applied_to_every_door_asset(monkeypatch):
     }
     monkeypatch.setitem(sys.modules, module_name, module)
 
-    result = build_training_doorman_door_cfg(
-        2, door_open_lr="right", door_open_io="out"
-    )
+    result = build_training_doorman_door_cfg(2, door_open_lr="right", door_open_io="out")
 
     assert result.prim_path == "/World/envs/env_.*/door"
     assert [asset.door_open_lr for asset in result.spawn.assets_cfg] == [
@@ -71,9 +70,7 @@ def _turn_gap_endpoint_x(hinge_axis_sign: float) -> tuple[float, float]:
     fsm.stage_steps = torch.zeros(1, dtype=torch.int32)
     fsm.hinge_idx = 0
     fsm.turn_start_hinge_angle = torch.zeros(1)
-    fsm.turn_target_hinge_angle = torch.tensor(
-        [hinge_axis_sign * math.radians(6.0)]
-    )
+    fsm.turn_target_hinge_angle = torch.tensor([hinge_axis_sign * math.radians(6.0)])
     fsm.hinge_axis_sign = torch.tensor([hinge_axis_sign])
     fsm.turn_handle_axis_world = torch.tensor([[0.0, 1.0, 0.0]])
     fsm.turn_grasp_orientation = torch.tensor([[1.0, 0.0, 0.0, 0.0]])
@@ -108,8 +105,8 @@ def test_pull_hinge_sign_reverses_turn_path_toward_robot_side():
 
 def test_restore_completion_can_be_the_terminal_stage():
     fsm = TensorDoorFSM.__new__(TensorDoorFSM)
-    fsm.Stage = SimpleNamespace(RESTORE_GRIPPER=10, PULL_ARM_RETRACT=23, SUCCESS=17)
-    fsm.terminal_stage = fsm.Stage.RESTORE_GRIPPER
+    fsm.Stage = SimpleNamespace(STOW_ARM_AND_CLOSE_GRIPPER=10, STOW_ARM_AFTER_PULL=23, SUCCESS=17)
+    fsm.terminal_stage = fsm.Stage.STOW_ARM_AND_CLOSE_GRIPPER
     fsm.device = torch.device("cpu")
     fsm.stage = torch.tensor([10], dtype=torch.int64)
     fsm.stage_steps = torch.tensor([50], dtype=torch.int32)
@@ -130,7 +127,7 @@ def test_restore_completion_can_be_the_terminal_stage():
         "ee_orn": torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
     }
 
-    completed = fsm.advance_restore(state)
+    completed = fsm.advance_stow_arm_and_close_gripper(state)
 
     assert completed.tolist() == [0]
     assert fsm.stage.tolist() == [17]

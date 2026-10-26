@@ -8,17 +8,13 @@ from gr00t.rl.data_collection.auto_open_collector import (
 
 
 def _collector(*, joint_mode=True):
-    collector = AutoOpenStandardEpisodeCollector.__new__(
-        AutoOpenStandardEpisodeCollector
-    )
+    collector = AutoOpenStandardEpisodeCollector.__new__(AutoOpenStandardEpisodeCollector)
     collector.env = SimpleNamespace(
         teleop_arm_joint_control_mask=np.asarray([joint_mode], dtype=bool)
     )
     collector.env_id = 0
     collector.controller = SimpleNamespace(
-        middle_arm_joint_target=np.asarray(
-            [-1.57, 1.60, -0.63, -1.10, 0.0, 0.0], dtype=np.float32
-        )
+        middle_arm_joint_target=np.asarray([-1.57, 1.60, -0.63, -1.10, 0.0, 0.0], dtype=np.float32)
     )
     collector.arm_indices = np.arange(6, dtype=np.int64)
     collector._middle_preset_interval = False
@@ -61,9 +57,10 @@ def test_middle_preset_motion_is_reset():
     middle = collector.controller.middle_arm_joint_target
 
     assert collector._mode_flags(_snapshot(middle + 0.10), middle) == (False, True)
-    assert collector._mode_flags(
-        _snapshot(middle, velocity=np.full(6, 0.10)), middle
-    ) == (False, True)
+    assert collector._mode_flags(_snapshot(middle, velocity=np.full(6, 0.10)), middle) == (
+        False,
+        True,
+    )
 
 
 def test_settled_middle_preset_is_inactive():
@@ -81,6 +78,7 @@ def test_middle_preset_reset_completion_is_latched_across_velocity_noise():
     for _ in range(9):
         assert collector._mode_flags(_snapshot(middle), middle) == (False, True)
     assert collector._mode_flags(_snapshot(middle), middle) == (True, False)
-    assert collector._mode_flags(
-        _snapshot(middle, velocity=np.full(6, 0.20)), middle
-    ) == (True, False)
+    assert collector._mode_flags(_snapshot(middle, velocity=np.full(6, 0.20)), middle) == (
+        True,
+        False,
+    )

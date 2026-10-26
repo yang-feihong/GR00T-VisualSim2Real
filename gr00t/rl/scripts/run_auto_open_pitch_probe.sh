@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Dedicated debug entry for reporting production PREGRASP pitch selection.
+# Dedicated debug entry for reporting production MOVE_TO_PREGRASP pitch selection.
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 ENTRY="${REPO_ROOT}/gr00t/rl/scripts/doorman_auto_open.py"
 PITCH_PROBE_SEEDS="${PITCH_PROBE_SEEDS:-1700,1701,1702,1703}"
@@ -42,7 +42,7 @@ CUDA_VISIBLE_DEVICES="${PITCH_PROBE_GPU}" python "${ENTRY}" \
     --summary_only \
     --collection_camera_mode none \
     --doorman_door_open_io out \
-    --terminal_stage RESTORE_GRIPPER \
+    --terminal_stage STOW_ARM_AND_CLOSE_GRIPPER \
     --pitch_probe_output "${PITCH_PROBE_OUTPUT}" \
     --output_dir "${PITCH_PROBE_RUN_DIR}" \
     >"${PITCH_PROBE_LOG}" 2>&1

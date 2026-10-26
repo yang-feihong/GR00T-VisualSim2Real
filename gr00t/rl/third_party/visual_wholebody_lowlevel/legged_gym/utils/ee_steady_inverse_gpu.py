@@ -9,7 +9,6 @@ import torch
 from gr00t.rl.envs.door.b2z1_reset_geometry import (
     b2z1_gripper_pose_and_jacobian,
 )
-from .constrained_ik import batched_constrained_dls_delta
 
 
 @dataclass(frozen=True)
@@ -40,34 +39,56 @@ def _matrix_to_quaternion_wxyz(rotation: torch.Tensor) -> torch.Tensor:
         candidates.gather(-1, index.unsqueeze(-1)).squeeze(-1).clamp_min(1.0e-12)
     )
     rows = (
-        torch.stack((1.0 + m00 + m11 + m22, rotation[..., 2, 1] - rotation[..., 1, 2], rotation[..., 0, 2] - rotation[..., 2, 0], rotation[..., 1, 0] - rotation[..., 0, 1]), dim=-1),
-        torch.stack((rotation[..., 2, 1] - rotation[..., 1, 2], 1.0 + m00 - m11 - m22, rotation[..., 0, 1] + rotation[..., 1, 0], rotation[..., 0, 2] + rotation[..., 2, 0]), dim=-1),
-        torch.stack((rotation[..., 0, 2] - rotation[..., 2, 0], rotation[..., 0, 1] + rotation[..., 1, 0], 1.0 - m00 + m11 - m22, rotation[..., 1, 2] + rotation[..., 2, 1]), dim=-1),
-        torch.stack((rotation[..., 1, 0] - rotation[..., 0, 1], rotation[..., 0, 2] + rotation[..., 2, 0], rotation[..., 1, 2] + rotation[..., 2, 1], 1.0 - m00 - m11 + m22), dim=-1),
+        torch.stack(
+            (
+                1.0 + m00 + m11 + m22,
+                rotation[..., 2, 1] - rotation[..., 1, 2],
+                rotation[..., 0, 2] - rotation[..., 2, 0],
+                rotation[..., 1, 0] - rotation[..., 0, 1],
+            ),
+            dim=-1,
+        ),
+        torch.stack(
+            (
+                rotation[..., 2, 1] - rotation[..., 1, 2],
+                1.0 + m00 - m11 - m22,
+                rotation[..., 0, 1] + rotation[..., 1, 0],
+                rotation[..., 0, 2] + rotation[..., 2, 0],
+            ),
+            dim=-1,
+        ),
+        torch.stack(
+            (
+                rotation[..., 0, 2] - rotation[..., 2, 0],
+                rotation[..., 0, 1] + rotation[..., 1, 0],
+                1.0 - m00 + m11 - m22,
+                rotation[..., 1, 2] + rotation[..., 2, 1],
+            ),
+            dim=-1,
+        ),
+        torch.stack(
+            (
+                rotation[..., 1, 0] - rotation[..., 0, 1],
+                rotation[..., 0, 2] + rotation[..., 2, 0],
+                rotation[..., 1, 2] + rotation[..., 2, 1],
+                1.0 - m00 - m11 + m22,
+            ),
+            dim=-1,
+        ),
     )
-    quaternion = torch.stack(rows, dim=-2).gather(
-        -2, index[..., None, None].expand(*index.shape, 1, 4)
-    ).squeeze(-2)
+    quaternion = (
+        torch.stack(rows, dim=-2)
+        .gather(-2, index[..., None, None].expand(*index.shape, 1, 4))
+        .squeeze(-2)
+    )
     quaternion = quaternion * scale.unsqueeze(-1)
-    quaternion = quaternion / torch.linalg.vector_norm(
-        quaternion, dim=-1, keepdim=True
-    ).clamp_min(1.0e-12)
+    quaternion = quaternion / torch.linalg.vector_norm(quaternion, dim=-1, keepdim=True).clamp_min(
+        1.0e-12
+    )
     return torch.where(quaternion[..., :1] < 0.0, -quaternion, quaternion)
 
 
-def _quaternion_nlerp_wxyz(
-    start: torch.Tensor, end: torch.Tensor, fraction: torch.Tensor
-) -> torch.Tensor:
-    end = torch.where((start * end).sum(dim=-1, keepdim=True) < 0.0, -end, end)
-    result = start + fraction.unsqueeze(-1) * (end - start)
-    return result / torch.linalg.vector_norm(result, dim=-1, keepdim=True).clamp_min(
-        1.0e-12
-    )
-
-
-def _quaternion_multiply_wxyz(
-    left: torch.Tensor, right: torch.Tensor
-) -> torch.Tensor:
+def _quaternion_multiply_wxyz(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
     w1, x1, y1, z1 = left.unbind(dim=-1)
     w2, x2, y2, z2 = right.unbind(dim=-1)
     return torch.stack(
@@ -81,51 +102,13 @@ def _quaternion_multiply_wxyz(
     )
 
 
-def _cpu_orientation_error_and_jacobian(
-    desired_orientation: torch.Tensor,
-    current_rotation: torch.Tensor,
-    angular_jacobian: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Return the CPU inverse quaternion residual and its command Jacobian."""
-    current_orientation = _matrix_to_quaternion_wxyz(current_rotation)
-    current_conjugate = current_orientation.clone()
-    current_conjugate[..., 1:] *= -1.0
-    relative = _quaternion_multiply_wxyz(
-        desired_orientation, current_conjugate
-    )
-    relative = torch.where(relative[..., :1] < 0.0, -relative, relative)
-    scalar = relative[..., 0]
-    vector = relative[..., 1:]
-
-    vx, vy, vz = vector.unbind(dim=-1)
-    zero = torch.zeros_like(vx)
-    skew = torch.stack(
-        (
-            zero, -vz, vy,
-            vz, zero, -vx,
-            -vy, vx, zero,
-        ),
-        dim=-1,
-    ).reshape(*vector.shape[:-1], 3, 3)
-    identity = torch.eye(
-        3, dtype=vector.dtype, device=vector.device
-    ).expand(*vector.shape[:-1], 3, 3)
-    command_jacobian = 0.5 * torch.matmul(
-        scalar[..., None, None] * identity + skew,
-        angular_jacobian,
-    )
-    return vector, command_jacobian
-
-
-def _cpu_orientation_error(
+def _orientation_error(
     desired_orientation: torch.Tensor, current_rotation: torch.Tensor
 ) -> torch.Tensor:
     current_orientation = _matrix_to_quaternion_wxyz(current_rotation)
     current_conjugate = current_orientation.clone()
     current_conjugate[..., 1:] *= -1.0
-    relative = _quaternion_multiply_wxyz(
-        desired_orientation, current_conjugate
-    )
+    relative = _quaternion_multiply_wxyz(desired_orientation, current_conjugate)
     relative = torch.where(relative[..., :1] < 0.0, -relative, relative)
     return relative[..., 1:]
 
@@ -155,8 +138,9 @@ def batched_steady_ee_inverse_no_gravity(
     ).clamp_min(1.0e-12)
     if not desired_position_world.is_cuda:
         raise ValueError("steady GPU inverse requires CUDA inputs")
-    from .ee_steady_inverse_kernel import steady_inverse_kernel
     import warp as wp
+
+    from .ee_steady_inverse_kernel import steady_inverse_kernel
 
     count = len(initial_arm_joint_positions)
     limits = joint_limits
@@ -167,8 +151,12 @@ def batched_steady_ee_inverse_no_gravity(
     values = [
         value.to(dtype=torch.float64).contiguous()
         for value in (
-            desired_position_world, desired_orientation, base_position_world,
-            base_orientation_world_xyzw, initial_arm_joint_positions, limits,
+            desired_position_world,
+            desired_orientation,
+            base_position_world,
+            base_orientation_world_xyzw,
+            initial_arm_joint_positions,
+            limits,
         )
     ]
     solved = torch.empty_like(values[4])
@@ -179,9 +167,12 @@ def batched_steady_ee_inverse_no_gravity(
             dim=count,
             inputs=[
                 *[wp.from_torch(value) for value in values],
-                continuation_position_step_m, continuation_orientation_step_rad,
-                ik_damping, iterations_per_waypoint,
-                wp.from_torch(solved), wp.from_torch(iterations),
+                continuation_position_step_m,
+                continuation_orientation_step_rad,
+                ik_damping,
+                iterations_per_waypoint,
+                wp.from_torch(solved),
+                wp.from_torch(iterations),
             ],
             stream=wp.stream_from_torch(torch.cuda.current_stream(solved.device)),
         )
@@ -192,12 +183,9 @@ def batched_steady_ee_inverse_no_gravity(
     )
     orientation = _matrix_to_quaternion_wxyz(rotation)
     position_error = position - desired_position_world
-    orientation_error = _cpu_orientation_error(desired_orientation, rotation)
-    exact = (
-        torch.linalg.vector_norm(position_error, dim=-1) <= position_tolerance_m
-    ) & (
-        torch.linalg.vector_norm(orientation_error, dim=-1)
-        <= orientation_tolerance
+    orientation_error = _orientation_error(desired_orientation, rotation)
+    exact = (torch.linalg.vector_norm(position_error, dim=-1) <= position_tolerance_m) & (
+        torch.linalg.vector_norm(orientation_error, dim=-1) <= orientation_tolerance
     )
     return BatchedSteadyEeInverseResult(
         command_position_world=position,

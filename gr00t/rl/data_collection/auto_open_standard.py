@@ -385,31 +385,31 @@ class BoundaryResult:
 
 AUTOOPEN_HANDLE_PRESS_STAGES = frozenset(
     {
-        "PREGRASP",
+        "MOVE_TO_PREGRASP",
         "OPEN_GRIPPER",
-        "CENTER_HANDLE",
+        "INSERT_AROUND_HANDLE",
         "GRASP_HANDLE",
         "PRESS_HANDLE",
-        "PUSH_PULL_DOOR",
-        "RETURN_HANDLE",
-        "OPEN_AND_CLEAR",
-        "RETREAT_ARM",
-        "RESTORE_GRIPPER",
+        "OPEN_DOOR_WITH_HANDLE",
+        "RESET_HANDLE",
+        "RELEASE_HANDLE",
+        "WITHDRAW_FROM_HANDLE",
+        "STOW_ARM_AND_CLOSE_GRIPPER",
     }
 )
 AUTOOPEN_TRAVERSAL_STAGES = frozenset(
     {
-        "PULL_CLEAR_SWEEP",
-        "PULL_INSERT",
-        "PULL_OPEN",
-        "PULL_ARM_RETRACT",
-        "PULL_BASE_ADVANCE",
-        "ALIGN_PANEL",
-        "CONTACT_PANEL",
-        "PUSH_OPEN",
-        "PUSH_ARM_RETRACT",
-        "BASE_ADVANCE",
-        "THROUGH",
+        "MOVE_TO_GAP_STATION",
+        "INSERT_INTO_DOOR_GAP",
+        "PRY_DOOR_OPEN",
+        "STOW_ARM_AFTER_PULL",
+        "FOLLOW_WALL_TO_PANEL",
+        "MOVE_TO_PANEL_STATION",
+        "MOVE_TO_PANEL_STANDOFF",
+        "PUSH_PANEL_OPEN",
+        "STOW_ARM_AFTER_PUSH",
+        "ADVANCE_TO_NEXT_PUSH_STATION",
+        "PASS_THROUGH_DOORWAY",
         "SUCCESS",
     }
 )
@@ -417,7 +417,7 @@ AUTOOPEN_TRAVERSAL_STAGES = frozenset(
 
 def physical_phase_for_autoopen_stage(stage_name: str) -> str:
     """Map the authoritative AutoOpen FSM stage to the three data phases."""
-    if stage_name == "APPROACH":
+    if stage_name == "APPROACH_HANDLE":
         return "approach"
     if stage_name in AUTOOPEN_HANDLE_PRESS_STAGES:
         return "handle_press"

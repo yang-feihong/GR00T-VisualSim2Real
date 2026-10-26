@@ -88,12 +88,8 @@ def test_shared_grasp_sample_preserves_relative_path_geometry():
     start_position = np.array([1.0, 2.0, 3.0])
     end_position = np.array([1.1, 2.0, 3.0])
     orientation = np.array([1.0, 0.0, 0.0, 0.0])
-    perturbed_start = noise.perturb_pose(
-        "grasp_chain", start_position, orientation, **kwargs
-    )
-    perturbed_end = noise.perturb_pose(
-        "grasp_chain", end_position, orientation, **kwargs
-    )
+    perturbed_start = noise.perturb_pose("grasp_chain", start_position, orientation, **kwargs)
+    perturbed_end = noise.perturb_pose("grasp_chain", end_position, orientation, **kwargs)
     np.testing.assert_allclose(
         perturbed_end[0] - perturbed_start[0],
         end_position - start_position,
@@ -113,9 +109,7 @@ def test_shared_pose_sample_is_remapped_into_each_candidate_frame():
     )
     orientation = np.array([1.0, 0.0, 0.0, 0.0])
     first_axes = np.eye(3)
-    second_axes = np.array(
-        [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]]
-    )
+    second_axes = np.array([[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]])
     kwargs = dict(
         position_bounds=(0.0, 0.0, 0.002),
         rotation_bounds=(0.0, 0.0, 0.0),
@@ -123,15 +117,9 @@ def test_shared_pose_sample_is_remapped_into_each_candidate_frame():
         rotation_names=("roll_rad", "tilt_h_rad", "tilt_z_rad"),
     )
     origin = np.zeros(3)
-    first, _ = noise.perturb_pose(
-        "grasp_chain", origin, orientation, first_axes, **kwargs
-    )
-    second, _ = noise.perturb_pose(
-        "grasp_chain", origin, orientation, second_axes, **kwargs
-    )
-    closing_delta = noise.metadata()["samples"]["pose:grasp_chain"][
-        "closing_m_delta"
-    ]
+    first, _ = noise.perturb_pose("grasp_chain", origin, orientation, first_axes, **kwargs)
+    second, _ = noise.perturb_pose("grasp_chain", origin, orientation, second_axes, **kwargs)
+    closing_delta = noise.metadata()["samples"]["pose:grasp_chain"]["closing_m_delta"]
     np.testing.assert_allclose(first, first_axes[:, 2] * closing_delta)
     np.testing.assert_allclose(second, second_axes[:, 2] * closing_delta)
 
@@ -156,9 +144,7 @@ def test_semantic_labels_have_independent_random_streams():
     orientation = np.array([1.0, 0.0, 0.0, 0.0])
 
     grasp_first = EpisodeTargetNoise(seed=1703)
-    grasp_first.perturb_pose(
-        "grasp_chain", position, orientation, **pose_kwargs
-    )
+    grasp_first.perturb_pose("grasp_chain", position, orientation, **pose_kwargs)
     panel_after_grasp = grasp_first.perturb_pose(
         "panel_push_chain", position, orientation, **pose_kwargs
     )

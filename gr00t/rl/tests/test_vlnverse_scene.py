@@ -50,9 +50,7 @@ def test_scene_selection_is_deterministic_and_batch_prefix_stable(tmp_path):
     records = discover_vlnverse_scenes(tmp_path)
     short = select_vlnverse_scenes(records, 3, seed=73)
     long = select_vlnverse_scenes(records, 12, seed=73)
-    assert [record.scene_id for record in short] == [
-        record.scene_id for record in long[:3]
-    ]
+    assert [record.scene_id for record in short] == [record.scene_id for record in long[:3]]
     assert len({record.scene_id for record in long[:5]}) == 5
     assert [record.scene_id for record in long] == [
         record.scene_id for record in select_vlnverse_scenes(records, 12, seed=73)

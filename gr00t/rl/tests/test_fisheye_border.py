@@ -12,8 +12,13 @@ from gr00t.rl.data_collection.fisheye_border import FisheyeBorderAugmenter, STYL
 
 
 SPEC = {
-    "projection_type": "opencvFisheye", "width": 80, "height": 60,
-    "fx": 33.0, "fy": 34.0, "cx": 41.0, "cy": 31.0,
+    "projection_type": "opencvFisheye",
+    "width": 80,
+    "height": 60,
+    "fx": 33.0,
+    "fy": 34.0,
+    "cx": 41.0,
+    "cy": 31.0,
     "valid_circle_mask": {"center": [40.0, 30.0], "radius": 32.0, "feather": 2.0},
 }
 
@@ -80,13 +85,16 @@ def test_texture_diversity_and_serializable_actual_parameters():
     assert seen == set(STYLES)
 
 
-@pytest.mark.parametrize("name,spec", [
-    ("door_panel_diagnostic", SPEC),
-    ("robot_top_diagnostic", SPEC),
-    ("wrist", {**SPEC, "projection_type": "pinhole"}),
-    ("wrist", {**SPEC, "valid_circle_mask": None}),
-    ("wrist", {**SPEC, "valid_circle_mask": {"enabled": False}}),
-])
+@pytest.mark.parametrize(
+    "name,spec",
+    [
+        ("door_panel_diagnostic", SPEC),
+        ("robot_top_diagnostic", SPEC),
+        ("wrist", {**SPEC, "projection_type": "pinhole"}),
+        ("wrist", {**SPEC, "valid_circle_mask": None}),
+        ("wrist", {**SPEC, "valid_circle_mask": {"enabled": False}}),
+    ],
+)
 def test_diagnostics_and_nonfisheye_are_untouched(name, spec):
     frame = np.ones((60, 80, 3), np.uint8)
     augmenter = FisheyeBorderAugmenter(5, name, spec)
@@ -110,10 +118,16 @@ def test_effective_offset_mask_not_principal_point_or_black_detection():
 def test_collector_dual_and_six_share_augmentation_and_preserve_diagnostics():
     from gr00t.rl.data_collection.auto_open_collector import AutoOpenStandardEpisodeCollector
     from gr00t.rl.data_collection.auto_open_standard import (
-        camera_streams_for_mode, transform_collection_images,
+        camera_streams_for_mode,
+        transform_collection_images,
     )
-    spec = {**SPEC, "width": 640, "height": 480,
-            "valid_circle_mask": {"center": [320, 240], "radius": 262, "feather": 2}}
+
+    spec = {
+        **SPEC,
+        "width": 640,
+        "height": 480,
+        "valid_circle_mask": {"center": [320, 240], "radius": 262, "feather": 2},
+    }
     image = np.full((480, 640, 3), 120, np.uint8)
     outputs = {}
     for mode in ("dual", "six"):
@@ -164,33 +178,41 @@ def test_manager_uses_episode_environment_not_reused_render_slot():
 def test_capture_before_rotation_and_finish_persists_actual_parameters(mode):
     from gr00t.rl.data_collection.auto_open_collector import AutoOpenStandardEpisodeCollector
     from gr00t.rl.data_collection.auto_open_standard import (
-        camera_streams_for_mode, transform_collection_images,
+        camera_streams_for_mode,
+        transform_collection_images,
     )
-    spec = {**SPEC, "width": 640, "height": 480,
-            "valid_circle_mask": {"center": [310, 235], "radius": 250, "feather": 2}}
+
+    spec = {
+        **SPEC,
+        "width": 640,
+        "height": 480,
+        "valid_circle_mask": {"center": [310, 235], "radius": 250, "feather": 2},
+    }
     image = np.random.default_rng(3).integers(0, 256, (480, 640, 3), dtype=np.uint8)
     collector = AutoOpenStandardEpisodeCollector.__new__(AutoOpenStandardEpisodeCollector)
     collector.seed, collector.env_id, collector.episode_index = 19, 7, 0
     collector._fisheye_borders = {}
-    collector.runner = SimpleNamespace(rgb_camera_manager=SimpleNamespace(
-        camera_spec_for_env=lambda name, env_id: spec
-    ))
+    collector.runner = SimpleNamespace(
+        rgb_camera_manager=SimpleNamespace(camera_spec_for_env=lambda name, env_id: spec)
+    )
     collector.camera_streams = camera_streams_for_mode(mode)
     collector.camera_mode, collector.capture_images = mode, True
     collector._pending, collector.video_staging_root = None, None
     collector.states, collector.actions, collector.contacts = [], [], []
     collector.video_encoders, collector.events = {}, {}
     collector.images, collector.audit, collector.timing = (
-        defaultdict(list), defaultdict(list), defaultdict(float)
+        defaultdict(list),
+        defaultdict(list),
+        defaultdict(float),
     )
     collector._snapshot_state = lambda state: {"packed_state": np.zeros(58, np.float32)}
     collector._append_state_audit = lambda *args: None
     frames = {name: image for name in collector.camera_streams}
     collector._read_current_images = lambda: frames
     collector.capture_before_step(None, np.zeros(25), stage_name="TEST", begin_contact_tick=False)
-    expected = transform_collection_images({
-        name: FisheyeBorderAugmenter(19, name, spec).apply(image) for name in frames
-    }, mode)
+    expected = transform_collection_images(
+        {name: FisheyeBorderAugmenter(19, name, spec).apply(image) for name in frames}, mode
+    )
     for name, expected_image in expected.items():
         np.testing.assert_array_equal(collector.images[name][0], expected_image)
     collector._pending = None
