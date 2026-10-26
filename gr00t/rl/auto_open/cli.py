@@ -20,6 +20,8 @@ DEFAULT_ARM_RETRACT_POSE_LOCAL = (
     0.0,
     0.0,
 )
+DEFAULT_ARM_RETRACT_POSITION_NOISE_RADIUS_M = 0.01
+DEFAULT_ARM_RETRACT_ROTATION_NOISE_DEG = 1.0
 
 def _parser() -> argparse.ArgumentParser:
     parser = build_common_arg_parser()
@@ -50,38 +52,6 @@ def _parser() -> argparse.ArgumentParser:
         help="Exact episode seed assigned to each environment in the batch.",
     )
     parser.add_argument(
-        "--steady_path_workers",
-        type=int,
-        default=0,
-        help="Exact CPU workers used to batch PREGRASP steady-path solves.",
-    )
-    parser.add_argument(
-        "--batch_contact_ik_backend",
-        choices=("scalar", "exact_workers"),
-        default="scalar",
-        help="CONTACT_PANEL steady-inverse backend used by batched collection.",
-    )
-    parser.add_argument(
-        "--batch_path_backend",
-        choices=("scalar", "exact_workers"),
-        default="scalar",
-        help=(
-            "Backend for PREGRASP and RELEASE path solves in batched collection."
-        ),
-    )
-    parser.add_argument(
-        "--batch_panel_clearance_backend",
-        choices=("scalar", "gpu"),
-        default="gpu",
-        help="Backend for batched CONTACT_PANEL/PUSH_OPEN finger clearance.",
-    )
-    parser.add_argument(
-        "--batch_geometry_fallback_backend",
-        choices=("scalar", "numpy_batch"),
-        default="numpy_batch",
-        help="Backend for guarded CENTER_HANDLE geometry fallback rows.",
-    )
-    parser.add_argument(
         "--target_noise",
         action="append",
         default=[],
@@ -105,7 +75,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--arm_retract_position_noise_radius_m",
         type=float,
-        default=0.05,
+        default=DEFAULT_ARM_RETRACT_POSITION_NOISE_RADIUS_M,
         help=(
             "Per-entry uniform-volume position randomization radius for "
             "RESTORE_GRIPPER and PUSH_ARM_RETRACT."
@@ -114,7 +84,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--arm_retract_rotation_noise_deg",
         type=float,
-        default=5.0,
+        default=DEFAULT_ARM_RETRACT_ROTATION_NOISE_DEG,
         help=(
             "Per-entry independent absolute XYZ Euler randomization bound "
             "for RESTORE_GRIPPER and PUSH_ARM_RETRACT."
@@ -189,6 +159,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--max_steps", type=int, default=3000)
     parser.add_argument(
+        "--pull_panel_contact_baseline",
+        choices=("base_forward", "trunk_front", "trunk_front_minus10"),
+        default="trunk_front_minus10",
+        help="Pull-door tangent search center: base +20cm, trunk front, or front -10cm.",
+    )
+    parser.add_argument(
         "--pitch_probe_output",
         type=str,
         default=None,
@@ -196,7 +172,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--terminal_stage",
-        choices=("THROUGH", "RESTORE_GRIPPER"),
+        choices=("THROUGH", "RESTORE_GRIPPER", "PULL_CLEAR_SWEEP", "PULL_INSERT", "PULL_OPEN", "PULL_BASE_ADVANCE"),
         default="THROUGH",
         help="Stage whose completed acceptance terminates the requested workflow.",
     )

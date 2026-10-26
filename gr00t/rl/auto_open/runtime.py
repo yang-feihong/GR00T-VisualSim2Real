@@ -24,10 +24,10 @@ from legged_gym.utils.ee_steady_state import B2Z1SteadyEeForwardModel
 from gr00t.rl.auto_open.cli import LOWLEVEL_ROOT
 from gr00t.rl.auto_open.geometry import (
     _batched_geometry_metrics_gpu,
-    _batched_handle_centers_gpu,
     _batched_panel_finger_clearance_gpu,
     _make_batched_geometry_cache,
     _resolved_door_prim_path,
+    initial_approach_clearance_gpu,
 )
 from gr00t.rl.auto_open.lifecycle import reset_controller
 from gr00t.rl.auto_open.io import (
@@ -39,11 +39,7 @@ from gr00t.rl.auto_open.io import (
 from gr00t.rl.auto_open.control import (
     _approach_base_target,
     _arm_drive_stiffness,
-    _limit_base_commands,
     _perturb_base_target,
-)
-from gr00t.rl.data_collection.auto_open_collector import (
-    batched_target_height_invariant_poses,
 )
 from gr00t.rl.auto_open.utils import as_numpy as _as_np
 from gr00t.rl.auto_open.tensor_fsm import TensorCommandBuffers, TensorDoorFSM
@@ -65,14 +61,14 @@ def _slice_control_state(state, env_id, num_envs):
     return sliced
 
 def _slice_all_control_states(state, num_envs):
-    """Materialize row views once for command and post-step advance."""
+    """Materialize rows for initialization and audit serialization."""
     return [
         _slice_control_state(state, env_id, num_envs)
         for env_id in range(num_envs)
     ]
 
 def _control_state_to_host(state, num_envs):
-    """Copy vectorized controller observations to host once per simulation step."""
+    """Copy observations for initialization or output, never online planning."""
     hosted = {}
     for key, value in state.items():
         if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == num_envs:
@@ -81,12 +77,32 @@ def _control_state_to_host(state, num_envs):
             hosted[key] = value
     return hosted
 
-def _update_batched_reference_buffers(env, buffers):
-    buffers["get_goal_reference_origin"] = _as_np(env.get_goal_reference_origin())
-    buffers["get_goal_reference_quat"] = _as_np(env.get_goal_reference_quat())
-    buffers["get_goal_center_offset_local"] = _as_np(
-        env.get_goal_center_offset_local()
+def _target_height_invariant_poses_gpu(root_states, arm_targets):
+    """Dataset poses with GPU FK and frame transforms before serialization."""
+    roots = root_states.to(dtype=torch.float64)
+    position, rotation, _ = b2z1_gripper_pose_and_jacobian(
+        roots[:, :3], roots[:, [4, 5, 6, 3]], arm_targets.to(dtype=torch.float64)
     )
+    gripper_to_dataset = roots.new_tensor(
+        ((1.0, 0.0, 0.0), (0.0, 0.0, -1.0), (0.0, 1.0, 0.0))
+    )
+    w, x, y, z = fixed_normalize(roots[:, 3:7], eps=1.0e-12).unbind(-1)
+    yaw = torch.atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    cosine, sine = torch.cos(yaw), torch.sin(yaw)
+    world_to_yaw = roots.new_zeros((roots.shape[0], 3, 3))
+    world_to_yaw[:, 0, 0] = cosine
+    world_to_yaw[:, 0, 1] = sine
+    world_to_yaw[:, 1, 0] = -sine
+    world_to_yaw[:, 1, 1] = cosine
+    world_to_yaw[:, 2, 2] = 1.0
+    translated = position.clone()
+    translated[:, :2] -= roots[:, :2]
+    local_position = (world_to_yaw @ translated.unsqueeze(-1)).squeeze(-1)
+    local_position -= roots.new_tensor((0.22, 0.0, 0.7))
+    local_rotation = world_to_yaw @ (rotation @ gripper_to_dataset)
+    return torch.cat(
+        (local_rotation[:, :, 0], local_rotation[:, :, 1], local_position), dim=1
+    ).to(dtype=torch.float32)
 
 
 def _write_stage_progress(output_dir, stage_enum, fsm, episode_step, elapsed_s):
@@ -107,147 +123,8 @@ def _write_stage_progress(output_dir, stage_enum, fsm, episode_step, elapsed_s):
     temporary = path.with_suffix(".tmp")
     temporary.write_text("\n".join(lines) + "\n", encoding="utf-8")
     temporary.replace(path)
-    return tuple(int(item) for item in stages)
+    return fsm.stage.detach().clone()
 
-class _BatchedEnvView:
-    """Expose one row of a vectorized ManipLoco environment to a scalar controller."""
-
-    _ROW_METHODS = {
-        "get_goal_reference_origin",
-        "get_goal_reference_quat",
-        "get_goal_center_offset_local",
-    }
-
-    def __init__(self, env, env_id, reference_buffers=None, arm_mode_buffer=None):
-        self._env = env
-        self._env_id = int(env_id)
-        self._reference_buffers = reference_buffers
-        self._arm_mode_buffer = arm_mode_buffer
-
-    def __getattr__(self, name):
-        if name == "teleop_arm_joint_pos_targets":
-            return self._env.teleop_arm_joint_pos_targets[
-                self._env_id : self._env_id + 1
-            ]
-        attribute = getattr(self._env, name)
-        if name in self._ROW_METHODS:
-            if self._reference_buffers is not None:
-                return lambda: self._reference_buffers[name][
-                    self._env_id : self._env_id + 1
-                ]
-            return lambda: attribute()[self._env_id : self._env_id + 1]
-        return attribute
-
-    def _set_teleop_arm_control_mode(self, mode):
-        if self._arm_mode_buffer is not None:
-            joint_mode = mode == "joint"
-            if bool(self._arm_mode_buffer[self._env_id]) == joint_mode:
-                return
-            self._arm_mode_buffer[self._env_id] = joint_mode
-        self._env._set_teleop_arm_control_mode(mode, [self._env_id])
-
-class _BatchedRunnerView:
-    """Collect one controller's commands into shared vectorized teleop buffers."""
-
-    def __init__(
-        self,
-        runner,
-        env_id,
-        state,
-        reference_buffers=None,
-        arm_mode_buffer=None,
-        command_buffers=None,
-    ):
-        self._runner = runner
-        self.env_id = int(env_id)
-        self.env = _BatchedEnvView(
-            runner.env, env_id, reference_buffers, arm_mode_buffer
-        )
-        self.state = state
-        self.command_buffers = command_buffers
-
-    @property
-    def obs(self):
-        return self._runner.obs
-
-    @obs.setter
-    def obs(self, value):
-        self._runner.obs = value
-
-    def set_state(self, state):
-        self.state = state
-
-    def get_control_state(self):
-        return self.state
-
-    def set_teleop_targets(
-        self,
-        base_command,
-        ee_goal_cart=None,
-        ee_orn_delta_rpy=None,
-        gripper_target=None,
-        ee_goal_orn_quat_world=None,
-        ee_goal_orn_quat_world_enabled=None,
-    ):
-        env = self._runner.env
-        row = slice(self.env_id, self.env_id + 1)
-        base_command = _limit_base_commands(base_command)
-
-        if self.command_buffers is not None:
-            def _store(name, value):
-                if value is not None:
-                    target = self.command_buffers[name][row]
-                    target[...] = _as_np(value).reshape(target.shape)
-
-            _store("base", base_command)
-            _store("ee_cart", ee_goal_cart)
-            _store("ee_rpy", ee_orn_delta_rpy)
-            _store("gripper", gripper_target)
-            if ee_goal_orn_quat_world is not None:
-                quat = _as_np(ee_goal_orn_quat_world).reshape(1, 4)
-                quat /= max(float(np.linalg.norm(quat)), 1.0e-8)
-                self.command_buffers["ee_quat"][row] = quat
-                if ee_goal_orn_quat_world_enabled is None:
-                    self.command_buffers["ee_quat_enabled"][row] = True
-            if ee_goal_orn_quat_world_enabled is not None:
-                self.command_buffers["ee_quat_enabled"][row] = bool(
-                    np.asarray(ee_goal_orn_quat_world_enabled).reshape(-1)[0]
-                )
-            return
-
-        def _copy(target, value):
-            if value is not None:
-                target[row] = torch.as_tensor(
-                    value, device=env.device, dtype=target.dtype
-                ).reshape_as(target[row])
-
-        _copy(env.teleop_raw_commands, base_command)
-        _copy(env.teleop_raw_ee_goal_cart, ee_goal_cart)
-        _copy(env.teleop_raw_ee_goal_orn_delta_rpy, ee_orn_delta_rpy)
-        _copy(env.gripper_pos_targets, gripper_target)
-        if ee_goal_orn_quat_world is not None:
-            quat = torch.as_tensor(
-                ee_goal_orn_quat_world, device=env.device, dtype=torch.float32
-            ).reshape(1, 4)
-            quat = fixed_normalize(quat, eps=1.0e-8)
-            env.teleop_world_ee_goal_orn_quat[row] = quat
-            if ee_goal_orn_quat_world_enabled is None:
-                env.teleop_world_ee_goal_orn_quat_enabled[row] = True
-        if ee_goal_orn_quat_world_enabled is not None:
-            env.teleop_world_ee_goal_orn_quat_enabled[row] = bool(
-                torch.as_tensor(ee_goal_orn_quat_world_enabled).reshape(-1)[0]
-            )
-        env._teleop_inputs_dirty = True
-
-def _make_batched_command_buffers(env):
-    return {
-        "base": _as_np(env.teleop_raw_commands),
-        "ee_cart": _as_np(env.teleop_raw_ee_goal_cart),
-        "ee_rpy": _as_np(env.teleop_raw_ee_goal_orn_delta_rpy),
-        "gripper": _as_np(env.gripper_pos_targets),
-        "ee_quat": _as_np(env.teleop_world_ee_goal_orn_quat),
-        "ee_quat_enabled": env.teleop_world_ee_goal_orn_quat_enabled.detach().cpu().numpy().copy(),
-    }
 
 def _write_batched_episode_result(
     args, controller, runner, state, env_id, seed, step_count, max_finger_force,
@@ -310,6 +187,7 @@ def _write_batched_episode_result(
             "door_randomization": door_randomization,
         },
         "robot_state": {
+            "initial_approach_clearance": controller.initial_approach_clearance,
             "initial_base_pose_w": initial_root_state.tolist(),
             "initial_base_pose_env": initial_root_local.tolist(),
             "initial_arm_joint_position": initial_dof_position[arm_joint_ids].tolist(),
@@ -362,6 +240,7 @@ def _finish_standard_collection(
             "initial_root_pose_w": initial_root_state.tolist(),
             "initial_dof_position": initial_dof_position.tolist(),
             "initial_gripper_position": float(initial_gripper_position),
+            "initial_approach_clearance": controller.initial_approach_clearance,
             "door_randomization": door_randomization,
             "door_asset": door_asset_snapshot,
             "camera_mount_randomization": dict(
@@ -402,17 +281,14 @@ def _run_tensor_fsm_loop(
     stage_enum,
     runner,
     controllers,
-    views,
     geometry_cache,
     device_state,
-    steady_path_executor,
     approach_command_targets,
     approach_nominal_targets,
     initial_root_states,
     initial_dof_positions,
     initial_policy_observations,
     initial_gripper_positions,
-    reference_buffers,
     standard_collectors,
     standard_door_randomizations,
     standard_door_asset_snapshots,
@@ -433,11 +309,11 @@ def _run_tensor_fsm_loop(
         approach_nominal_xy=np.stack([target[0] for target in approach_nominal_targets]),
         approach_nominal_yaw=np.asarray([target[1] for target in approach_nominal_targets]),
         terminal_stage=Stage[args.terminal_stage],
+        pull_door=args.doorman_door_open_io == "out",
+        pull_panel_contact_baseline=getattr(args, "pull_panel_contact_baseline", "trunk_front_minus10"),
     )
     buffers = TensorCommandBuffers.from_env(env)
-    planner = TensorPlanningCoordinator(
-        controllers, views, steady_path_executor, Stage
-    )
+    planner = TensorPlanningCoordinator(controllers, Stage)
     timing = {
         "command_s": 0.0,
         "teleop_prepare_s": 0.0,
@@ -475,8 +351,6 @@ def _run_tensor_fsm_loop(
         planning_start = time.perf_counter()
         contact_rows = fsm.contact_plan_requests()
         retract_rows = fsm.push_retract_requests(device_state)
-        if len(contact_rows) or len(retract_rows):
-            _update_batched_reference_buffers(env, reference_buffers)
         if len(contact_rows):
             planner.plan_contact(fsm, device_state, contact_rows)
         if len(retract_rows):
@@ -507,7 +381,8 @@ def _run_tensor_fsm_loop(
         if len(panel_rows):
             panel_start = time.perf_counter()
             clearance[panel_rows] = _batched_panel_finger_clearance_gpu(
-                device_state, geometry_cache, panel_rows
+                device_state, geometry_cache, panel_rows,
+                normal_sign=fsm.panel_contact_normal_sign[panel_rows],
             )
             timing["panel_clearance_backend_s"] += time.perf_counter() - panel_start
 
@@ -537,10 +412,12 @@ def _run_tensor_fsm_loop(
 
         capture_env_ids = []
         capture_state_host = None
+        capture_root_states = None
         inverse_input_world = None
         if standard_collectors:
             standard_capture_start = time.perf_counter()
             capture_env_ids = torch.where(active)[0].detach().cpu().tolist()
+            capture_root_states = device_state["root_states"].detach().clone()
             capture_state_host = _control_state_to_host(device_state, num_envs)
             capture_states = _slice_all_control_states(
                 capture_state_host, num_envs
@@ -575,13 +452,12 @@ def _run_tensor_fsm_loop(
             post_states = _slice_all_control_states(
                 post_state_host, num_envs
             )
-            target_poses = batched_target_height_invariant_poses(
-                capture_state_host["root_states"],
-                post_state_host["arm_position_target"],
-            )
+            target_poses = _target_height_invariant_poses_gpu(
+                capture_root_states, result["state"]["arm_position_target"]
+            ).detach().cpu().numpy()
             inverse_output_world, _, _ = b2z1_gripper_pose_and_jacobian(
-                device_state["root_states"][:, :3],
-                device_state["root_states"][:, [4, 5, 6, 3]],
+                capture_root_states[:, :3],
+                capture_root_states[:, [4, 5, 6, 3]],
                 result["state"]["arm_position_target"],
             )
             inverse_input_host = inverse_input_world.detach().cpu().numpy()
@@ -649,7 +525,8 @@ def _run_tensor_fsm_loop(
         )
         if len(panel_rows):
             clearance[panel_rows] = _batched_panel_finger_clearance_gpu(
-                device_state, geometry_cache, panel_rows
+                device_state, geometry_cache, panel_rows,
+                normal_sign=fsm.panel_contact_normal_sign[panel_rows],
             )
 
         advance_start = time.perf_counter()
@@ -690,10 +567,7 @@ def _run_tensor_fsm_loop(
                             "stage": Stage(int(debug_stage_after[env_id])).name,
                         }
                     )
-        current_progress_stages = tuple(
-            int(item) for item in fsm.stage.detach().cpu().tolist()
-        )
-        if current_progress_stages != last_progress_stages or step % 50 == 0:
+        if step % 50 == 0 or bool(torch.any(fsm.stage != last_progress_stages).item()):
             last_progress_stages = _write_stage_progress(
                 args.output_dir,
                 Stage,
@@ -702,26 +576,14 @@ def _run_tensor_fsm_loop(
                 time.monotonic() - loop_started,
             )
         planning_start = time.perf_counter()
-        has_planning_event = any(
-            len(events[name])
-            for name in (
-                "pregrasp_plan",
-                "center_plan",
-                "release_open_plan",
-                "retreat_plan",
-                "restore_plan",
-                "press_handle_plan",
-                "push_pull_plan",
-                "return_handle_plan",
-            )
-        )
-        if has_planning_event:
-            _update_batched_reference_buffers(env, reference_buffers)
         planner.plan_pregrasp(fsm, device_state, events["pregrasp_plan"])
         planner.plan_center(fsm, device_state, events["center_plan"])
-        planner.plan_turn_path(fsm, device_state, events["press_handle_plan"])
-        planner.plan_turn_path(fsm, device_state, events["push_pull_plan"])
-        planner.plan_turn_path(fsm, device_state, events["return_handle_plan"])
+        planner.plan_pose_path(fsm, device_state, events["press_handle_plan"])
+        planner.plan_pose_path(fsm, device_state, events["push_pull_plan"])
+        planner.plan_pose_path(fsm, device_state, events["return_handle_plan"])
+        planner.plan_initial_pull_station(fsm, device_state, events["pull_station_plan"])
+        planner.plan_pull_insert(fsm, device_state, events["pull_insert_plan"])
+        planner.plan_pull_open(fsm, device_state, events["pull_open_plan"])
         planner.plan_release_open(fsm, device_state, events["release_open_plan"])
         planner.plan_retreat(fsm, device_state, events["retreat_plan"])
         planner.plan_restore(fsm, device_state, events["restore_plan"])
@@ -732,6 +594,8 @@ def _run_tensor_fsm_loop(
             failed = fsm.stage == int(Stage.FAILURE)
             if bool(torch.all(planned | failed).item()):
                 break
+
+    planner.finalize_diagnostics()
 
     if args.pitch_probe_output:
         planned = (fsm.arm_align_path.length > 0).detach().cpu().tolist()
@@ -776,6 +640,14 @@ def _run_tensor_fsm_loop(
         45: "panel_contact_inverse_mapping_failed",
         46: "arm_retract_pose_sampling_failed",
         47: "pregrasp_no_reachable_pitch",
+        48: "pull_no_frame_and_wall_safe_target_at_requested_gap_distance",
+        49: "panel_path_inverse_residual_exceeded",
+        50: "pull_panel_entry_geometry_invalid",
+        51: "pull_panel_arc_no_progress",
+        52: "pull_panel_door_overspeed",
+        53: "pull_base_station_sweep_intersects_wall_or_panel",
+        54: "pull_no_distinct_next_station_within_approved_angle_noise",
+        55: "pull_initial_station_no_clearance_and_full_insertion_feasible_candidate",
     }
 
     def failure_reason(code, origin):
@@ -823,6 +695,32 @@ def _run_tensor_fsm_loop(
                 Stage(origin).name if origin else Stage.FAILURE.name
             )
         root = final_state["root_states"][env_id]
+        if fsm.pull_door and int(fsm.stage_visit[env_id, int(Stage.PULL_CLEAR_SWEEP)].item()):
+            controller.last_acceptance_diagnostics["pull_clear_sweep_plan"] = {
+                "target_xy_world_m": fsm.pull_initial_station_xy[env_id].detach().cpu().tolist(),
+                "target_yaw_rad": float(fsm.pull_initial_station_yaw[env_id].item()),
+                "gap_center_xy_world_m": fsm.pull_gap_xy[env_id].detach().cpu().tolist(),
+                "frame_free_boundary_from_hinge_m": float(fsm.pull_frame_edge[env_id].item()),
+                "planned_base_frame_clearance_m": float(fsm.pull_planned_frame_clearance[env_id].item()),
+                "wall_front_from_hinge_m": float(fsm.pull_wall_front[env_id].item()),
+                "planned_base_wall_clearance_m": float(fsm.pull_planned_wall_clearance[env_id].item()),
+                "required_wall_clearance_m": fsm.pull_station_config.wall_clearance_m,
+                "extra_planning_margin_m": fsm.pull_station_config.planning_margin_m,
+                "sampling_local_x_range_m": fsm.pull_station_config.first_x_range_m,
+                "sampling_local_y_range_m": fsm.pull_station_config.first_y_range_m,
+                "sampling_local_yaw_range_deg": fsm.pull_station_config.first_yaw_range_deg,
+                "candidate_planning": fsm.pull_initial_station_history[env_id],
+                "required_clearance_m": fsm.pull_station_config.clearance_m,
+            }
+            if int(fsm.stage_visit[env_id, int(Stage.PULL_INSERT)].item()):
+                controller.last_acceptance_diagnostics["pull_panel_result"] = {
+                    "cycles": fsm.pull_cycle_history[env_id],
+                    "base_stations": fsm.pull_station_history[env_id],
+                    "needs_base_reposition": bool(fsm.pull_finished_for_reposition[env_id].item()),
+                    "comfort_radius_m": float(fsm.push_comfort_reach_radius[env_id].item()),
+                    "max_angular_lead_rad": float(fsm.push_max_angular_lead[env_id].item()),
+                    "target_door_speed_rad_s": float(fsm.push_target_angular_speed[env_id].item()),
+                }
         diagnostic_stage = int(failure_from_stages[env_id]) or int(stages[env_id])
         stage_acceptance = fsm.acceptance_diagnostics(env_id, diagnostic_stage)
         failure_acceptance[env_id] = stage_acceptance
@@ -1025,11 +923,6 @@ def _run_tensor_fsm_loop(
         flush=True,
     )
     print(f"[doorman][batch] complete: {successes}/{num_envs} active", flush=True)
-    if steady_path_executor is not None:
-        steady_path_executor.shutdown(
-            wait=not args.headless,
-            cancel_futures=bool(args.headless),
-        )
     if args.headless:
         sys.stdout.flush()
         sys.stderr.flush()
@@ -1101,15 +994,7 @@ def _run_batched(args, *, controller_cls, stage_enum):
         stiffness=_arm_drive_stiffness(env),
         emit_tolerance_warnings=not args.summary_only,
     )
-    steady_path_executor = None
-    views = []
     controllers = []
-    reference_buffers = {}
-    _update_batched_reference_buffers(env, reference_buffers)
-    command_buffers = _make_batched_command_buffers(env)
-    arm_mode_buffer = (
-        env.teleop_arm_joint_control_mask.detach().cpu().numpy().copy()
-    )
     shared_robot_geometry = None
     controller_stdout = open(os.devnull, "w") if args.summary_only else None
     with (
@@ -1119,16 +1004,8 @@ def _run_batched(args, *, controller_cls, stage_enum):
     ):
         for env_id in range(num_envs):
             sliced_state = state_rows[env_id]
-            view = _BatchedRunnerView(
-                runner,
-                env_id,
-                sliced_state,
-                reference_buffers=reference_buffers,
-                arm_mode_buffer=arm_mode_buffer,
-                command_buffers=command_buffers,
-            )
             controller = DoorController(
-                view,
+                runner,
                 robot_side=args.robot_side,
                 position_only_center=args.position_only_center,
                 disable_push_base_assist=args.disable_push_base_assist,
@@ -1150,7 +1027,6 @@ def _run_batched(args, *, controller_cls, stage_enum):
                 reset_env=False,
                 close_gripper=False,
             )
-            views.append(view)
             controllers.append(controller)
             if shared_robot_geometry is None:
                 shared_robot_geometry = controller.center_geometry
@@ -1167,26 +1043,28 @@ def _run_batched(args, *, controller_cls, stage_enum):
         device=env.device,
         dtype=joint_pos.dtype,
     )
-    command_buffers["gripper"][:, 0] = np.asarray(
-        [controller.q_closed for controller in controllers], dtype=np.float32
-    )
     joint_vel[:, gripper_joint_id] = 0.0
     env.robot.write_joint_state_to_sim(joint_pos, joint_vel)
     env.robot.set_joint_position_target(joint_pos)
     runner.obs = env.get_observations()
     device_state = runner.get_control_state()
     full_state = _control_state_to_host(device_state, num_envs)
-    handle_center_gpu_s = 0.0
-    phase_start = time.perf_counter()
-    handle_centers = _batched_handle_centers_gpu(full_state, geometry_cache)
-    handle_center_gpu_s += time.perf_counter() - phase_start
     initial_root_states = _as_np(full_state["root_states"])[:, :7].copy()
     initial_dof_positions = _as_np(full_state["dof_pos"]).copy()
     initial_gripper_positions = _as_np(full_state["gripper_position"]).reshape(-1).copy()
     initial_policy_observations = _as_np(runner.obs).copy()
-    first_low_level_actions = np.full(
-        (num_envs, env.num_actions), np.nan, dtype=np.float32
-    )
+    approach_clearance = initial_approach_clearance_gpu(device_state, geometry_cache)
+    station_xy = torch.as_tensor(np.stack([c.station_xy for c in controllers]), device=env.device)
+    station_xy = station_xy + ((approach_clearance['approach_distance_m'] - .85)[:, None]
+                              * geometry_cache['door_normal'][:, :2]).to(station_xy.dtype)
+    # Materialize initialization metadata once; geometry and target math stay on GPU.
+    clearance_host = {name: value.detach().cpu().tolist() for name, value in approach_clearance.items()}
+    stations_host = station_xy.detach().cpu().numpy()
+    for env_id, controller in enumerate(controllers):
+        controller.initial_approach_clearance = {name: value[env_id] for name, value in clearance_host.items()}
+        controller.approach_distance = clearance_host['approach_distance_m'][env_id]
+        controller.station_xy = stations_host[env_id].copy()
+    # panel_station_xy is a later-stage target; this rule is APPROACH-only.
     standard_collectors = []
     standard_door_randomizations = []
     standard_door_asset_snapshots = []
@@ -1237,44 +1115,6 @@ def _run_batched(args, *, controller_cls, stage_enum):
         flush=True,
     )
 
-    step_counts = np.zeros(num_envs, dtype=np.int32)
-    max_finger_forces = np.zeros(num_envs, dtype=np.float32)
-    max_abs_hinge_speeds = np.zeros(num_envs, dtype=np.float32)
-    pending_metrics = np.zeros((num_envs, 2), dtype=np.float32)
-    batch_timing = {
-        "command_s": 0.0,
-        "teleop_prepare_s": 0.0,
-        "policy_physics_s": 0.0,
-        "state_to_host_s": 0.0,
-        "advance_s": 0.0,
-        "steady_path_workers_s": 0.0,
-        "geometry_gpu_s": 0.0,
-        "geometry_numpy_backend_s": 0.0,
-        "stability_gpu_s": 0.0,
-        "orientation_gpu_s": 0.0,
-        "contact_ik_backend_s": 0.0,
-        "path_backend_s": 0.0,
-        "panel_clearance_backend_s": 0.0,
-    }
-    contact_ik_backend_stats = {
-        "batches": 0,
-        "requests": 0,
-        "worker_errors": 0,
-    }
-    path_backend_stats = {
-        "batches": 0,
-        "requests": 0,
-        "worker_errors": 0,
-        "labels": {},
-    }
-    geometry_numpy_backend_stats = {
-        "batches": 0,
-        "requests": 0,
-        "accepted_requests": 0,
-        "exact_scalar_requests": 0,
-        "max_batch": 0,
-    }
-    orientation_gpu_calls = 0
     approach_nominal_targets = [
         _approach_base_target(controller) for controller in controllers
     ]
@@ -1291,17 +1131,14 @@ def _run_batched(args, *, controller_cls, stage_enum):
         stage_enum=Stage,
         runner=runner,
         controllers=controllers,
-        views=views,
         geometry_cache=geometry_cache,
         device_state=device_state,
-        steady_path_executor=steady_path_executor,
         approach_command_targets=approach_command_targets,
         approach_nominal_targets=approach_nominal_targets,
         initial_root_states=initial_root_states,
         initial_dof_positions=initial_dof_positions,
         initial_policy_observations=initial_policy_observations,
         initial_gripper_positions=initial_gripper_positions,
-        reference_buffers=reference_buffers,
         standard_collectors=standard_collectors,
         standard_door_randomizations=standard_door_randomizations,
         standard_door_asset_snapshots=standard_door_asset_snapshots,

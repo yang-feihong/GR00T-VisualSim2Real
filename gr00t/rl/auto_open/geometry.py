@@ -221,11 +221,13 @@ class ColliderGeometry:
     the final contact response.
     """
 
-    def __init__(self, name, body_name, points_body, source_paths, triangles_body=None):
+    def __init__(self, name, body_name, points_body, source_paths, triangles_body=None, convex_parts_body=None):
         self.name = name
         self.body_name = body_name
         self.points_body = np.asarray(points_body, dtype=np.float32)
         self.source_paths = list(source_paths)
+        self.convex_parts_body = ([self.points_body] if convex_parts_body is None
+                                  else [np.asarray(part, dtype=np.float32) for part in convex_parts_body])
         self.triangles_body = (
             np.empty((0, 3, 3), dtype=np.float32)
             if triangles_body is None else np.asarray(triangles_body, dtype=np.float32)
@@ -237,6 +239,10 @@ class ColliderGeometry:
         pos = np.asarray(body_pose[:3], dtype=np.float32)
         quat = np.asarray(body_pose[3:7], dtype=np.float32)
         return _quat_rotate_points_np(quat, self.points_body) + pos
+
+    def world_parts(self, body_pose):
+        pos, quat = np.asarray(body_pose[:3]), np.asarray(body_pose[3:7])
+        return [_quat_rotate_points_np(quat, part) + pos for part in self.convex_parts_body]
 
     def bounds(self):
         return self.points_body.min(axis=0), self.points_body.max(axis=0)
@@ -261,6 +267,7 @@ def _read_collider_points(stage, body_prim, tokens):
     points = []
     paths = []
     triangles = []
+    parts = []
     for prim in Usd.PrimRange(body_prim, Usd.TraverseInstanceProxies()):
         path_text = str(prim.GetPath())
         low = path_text.lower()
@@ -305,11 +312,13 @@ def _read_collider_points(stage, body_prim, tokens):
                     offset += count
             # Large jaw meshes are reduced to a deterministic hull sample.
             stride = max(1, len(transformed) // 1024)
-            points.extend(np.asarray(transformed[::stride], dtype=np.float32))
+            part = np.asarray(transformed[::stride], dtype=np.float32)
+            points.extend(part)
+            parts.append(part)
             paths.append(path_text)
     if not points:
         return None
-    return ColliderGeometry("", body_prim.GetName(), np.asarray(points), paths, triangles)
+    return ColliderGeometry("", body_prim.GetName(), np.asarray(points), paths, triangles, parts)
 
 def _quat_rotate_points_torch(quaternion_wxyz, points):
     """Rotate one point cloud per quaternion with float32 Isaac semantics."""
@@ -320,6 +329,36 @@ def _quat_rotate_points_torch(quaternion_wxyz, points):
     return points + 2.0 * (
         scalar * first_cross + torch.cross(vector, first_cross, dim=-1)
     )
+
+
+def initial_approach_clearance_gpu(state, cache):
+    """Measure initial closed jaws and only enlarge the nominal approach."""
+    roots = state['root_states'].to(torch.float64)
+    bodies = state['robot_body_state_w'].to(torch.float64)
+    fixed_pose = bodies[:, cache['fixed_body_idx'], :7]
+    moving_pose = bodies[:, cache['moving_body_idx'], :7]
+    fixed = _quat_rotate_points_torch(fixed_pose[:, 3:7], cache['fixed_points'].double()) + fixed_pose[:, None, :3]
+    moving = _quat_rotate_points_torch(moving_pose[:, 3:7], cache['moving_points'].double()) + moving_pose[:, None, :3]
+    lower = torch.minimum(fixed[..., 2].amin(1), moving[..., 2].amin(1))
+    upper = torch.maximum(fixed[..., 2].amax(1), moving[..., 2].amax(1))
+    inverse = roots[:, 3:7].clone()
+    inverse[:, 1:] *= -1
+    fixed_local = _quat_rotate_points_torch(inverse, fixed - roots[:, None, :3])
+    moving_local = _quat_rotate_points_torch(inverse, moving - roots[:, None, :3])
+    front = torch.maximum(fixed_local[..., 0].amax(1), moving_local[..., 0].amax(1))
+    handle = state['door_body_state_w'][:, cache['handle_body_idx'], :7].double()
+    center = handle[:, :3] + _quat_rotate_points_torch(
+        handle[:, 3:7], cache['handle_center_local'].double()[:, None])[:, 0]
+    axis = _quat_rotate_points_torch(handle[:, 3:7], cache['handle_axis_local'].double()[:, None])[:, 0]
+    half_height = cache['handle_half_length'].double() * axis[:, 2].abs() + cache['handle_radius'].double()
+    handle_lower, handle_upper = center[:, 2] - half_height, center[:, 2] + half_height
+    gap = torch.maximum(handle_lower - upper, lower - handle_upper).clamp_min(0.)
+    near = gap < .02
+    distance = torch.where(near, (front + .02).clamp_min(.85), torch.full_like(front, .85))
+    return dict(height_gap_m=gap, gripper_front_m=front, approach_distance_m=distance,
+                height_near=near, enlarged=distance > .85,
+                gripper_lower_z_m=lower, gripper_upper_z_m=upper,
+                handle_lower_z_m=handle_lower, handle_upper_z_m=handle_upper)
 
 def _make_batched_geometry_cache(controllers, device):
     first = controllers[0]
@@ -451,7 +490,7 @@ def _make_batched_geometry_cache(controllers, device):
         ).astype(np.float32),
     }
 
-def _batched_panel_finger_clearance_gpu(state, cache, env_ids):
+def _batched_panel_finger_clearance_gpu(state, cache, env_ids, *, normal_sign=None):
     """Compute panel-to-finger clearance for selected rows on the GPU."""
     device = state["robot_body_state_w"].device
     rows = torch.as_tensor(env_ids, dtype=torch.long, device=device)
@@ -486,6 +525,8 @@ def _batched_panel_finger_clearance_gpu(state, cache, env_ids):
         ),
         dim=-1,
     )
+    if normal_sign is not None:
+        panel_normal = panel_normal * normal_sign[:, None]
     signed_distance = fixed_dot(
         finger_points - panel_center[:, None, :], panel_normal[:, None, :]
     )
@@ -1235,8 +1276,7 @@ def _contacts_form_opposed_grasp(self, points, handle_state):
         "closing_coordinates": closing_coordinates.copy(),
     }
     valid = bool(
-        np.all(np.abs(axial) <= max(self.handle_half_length - 0.005, 0.0))
-        and float(closing_coordinates[0] * closing_coordinates[1]) < 0.0
+        float(closing_coordinates[0] * closing_coordinates[1]) < 0.0
         and np.all(np.abs(closing_coordinates) >= 0.25 * radius)
     )
     return valid, metrics

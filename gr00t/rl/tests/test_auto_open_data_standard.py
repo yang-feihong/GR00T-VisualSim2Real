@@ -445,6 +445,22 @@ def test_contact_classifier_rejects_non_foot_ground_contact():
     assert summary["abnormal"][0]["reason"] == "non_foot_robot_ground_contact"
 
 
+@pytest.mark.parametrize('stage', ['PULL_INSERT', 'PULL_OPEN', 'PULL_ARM_RETRACT'])
+@pytest.mark.parametrize('penetration', [.002, .004])
+def test_pull_panel_contact_uses_existing_panel_penetration_limit(stage, penetration):
+    episode = AutoOpenEpisodeData(episode_index=0, seed=1700,
+        observation_state=np.zeros((1, 58), dtype=np.float32),
+        action=np.zeros((1, 25), dtype=np.float32), images={}, raw_audit={},
+        raw_contacts=({'frame_index': 0, 'body_a_path': '/World/envs/env_0/Robot/gripperMover',
+                       'body_b_path': '/World/envs/env_0/door_left/door_panel',
+                       'max_contact_force': 50., 'max_normal_impulse': .2,
+                       'max_penetration_depth': penetration},))
+    summary = _contact_acceptance_summary(episode, np.array([stage], dtype=object))
+    assert not summary['abnormal']
+    assert summary['class_maxima']['gripper_panel']['rows'] == 1
+    assert bool(summary['penetration_violations']) == (penetration > .003)
+
+
 def test_contact_aggregation_drops_zero_rows_and_merges_mirrors():
     rows = (
         ContactPairMaximum("/A", "/B", 0.2, 4.0, 0.001, (1, 2, 3), (1, 0, 0)),

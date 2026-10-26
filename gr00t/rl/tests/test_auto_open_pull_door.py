@@ -108,7 +108,7 @@ def test_pull_hinge_sign_reverses_turn_path_toward_robot_side():
 
 def test_restore_completion_can_be_the_terminal_stage():
     fsm = TensorDoorFSM.__new__(TensorDoorFSM)
-    fsm.Stage = SimpleNamespace(RESTORE_GRIPPER=10, SUCCESS=17)
+    fsm.Stage = SimpleNamespace(RESTORE_GRIPPER=10, PULL_ARM_RETRACT=23, SUCCESS=17)
     fsm.terminal_stage = fsm.Stage.RESTORE_GRIPPER
     fsm.device = torch.device("cpu")
     fsm.stage = torch.tensor([10], dtype=torch.int64)

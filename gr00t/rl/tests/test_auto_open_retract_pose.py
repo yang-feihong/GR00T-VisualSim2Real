@@ -7,7 +7,12 @@ import numpy as np
 import torch
 
 import gr00t.rl.auto_open.planning as retract_planning
-from gr00t.rl.auto_open.cli import DEFAULT_ARM_RETRACT_POSE_LOCAL
+from gr00t.rl.auto_open.cli import (
+    DEFAULT_ARM_RETRACT_POSE_LOCAL,
+    DEFAULT_ARM_RETRACT_POSITION_NOISE_RADIUS_M,
+    DEFAULT_ARM_RETRACT_ROTATION_NOISE_DEG,
+    _parser,
+)
 from gr00t.rl.auto_open.control import _ee_world_orientation_target
 from gr00t.rl.auto_open.planning import (
     _sample_ball_uniform_volume,
@@ -55,6 +60,17 @@ def test_retract_orientation_uses_goal_reference_frame_xyz_euler():
         [np.sqrt(0.5), 0.0, 0.0, np.sqrt(0.5)],
         atol=1.0e-6,
     )
+
+
+def test_retract_randomization_defaults_match_offline_checked_range():
+    parser = _parser()
+    parameters = inspect.signature(DoorController).parameters
+    for name, expected in (
+        ('arm_retract_position_noise_radius_m', 0.01),
+        ('arm_retract_rotation_noise_deg', 1.0),
+    ):
+        assert parser.get_default(name) == expected
+        assert parameters[name].default == expected
 
 
 def test_retract_orientation_composes_with_world_reference():
@@ -107,8 +123,8 @@ def _retract_selector_fixture(seed):
         arm_retract_pose_local=np.asarray(
             DEFAULT_ARM_RETRACT_POSE_LOCAL, dtype=np.float32
         ),
-        arm_retract_position_noise_radius_m=0.05,
-        arm_retract_rotation_noise_deg=5.0,
+        arm_retract_position_noise_radius_m=DEFAULT_ARM_RETRACT_POSITION_NOISE_RADIUS_M,
+        arm_retract_rotation_noise_deg=DEFAULT_ARM_RETRACT_ROTATION_NOISE_DEG,
         arm_retract_randomization_records=[],
         active_arm_retract_pose_local=None,
         ee_steady_model=model,
@@ -139,8 +155,8 @@ def test_retract_pose_is_resampled_per_entry_and_exactly_reachable():
     for pose in (first, second):
         position_delta = pose[:3] - np.asarray(DEFAULT_ARM_RETRACT_POSE_LOCAL[:3])
         rpy_delta = pose[3:] - np.asarray(DEFAULT_ARM_RETRACT_POSE_LOCAL[3:])
-        assert np.linalg.norm(position_delta) <= 0.05 + 1.0e-7
-        assert np.max(np.abs(rpy_delta)) <= math.radians(5.0) + 1.0e-7
+        assert np.linalg.norm(position_delta) <= DEFAULT_ARM_RETRACT_POSITION_NOISE_RADIUS_M + 1.0e-7
+        assert np.max(np.abs(rpy_delta)) <= math.radians(DEFAULT_ARM_RETRACT_ROTATION_NOISE_DEG) + 1.0e-7
     assert [record["stage"] for record in controller.arm_retract_randomization_records] == [
         "RESTORE_GRIPPER",
         "PUSH_ARM_RETRACT",

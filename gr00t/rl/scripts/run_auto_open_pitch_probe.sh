@@ -43,11 +43,6 @@ CUDA_VISIBLE_DEVICES="${PITCH_PROBE_GPU}" python "${ENTRY}" \
     --collection_camera_mode none \
     --doorman_door_open_io out \
     --terminal_stage RESTORE_GRIPPER \
-    --batch_contact_ik_backend exact_workers \
-    --batch_path_backend exact_workers \
-    --batch_panel_clearance_backend gpu \
-    --batch_geometry_fallback_backend numpy_batch \
-    --steady_path_workers 4 \
     --pitch_probe_output "${PITCH_PROBE_OUTPUT}" \
     --output_dir "${PITCH_PROBE_RUN_DIR}" \
     >"${PITCH_PROBE_LOG}" 2>&1

@@ -241,6 +241,17 @@ def test_point_target_stages_own_independent_arrival_profiles():
     assert APPROACH_ARRIVAL.settle_frames == ALIGN_PANEL_ARRIVAL.settle_frames
 
 
+def test_point_target_profiles_use_benchmarked_thresholds():
+    for profile in (APPROACH_ARRIVAL, ALIGN_PANEL_ARRIVAL):
+        assert profile.inner_distance_m == 0.02
+        assert profile.outer_distance_m == 0.10
+        assert profile.inner_yaw_rad == 0.05
+        assert profile.outer_yaw_rad == 0.15
+        assert profile.settle_frames == 25
+        assert profile.max_linear_speed_m_s == 0.02
+        assert profile.max_angular_speed_rad_s == 0.05
+
+
 def test_semantic_target_stages_stop_on_their_physical_condition():
     base_advance = inspect.getsource(TensorDoorFSM.command_base_advance)
     through = inspect.getsource(TensorDoorFSM.command_through)

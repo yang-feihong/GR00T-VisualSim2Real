@@ -103,7 +103,7 @@ HANDLE_CONTACT_STAGES = frozenset(
         "OPEN_AND_CLEAR",
     }
 )
-PANEL_CONTACT_STAGES = frozenset({"PUSH_OPEN", "PUSH_ARM_RETRACT"})
+PANEL_CONTACT_STAGES = frozenset({"PUSH_OPEN", "PUSH_ARM_RETRACT", "PULL_INSERT", "PULL_OPEN", "PULL_ARM_RETRACT"})
 
 
 @dataclass
@@ -641,7 +641,7 @@ def _contact_acceptance_summary(episode, stages):
                         "pair": [leaf_a, leaf_b],
                         "force_n": force,
                         "impulse_ns": impulse,
-                        "reason": "panel_contact_outside_push_open",
+                        "reason": "panel_contact_outside_allowed_stage",
                     }
                 )
         elif "/Robot/" not in joined and "ground" not in joined.lower():

@@ -64,8 +64,8 @@ class BaseArrivalProfile:
 # These values are deliberately centralized and stage-specific.  The controller
 # architecture does not depend on them, so they can be tuned without changing
 # stage logic.
-APPROACH_ARRIVAL = BaseArrivalProfile(0.05, 0.15, 0.05, 0.10, 25, 0.02, 0.05)
-ALIGN_PANEL_ARRIVAL = BaseArrivalProfile(0.05, 0.15, 0.05, 0.10, 25, 0.02, 0.05)
+APPROACH_ARRIVAL = BaseArrivalProfile(0.02, 0.10, 0.05, 0.15, 25, 0.02, 0.05)
+ALIGN_PANEL_ARRIVAL = BaseArrivalProfile(0.02, 0.10, 0.05, 0.15, 25, 0.02, 0.05)
 
 # Compatibility names for diagnostics and low-level command shaping.  They are
 # not the stage arrival contract.

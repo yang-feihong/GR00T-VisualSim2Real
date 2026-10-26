@@ -222,12 +222,9 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
     # frame.  Keep the
     # geometric target here for logging; arrival tolerances are owned by
     # the shared base-target tracker.
-    # Keep the refined 0.20 m fixed jaw outside the handle while the arm
-    # remains in its randomized middle preset.  At 0.65 m the moving jaw
-    # reaches the lever during locomotion and invalidates the precomputed
-    # closed-door trajectory; 0.77 m retains arm reach with 0.12 m more
-    # clearance.
-    self.approach_distance = 0.77
+    # Nominal station. The batch runtime may only enlarge APPROACH after
+    # measuring the actual initial closed-jaw height gap and forward extent.
+    self.approach_distance = 0.85
     self.station_xy = self.grasp_center_pos[:2] + self.approach_distance * normal
     self.panel_station_xy = self.station_xy.copy()
     self.panel_station_xy += float(

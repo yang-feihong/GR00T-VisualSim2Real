@@ -1,697 +1,461 @@
-"""Sparse planning boundary for the GPU-resident AutoOpen FSM."""
+"""GPU batch planning at FSM stage boundaries; host access is output-only."""
 
 from __future__ import annotations
 
 import math
 
-import numpy as np
 import torch
 
-from legged_gym.utils.ee_steady_inverse_gpu import (
-    batched_steady_ee_inverse_no_gravity,
+from legged_gym.utils.ee_steady_inverse_gpu import batched_steady_ee_inverse_no_gravity
+from gr00t.rl.auto_open.tensor_stage_planning import GPUStagePlanningMixin
+from gr00t.rl.auto_open.pull_entry_gpu import PullEntryGPU, quat_rotate
+from gr00t.rl.auto_open.panel_motion import PullPanelConfig
+from gr00t.rl.auto_open.first_pull_entry import plan_first_pull_entry, insertion_endpoint_radius
+from gr00t.rl.auto_open.first_pull_station import (
+    station_candidates, station_clearances, first_insertion_residuals,
 )
-from gr00t.rl.auto_open.control import (
-    _ee_world_orientation_target,
-    _ee_world_target,
-    _perturb_ee_target,
-)
-from gr00t.rl.auto_open.geometry import (
-    _geometry_metrics,
-    _physical_handle_grasp_position,
-)
-from gr00t.rl.auto_open.planning import (
-    DeferredSteadyInverse,
-    _attach_pregrasp_reachability,
-    _apply_pregrasp_candidate,
-    _prepare_panel_contact_command,
-    _pregrasp_pitch_candidates,
-    _quat_nlerp,
-    _release_path_request,
-    _sample_reachable_arm_retract_pose,
-    _steady_path_request,
-)
-from gr00t.rl.auto_open.pregrasp_reachability import (
-    select_pregrasp_candidate_from_errors,
-)
+from gr00t.rl.auto_open.control import APPROACH_ARRIVAL
+from gr00t.rl.auto_open.tensor_fsm import _yaw_from_wxyz
 
 
-def selected_state_to_host(state, env_id: int, num_envs: int):
-    """Transfer one sparse planning row while preserving shared metadata."""
-    sliced = {}
-    for name, value in state.items():
-        if isinstance(value, torch.Tensor):
-            if value.ndim > 0 and value.shape[0] == num_envs:
-                value = value[env_id : env_id + 1]
-            sliced[name] = value.detach().cpu().numpy()
-        elif isinstance(value, np.ndarray):
-            if value.ndim > 0 and value.shape[0] == num_envs:
-                value = value[env_id : env_id + 1]
-            sliced[name] = value
-        else:
-            sliced[name] = value
-    return sliced
+class TensorPlanningCoordinator(GPUStagePlanningMixin):
+    """Generate, solve, and select whole path banks without per-env dispatch."""
 
-
-class TensorPlanningCoordinator:
-    """Convert sparse FSM events into batched exact-planning requests."""
-
-    def __init__(self, controllers, views, executor, stage_enum):
+    def __init__(self, controllers, stage_enum):
         self.controllers = controllers
-        self.views = views
-        self.executor = executor
         self.Stage = stage_enum
         self.num_envs = len(controllers)
+        env = controllers[0].env
+        self.arm_joint_ids = env.arm_joint_ids.to(dtype=torch.int64)
+        self.joint_limits = env.dof_pos_limits[self.arm_joint_ids]
         self.stats = {"batches": 0, "requests": 0, "errors": 0, "labels": {}}
+        self.path_diagnostics = []
+        self.initialize_gpu_stage_constants()
+        self.pull_geometry = PullEntryGPU.from_controllers(
+            controllers, device=self.joint_limits.device, config=PullPanelConfig(),
+            max_samples=1024)
 
-    @staticmethod
-    def _ids(rows) -> list[int]:
-        if rows is None or not len(rows):
-            return []
-        return [int(value) for value in rows.detach().cpu().tolist()]
-
-    def _state(self, device_state, env_id):
-        state = selected_state_to_host(device_state, env_id, self.num_envs)
-        self.views[env_id].set_state(state)
-        return state
-
-    def _run_paths(self, pending):
-        if not pending:
-            return []
-        specs = [self._gpu_path_spec(env_id, request) for _, env_id, request in pending]
-        flat = [
-            (spec_index, sample_index, float(fraction))
-            for spec_index, spec in enumerate(specs)
-            for sample_index, fraction in enumerate(spec["fractions"])
-        ]
-        roots = np.stack([specs[index]["root"] for index, _, _ in flat])
-        arms = torch.stack([specs[index]["arm"] for index, _, _ in flat])
-        positions = np.asarray(
-            [
-                (1.0 - fraction) * specs[index]["start"]
-                + fraction * specs[index]["end"]
-                for index, _, fraction in flat
-            ]
-        )
-        orientations = np.asarray(
-            [
-                _quat_nlerp(
-                    specs[index]["start_q"], specs[index]["end_q"], fraction
-                )
-                for index, _, fraction in flat
-            ]
-        )
-        result = self._inverse_gpu_batch(
-            [specs[index]["env_id"] for index, _, _ in flat],
-            roots,
-            arms,
-            positions,
-            orientations,
-            [specs[index]["tolerance"] for index, _, _ in flat],
-        )
-        for batch_index, (index, _, _) in enumerate(flat):
-            specs[index]["positions"].append(
-                result.command_position_world[batch_index].detach().cpu().numpy()
-            )
-            specs[index]["orientations"].append(
-                result.command_orientation_world_wxyz[batch_index]
-                .detach()
-                .cpu()
-                .numpy()
-            )
-        results = []
-        for spec in specs:
-            positions = np.asarray(spec["positions"], dtype=np.float32)
-            desired = np.asarray(
-                [(1.0 - value) * spec["start"] + value * spec["end"] for value in spec["fractions"]]
-            )
-            results.append(
-                {
-                    "error": None,
-                    "positions": positions,
-                    "orientations": np.asarray(spec["orientations"], dtype=np.float32),
-                    "max_prediction_error_m": float(
-                        np.linalg.norm(positions - desired, axis=1).max(initial=0.0)
-                    ),
-                    "warning_stats": {},
-                }
-            )
+    def _record_stats(self, label, requests, errors=None):
         self.stats["batches"] += 1
-        self.stats["requests"] += len(pending)
-        for label, _, _ in pending:
-            labels = self.stats["labels"]
-            labels[label] = labels.get(label, 0) + 1
-        return results
+        self.stats["requests"] += requests
+        if errors is not None:
+            self.stats["errors"] = self.stats["errors"] + errors
+        labels = self.stats["labels"]
+        labels[label] = labels.get(label, 0) + requests
 
-    def _inverse_gpu_batch(self, env_ids, roots, arms, positions, orientations, tolerances):
-        controller = self.controllers[env_ids[0]]
-        limits = torch.stack(
-            [
-                self.controllers[env_id].env.dof_pos_limits[
-                    self.controllers[env_id].env.arm_joint_ids
-                ]
-                for env_id in env_ids
-            ]
-        )
-        return batched_steady_ee_inverse_no_gravity(
-            torch.as_tensor(positions, device=limits.device, dtype=limits.dtype),
-            torch.as_tensor(orientations, device=limits.device, dtype=limits.dtype),
-            base_position_world=torch.as_tensor(roots[:, :3], device=limits.device, dtype=limits.dtype),
-            base_orientation_world_xyzw=torch.as_tensor(roots[:, [4, 5, 6, 3]], device=limits.device, dtype=limits.dtype),
-            initial_arm_joint_positions=arms,
-            joint_limits=limits,
-            position_tolerance_m=float(max(tolerances)),
-            orientation_tolerance=1.0e-4,
-        )
-
-    def plan_turn_path(self, fsm, device_state, rows):
-        """Resolve a complete press/push-pull/return path once at stage entry."""
-        env_ids = self._ids(rows)
-        if not env_ids:
-            return
-        row_tensor = torch.as_tensor(env_ids, dtype=torch.int64, device=fsm.device)
-        lengths = fsm.turn_path.length[row_tensor].clone()
-        max_samples = int(lengths.max().item())
-        desired_positions = fsm.turn_path.positions[
-            row_tensor, :max_samples
-        ].clone()
-        desired_orientations = fsm.turn_path.orientations[
-            row_tensor, :max_samples
-        ].clone()
-        solved_positions = desired_positions.clone()
-        solved_orientations = desired_orientations.clone()
-        arm_ids = self.controllers[env_ids[0]].env.arm_joint_ids.to(
-            device=fsm.device, dtype=torch.int64
-        )
-        arms = device_state["dof_pos"][row_tensor][:, arm_ids].clone()
-        roots = device_state["root_states"][row_tensor]
-        limits = torch.stack(
-            [
-                self.controllers[env_id].env.dof_pos_limits[
-                    self.controllers[env_id].env.arm_joint_ids
-                ]
-                for env_id in env_ids
-            ]
-        )
-        env_index, sample_index = torch.where(
-            torch.arange(max_samples, device=fsm.device)[None, :]
+    def _inverse_pose_bank(self, fsm, device_state, env_ids, desired_positions,
+                           desired_orientations, lengths, *, initial_arm_joint_positions=None):
+        rows = torch.as_tensor(env_ids, dtype=torch.int64, device=fsm.device)
+        arm_ids = self.arm_joint_ids
+        arms = device_state["dof_pos"][rows][:, arm_ids]
+        roots = device_state["root_states"][rows]
+        owner, sample = torch.where(
+            torch.arange(desired_positions.shape[1], device=fsm.device)[None, :]
             < lengths[:, None]
         )
         result = batched_steady_ee_inverse_no_gravity(
-            desired_positions[env_index, sample_index],
-            desired_orientations[env_index, sample_index],
-            base_position_world=roots[env_index, :3],
-            base_orientation_world_xyzw=roots[env_index][:, [4, 5, 6, 3]],
-            initial_arm_joint_positions=arms[env_index],
-            joint_limits=limits[env_index],
+            desired_positions[owner, sample], desired_orientations[owner, sample],
+            base_position_world=roots[owner, :3],
+            base_orientation_world_xyzw=roots[owner][:, [4, 5, 6, 3]],
+            initial_arm_joint_positions=(arms[owner] if initial_arm_joint_positions is None
+                else initial_arm_joint_positions[owner,sample]), joint_limits=self.joint_limits,
         )
-        solved_positions[env_index, sample_index] = result.command_position_world
-        solved_orientations[env_index, sample_index] = (
-            result.command_orientation_world_wxyz
-        )
-        fsm.turn_path.positions[row_tensor, :max_samples] = solved_positions
-        fsm.turn_path.orientations[row_tensor, :max_samples] = solved_orientations
-        self.stats["batches"] += 1
-        self.stats["requests"] += len(env_ids)
-        labels = self.stats["labels"]
-        labels["turn_stage_path"] = labels.get("turn_stage_path", 0) + len(env_ids)
+        return result, owner, sample
 
-    def _gpu_path_spec(self, env_id, request):
-        start = np.asarray(request["start_position_world"], dtype=np.float64)
-        end = np.asarray(request["end_position_world"], dtype=np.float64)
-        start_q = np.asarray(request["start_orientation_world_wxyz"], dtype=np.float64)
-        end_q = np.asarray(request["end_orientation_world_wxyz"], dtype=np.float64)
-        if request["path_kind"] == "release":
-            count = int(request["steps"])
-            fractions = np.linspace(0.0, 1.0, count + 1)
-            tolerance = float(request["position_tolerance_m"])
-        else:
-            orientation_distance = 2.0 * math.acos(
-                float(np.clip(abs(np.dot(start_q, end_q)), 0.0, 1.0))
-            )
-            count = max(
-                1,
-                int(math.ceil(float(np.linalg.norm(end - start)) / 0.002)),
-                int(math.ceil(orientation_distance / 0.03)),
-            )
-            fractions = np.linspace(1.0 / count, 1.0, count)
-            tolerance = 5.0e-3
-        names = list(request["dof_names"])
-        values = np.asarray(request["dof_positions"], dtype=np.float32)
-        arm_ids = [names.index(f"joint{index}") for index in range(1, 7)]
-        controller = self.controllers[env_id]
-        device = controller.env.device
-        arm = torch.as_tensor(values[arm_ids], device=device, dtype=torch.float32)
-        root = np.asarray(request["root_state"], dtype=np.float32)
-        return {
-            "env_id": env_id,
-            "start": start,
-            "end": end,
-            "start_q": start_q,
-            "end_q": end_q,
-            "fractions": fractions,
-            "tolerance": tolerance,
-            "root": root,
-            "arm": arm,
-            "positions": [],
-            "orientations": [],
-        }
+    def plan_pose_path(self, fsm, device_state, rows, *, bank_name="turn_path",
+                       label="turn_stage_path", prediction_tolerance=None,
+                       truncate_at_first_unreachable=False):
+        if not len(rows):
+            return
+        bank = getattr(fsm, bank_name)
+        lengths = bank.length[rows].clone()
+        desired_positions = bank.positions[rows].clone()
+        desired_orientations = bank.orientations[rows].clone()
+        result, owner, sample = self._inverse_pose_bank(
+            fsm, device_state, rows, desired_positions, desired_orientations, lengths)
+        bank.positions[rows[owner], sample] = result.command_position_world
+        bank.orientations[rows[owner], sample] = result.command_orientation_world_wxyz
+        if prediction_tolerance is not None:
+            error = torch.linalg.vector_norm(result.position_error, dim=-1)
+            angle = 2. * torch.asin(torch.linalg.vector_norm(
+                result.orientation_error, dim=-1).clamp(0., 1.))
+            bad = ((error > prediction_tolerance) | (angle > math.radians(1.))
+                   | ~torch.isfinite(error) | ~torch.isfinite(angle))
+            first_bad = torch.full_like(lengths, desired_positions.shape[1], dtype=torch.int64)
+            first_bad.scatter_reduce_(0, owner[bad], sample[bad], reduce="amin")
+            if truncate_at_first_unreachable:
+                shortened = (first_bad >= 2) & (first_bad < lengths)
+                lengths = torch.where(shortened, first_bad, lengths)
+                bank.length[rows] = lengths.to(bank.length.dtype)
+            retained = sample < lengths[owner]
+            rejection_count = torch.zeros(len(rows), device=fsm.device, dtype=torch.int32)
+            rejection_count.scatter_reduce_(0, owner, (bad & retained).to(torch.int32), reduce="amax")
+            rejected = rejection_count != 0
+            diagnostic_error = torch.nan_to_num(error, nan=torch.inf, posinf=torch.inf)
+            diagnostic_angle = torch.nan_to_num(angle, nan=torch.inf, posinf=torch.inf)
+            max_position = torch.zeros(len(rows), device=fsm.device).scatter_reduce_(
+                0, owner[retained], diagnostic_error[retained].to(torch.float32), reduce="amax")
+            max_orientation = torch.zeros_like(max_position).scatter_reduce_(
+                0, owner[retained], diagnostic_angle[retained].to(torch.float32), reduce="amax")
+            worst = torch.full_like(lengths, len(sample), dtype=torch.int64)
+            batch_index = torch.arange(len(sample), device=fsm.device)
+            maxima = retained & (diagnostic_error == max_position[owner])
+            worst.scatter_reduce_(0, owner[maxima], batch_index[maxima], reduce="amin")
+            worst = worst.clamp_max(max(len(sample) - 1, 0))
+            conditions = {
+                "path_inverse_position_residual_m": (max_position <= prediction_tolerance, max_position, "<=", prediction_tolerance),
+                "path_inverse_orientation_residual_rad": (max_orientation <= math.radians(1.), max_orientation, "<=", math.radians(1.)),
+            }
+            for stage in (self.Stage.PRESS_HANDLE, self.Stage.PUSH_PULL_DOOR,
+                          self.Stage.RETURN_HANDLE, self.Stage.PULL_OPEN):
+                selected = fsm.stage[rows] == int(stage)
+                stage_conditions = {
+                    name: (passed[selected], values[selected], relation, threshold)
+                    for name, (passed, values, relation, threshold) in conditions.items()
+                }
+                fsm.record_acceptance(stage, rows[selected], stage_conditions)
+            fsm.fail(rows[rejected], 49)
+            self.path_diagnostics.append((label, rows.clone(), {
+                "sample_count": lengths.clone(),
+                "max_position_error_m": max_position,
+                "max_orientation_error_rad": max_orientation,
+                "worst_position_sample": sample[worst],
+                "desired_position_world_m": desired_positions[
+                    torch.arange(len(rows), device=fsm.device), sample[worst]],
+                "predicted_position_world_m": desired_positions[
+                    torch.arange(len(rows), device=fsm.device), sample[worst]] + result.position_error[worst],
+                "inverse_command_position_world_m": result.command_position_world[worst],
+                "solved_arm_joints_rad": result.arm_joint_positions[worst],
+                "first_unreachable_sample": first_bad,
+            }))
+            self.stats["errors"] = self.stats["errors"] + rejected.sum()
+        self._record_stats(label, len(rows))
 
-    def plan_pregrasp(self, fsm, device_state, rows):
-        entries = []
-        for env_id in self._ids(rows):
-            controller = self.controllers[env_id]
-            state = self._state(device_state, env_id)
-            candidates = []
-            for candidate in _pregrasp_pitch_candidates(controller):
-                position, orientation = _perturb_ee_target(
-                    controller,
-                    "pregrasp",
-                    candidate["end_position"],
-                    candidate["orientation"],
-                )
-                candidates.append(
-                    _attach_pregrasp_reachability(
-                        controller,
-                        {
-                            "pitch_deg": candidate["pitch_deg"],
-                            "orientation": orientation.astype(float).tolist(),
-                            "end_position": position.astype(float).tolist(),
-                            "nominal_orientation": candidate[
-                                "orientation"
-                            ].astype(float).tolist(),
-                            "nominal_end_position": candidate[
-                                "end_position"
-                            ].astype(float).tolist(),
-                        },
-                        position,
-                        state,
-                    )
-                )
-            entries.append((env_id, controller, state, candidates))
+    def plan_pull_open(self, fsm, device_state, rows):
+        if not len(rows):
+            return
+        self.plan_pose_path(
+            fsm, device_state, rows, bank_name="pull_open_path", label="pull_panel_arc",
+            prediction_tolerance=fsm.pull_panel_config.position_tolerance_m,
+            truncate_at_first_unreachable=True)
 
-        selections = self._select_pregrasp_gpu_batch(entries)
-        pending = []
-        metadata = {}
-        for (env_id, controller, state, _), selection_result in zip(
-            entries, selections, strict=True
-        ):
-            selection, exact, diagnostics = selection_result
-            controller.pregrasp_pitch_diagnostics = diagnostics
-            if not exact:
-                print(
-                    f"[doorman][pregrasp-pitch][error] env={env_id} "
-                    f"no reachable pitch; candidates={diagnostics}",
-                    flush=True,
-                )
-                fsm.fail(torch.as_tensor([env_id], device=fsm.device), 47)
+    def plan_initial_pull_station(self, fsm, device_state, rows, *, arrival_xy_error=None, arrival_yaw_error=None):
+        if not len(rows):
+            return
+        config = fsm.pull_station_config
+        fsm.pull_first_station_attempts[rows] += 1
+        xy, yaw, local = station_candidates(
+            fsm.hinge_world[rows], fsm.door_normal[rows], fsm.pull_free_direction[rows],
+            fsm.pull_frame_edge[rows], fsm.pull_wall_front[rows],
+            fsm.sample_initial_pull_stations(rows), config)
+        wall, frame = station_clearances(
+            device_state['root_states'][rows], device_state['robot_body_state_w'][rows],
+            fsm.pull_motion_points, fsm.pull_motion_body_indices, xy, yaw,
+            fsm.door_normal[rows], fsm.pull_free_direction[rows], fsm.hinge_world[rows],
+            fsm.pull_frame_edge[rows], fsm.pull_wall_front[rows])
+        clearance_safe = ((wall >= config.wall_clearance_m + config.planning_margin_m)
+                          & (frame >= config.clearance_m + config.planning_margin_m))
+        nominal_clearance_safe = clearance_safe.clone()
+        candidate_count = xy.shape[1]
+        evaluation_xy, evaluation_yaw, evaluation_safe = xy, yaw, clearance_safe
+        if arrival_xy_error is not None:
+            forecast_xy = xy + arrival_xy_error[:, None]
+            forecast_yaw = yaw + arrival_yaw_error[:, None]
+            forecast_wall, forecast_frame = station_clearances(
+                device_state['root_states'][rows], device_state['robot_body_state_w'][rows],
+                fsm.pull_motion_points, fsm.pull_motion_body_indices, forecast_xy, forecast_yaw,
+                fsm.door_normal[rows], fsm.pull_free_direction[rows], fsm.hinge_world[rows],
+                fsm.pull_frame_edge[rows], fsm.pull_wall_front[rows])
+            forecast_safe = ((forecast_wall >= config.wall_clearance_m + config.planning_margin_m)
+                             & (forecast_frame >= config.clearance_m + config.planning_margin_m))
+            distance = torch.linalg.vector_norm(xy - device_state['root_states'][rows, None, :2], dim=-1)
+            angle_delta = yaw - _yaw_from_wxyz(device_state['root_states'][rows, 3:7])[:, None]
+            angle_distance = torch.atan2(angle_delta.sin(), angle_delta.cos()).abs()
+            # A fresh arrival latch would otherwise immediately stop without
+            # moving the rejected actual stance to the new nominal target.
+            moves = ((distance >= APPROACH_ARRIVAL.inner_distance_m)
+                     | (angle_distance >= APPROACH_ARRIVAL.inner_yaw_rad))
+            clearance_safe &= forecast_safe & moves
+            evaluation_xy = torch.cat((xy, forecast_xy), dim=1)
+            evaluation_yaw = torch.cat((yaw, forecast_yaw), dim=1)
+            evaluation_safe = torch.cat((clearance_safe, clearance_safe), dim=1)
+        inverse_safe, error, angle = first_insertion_residuals(
+            self.pull_geometry, device_state, rows, evaluation_xy, evaluation_yaw, evaluation_safe,
+            fsm.pull_cycle_pose_grid, self.arm_joint_ids, self.joint_limits,
+            fsm.pull_frame_edge[rows], fsm.pull_wall_front[rows],
+            fsm.pull_hardware_z[rows], fsm.pull_panel_config,
+            (fsm.env.get_goal_reference_origin(), fsm.env.get_goal_reference_quat(),
+             fsm.env.get_goal_center_offset_local()))
+        forecast_feasible = torch.ones_like(clearance_safe)
+        forecast_score = torch.zeros_like(wall)
+        if arrival_xy_error is not None:
+            forecast_feasible = inverse_safe[:, candidate_count:].any(-1)
+            forecast_score = torch.maximum(
+                error[:, candidate_count:] / fsm.pull_panel_config.position_tolerance_m,
+                angle[:, candidate_count:] / math.radians(1.)).amin(-1)
+            forecast_score = torch.nan_to_num(forecast_score, nan=torch.finfo(wall.dtype).max)
+            inverse_safe = inverse_safe[:, :candidate_count]
+        feasible = clearance_safe & inverse_safe.any(-1)
+        accepted = feasible.any(-1)
+        selected = forecast_score.masked_fill(~feasible, torch.inf).argmin(-1)
+        owners = torch.arange(len(rows), device=fsm.device)
+        chosen_owner = owners[accepted]
+        chosen = selected[accepted]
+        rotation = .5 * fsm.hinge_axis_sign[rows] * device_state['door_joint_position'][rows, fsm.hinge_idx]
+        tangent = fsm.pull_free_direction[rows]
+        c, s = rotation.cos(), rotation.sin()
+        # Gap midpoint is diagnostic only; station coordinates use the frame edge.
+        edge = fsm.pull_free_edge[rows, None] * tangent
+        rotated = torch.stack((c * edge[:, 0] - s * edge[:, 1], s * edge[:, 0] + c * edge[:, 1]), -1)
+        gap = fsm.hinge_world[rows, :2] + c[:, None] * rotated
+        fsm.install_initial_pull_station(rows[accepted], xy[chosen_owner, chosen], yaw[chosen_owner, chosen],
+            gap[accepted], frame[chosen_owner, chosen], wall[chosen_owner, chosen])
+        fsm.pull_initial_station_history.append_batch(rows, {
+            'entry_root_state': device_state['root_states'][rows].clone(),
+            'entry_arm_joint_position_rad': device_state['dof_pos'][rows][:, self.arm_joint_ids].clone(),
+            'candidate_local_x_y_yaw_deg': local, 'candidate_xy_world_m': xy,
+            'candidate_yaw_world_rad': yaw, 'wall_clearance_m': wall, 'frame_clearance_m': frame,
+            'nominal_clearance_safe': nominal_clearance_safe,
+            'clearance_safe': clearance_safe, 'insertion_candidate_feasible': inverse_safe,
+            'path_max_position_error_m': error[:, :candidate_count],
+            'path_max_orientation_error_rad': angle[:, :candidate_count],
+            'forecast_path_max_position_error_m': error[:, candidate_count:],
+            'forecast_path_max_orientation_error_rad': angle[:, candidate_count:],
+            'forecast_is_ranking_only': True,
+            'candidate_feasible': feasible, 'selected_attempt': torch.where(accepted, selected, -1),
+            'station_attempt': fsm.pull_first_station_attempts[rows].clone(),
+            'arrival_xy_error_world_m': torch.zeros_like(xy[:, 0]) if arrival_xy_error is None else arrival_xy_error,
+            'arrival_yaw_error_rad': torch.zeros_like(yaw[:, 0]) if arrival_yaw_error is None else arrival_yaw_error,
+            'forecast_insertion_feasible': forecast_feasible,
+        })
+        fsm.record_acceptance(self.Stage.PULL_CLEAR_SWEEP, rows, {
+            'station_clearance_candidate_exists': (clearance_safe.any(-1), clearance_safe.sum(-1), '>=', 1),
+            'station_full_insertion_candidate_exists': (accepted, feasible.sum(-1), '>=', 1),
+        })
+        fsm.fail(rows[~accepted], 55)
+        self._record_stats('first_pull_station', len(rows), (~accepted).sum())
+
+    def retry_first_pull_station(self, fsm, device_state, rows):
+        """Re-enter the same station controller, with measured arrival error."""
+        xy_error = device_state['root_states'][rows, :2] - fsm.pull_station_xy[rows]
+        yaw_error = _yaw_from_wxyz(device_state['root_states'][rows, 3:7]) - fsm.pull_station_yaw[rows]
+        yaw_error = torch.atan2(yaw_error.sin(), yaw_error.cos())
+        fsm.pull_cycle[rows] = 0
+        fsm.begin_pull_clear_sweep(device_state, rows)
+        self.plan_initial_pull_station(fsm, device_state, rows,
+            arrival_xy_error=xy_error, arrival_yaw_error=yaw_error)
+
+    def plan_pull_insert(self, fsm, device_state, rows):
+        if not len(rows):
+            return
+        cycle = fsm.pull_cycle[rows].clone()
+        draws = fsm.sample_pull_cycle_candidates(rows)
+        sample_names = ("height_m", "insertion_m", "yaw_rad", "station_angle_rad")
+        samples = dict(zip(sample_names, draws.unbind(-1)))
+        first_entry = cycle == 0
+        geometry = {}
+        for initial in (True, False):
+            selected = torch.where(first_entry == initial)[0]
+            if not len(selected):
                 continue
-            print(
-                "[doorman][pregrasp-pitch] "
-                f"env={env_id} selected={selection['pitch_deg']:.0f}deg "
-                f"candidates={diagnostics}",
-                flush=True,
-            )
-            request = _steady_path_request(
-                state,
-                state["ee_pos"][0],
-                selection["end_position"],
-                selection["orientation"],
-                start_orientation_world_wxyz=state["ee_orn"][0],
-            )
-            request["path_kind"] = "steady"
-            pending.append(("arm_align_path", env_id, request))
-            metadata[env_id] = selection
-        results = self._run_paths(pending)
-        ids, positions, orientations, targets = [], [], [], []
-        for (_, env_id, _), result in zip(pending, results, strict=True):
-            if result["error"] is not None:
-                self.stats["errors"] += 1
-                fsm.fail(torch.as_tensor([env_id], device=fsm.device), 40)
-                continue
-            selection = metadata[env_id]
-            controller = self.controllers[env_id]
-            _apply_pregrasp_candidate(
-                controller,
-                {
-                    "pitch_deg": selection["pitch_deg"],
-                    "orientation": selection["nominal_orientation"],
-                    "end_position": selection["nominal_end_position"],
-                },
-            )
-            controller.arm_align_desired_target_world = np.asarray(
-                selection["end_position"], dtype=np.float32
-            )
-            ids.append(env_id)
-            positions.append(result["positions"])
-            orientations.append(result["orientations"])
-            targets.append(selection["end_position"])
-        if ids:
-            fsm.install_pregrasp_plan(ids, positions, orientations, targets)
-
-    def _select_pregrasp_gpu_batch(self, entries):
-        if not entries:
-            return []
-        flat = []
-        for entry_index, (env_id, _, state, candidates) in enumerate(entries):
-            names = list(state["dof_names"])
-            values = np.asarray(state["dof_pos"])[0]
-            arm_ids = [names.index(f"joint{index}") for index in range(1, 7)]
-            root = np.asarray(state["root_states"])[0]
-            for candidate_index, candidate in enumerate(candidates):
-                flat.append((entry_index, env_id, candidate_index, candidate, root, values[arm_ids]))
-        device = self.controllers[flat[0][1]].env.device
-        sample_counts = [len(item[3]["reachability_positions"]) for item in flat]
-        sample_rows = np.repeat(np.arange(len(flat)), sample_counts)
-        initial_arms = torch.as_tensor(
-            np.asarray([item[5] for item in flat]), device=device, dtype=torch.float32
-        )
-        positions = np.concatenate([item[3]["reachability_positions"] for item in flat])
-        orientations = np.concatenate([item[3]["reachability_orientations"] for item in flat])
-        roots = np.asarray([item[4] for item in flat])[sample_rows]
-        device_sample_rows = torch.as_tensor(sample_rows, device=device, dtype=torch.int64)
-        limits = torch.stack(
-            [
-                self.controllers[item[1]].env.dof_pos_limits[
-                    self.controllers[item[1]].env.arm_joint_ids
-                ]
-                for item in flat
-            ]
-        )
-        result = batched_steady_ee_inverse_no_gravity(
-            torch.as_tensor(positions, device=device, dtype=torch.float32),
-            torch.as_tensor(orientations, device=device, dtype=torch.float32),
-            base_position_world=torch.as_tensor(
-                roots[:, :3], device=device, dtype=torch.float32
-            ),
-            base_orientation_world_xyzw=torch.as_tensor(
-                roots[:, [4, 5, 6, 3]], device=device, dtype=torch.float32
-            ),
-            initial_arm_joint_positions=initial_arms[device_sample_rows],
-            joint_limits=limits[device_sample_rows],
-            position_tolerance_m=float("inf"),
-            orientation_tolerance=float("inf"),
-        )
-        position_errors = (
-            torch.linalg.vector_norm(result.position_error, dim=-1)
-            .detach()
-            .cpu()
-            .numpy()
-        )
-        orientation_errors = (
-            torch.linalg.vector_norm(result.orientation_error, dim=-1)
-            .detach()
-            .cpu()
-            .numpy()
-        )
-        selections = []
-        boundaries = np.cumsum(sample_counts)[:-1]
-        position_errors = np.split(position_errors, boundaries)
-        orientation_errors = np.split(orientation_errors, boundaries)
-        offset = 0
-        for _, _, _, candidates in entries:
-            count = len(candidates)
-            selections.append(
-                select_pregrasp_candidate_from_errors(
-                    candidates,
-                    position_errors[offset : offset + count],
-                    orientation_errors[offset : offset + count],
-                )
-            )
-            offset += count
-        return selections
-
-    def plan_center(self, fsm, device_state, rows):
-        pending = []
-        metadata = {}
-        for env_id in self._ids(rows):
-            controller = self.controllers[env_id]
-            state = self._state(device_state, env_id)
-            handle_pose = state["door_body_state_w"][0, controller.handle_body_idx, :7]
-            grasp_center = _physical_handle_grasp_position(controller, handle_pose)
-            metrics = _geometry_metrics(controller, state, grasp_center)
-            if not metrics.get("valid"):
-                fsm.fail(torch.as_tensor([env_id], device=fsm.device), 41)
-                continue
-            fixed_upper = bool(np.asarray(metrics["fixed_center"])[2] >= grasp_center[2])
-            fixed_gap = max(
-                float(metrics["upper_gap" if fixed_upper else "lower_gap"]), 0.0
-            )
-            error = float(metrics["channel_vertical_error"])
-            needed = max(abs(error) - 0.008, 0.0)
-            available = max(0.019 - fixed_gap, 0.0)
-            shift = -math.copysign(min(needed, available), error) if needed else 0.0
-            if abs(error + shift) > 0.010:
-                fsm.fail(torch.as_tensor([env_id], device=fsm.device), 42)
-                continue
-            controller.arm_forward_target_world = controller.grasp_waypoint_world.copy()
-            controller.arm_forward_target_world[2] += shift
-            target, orientation = _perturb_ee_target(
-                controller,
-                "center_handle",
-                controller.arm_forward_target_world,
-                controller.grasp_orientation_quat,
-            )
-            controller.arm_forward_desired_target_world = target.copy()
-            request = _steady_path_request(
-                state,
-                state["ee_pos"][0],
-                target,
-                orientation,
-                start_orientation_world_wxyz=controller.grasp_orientation_quat,
-            )
-            request["path_kind"] = "steady"
-            pending.append(("arm_forward_path", env_id, request))
-            metadata[env_id] = target
-        results = self._run_paths(pending)
-        ids, positions, orientations, targets = [], [], [], []
-        for (_, env_id, _), result in zip(pending, results, strict=True):
-            if result["error"] is not None:
-                self.stats["errors"] += 1
-                fsm.fail(torch.as_tensor([env_id], device=fsm.device), 43)
-                continue
-            ids.append(env_id)
-            positions.append(result["positions"])
-            orientations.append(result["orientations"])
-            targets.append(metadata[env_id])
-        if ids:
-            fsm.install_center_plan(ids, positions, orientations, targets)
-
-    def _release_request(self, controller, state, label, start, end, start_q, end_q, q0, q1, steps):
-        return _release_path_request(
-            state, start, end, start_q, end_q, q0, q1, steps,
-            controller.pregrasp_position_tolerance,
-            int(controller.env.gripper_joint_ids[0].item()),
-        )
-
-    def plan_release_open(self, fsm, device_state, rows):
-        pending = []
-        for env_id in self._ids(rows):
-            controller = self.controllers[env_id]
-            state = self._state(device_state, env_id)
-            start = state["ee_pos"][0].copy()
-            start_q = state["ee_orn"][0].copy()
-            end = start + np.asarray(
-                [0.0, 0.0, float(fsm.release_vertical_delta[env_id].item())],
-                dtype=np.float32,
-            )
-            end, end_q = _perturb_ee_target(
-                controller, "open_and_clear", end, start_q
-            )
-            request = self._release_request(
-                controller, state, "release_open_path", start, end, start_q, end_q,
-                controller.q_closed, controller.q_open, 35,
-            )
-            pending.append(("release_open_path", env_id, request))
-        results = self._run_paths(pending)
-        self._install_simple_path(fsm, pending, results, "open")
-
-    def plan_retreat(self, fsm, device_state, rows):
-        pending, targets = [], {}
-        for env_id in self._ids(rows):
-            controller = self.controllers[env_id]
-            state = self._state(device_state, env_id)
-            start = state["ee_pos"][0].copy()
-            end = start + 0.10 * controller.door_normal + np.asarray([0, 0, 0.02], dtype=np.float32)
-            end, end_q = _perturb_ee_target(
-                controller, "retreat_arm", end, state["ee_orn"][0]
-            )
-            steps = max(50, int(math.ceil(float(np.linalg.norm(end - start)) / 0.002)))
-            request = self._release_request(
-                controller, state, "release_retreat_path", start, end,
-                state["ee_orn"][0], end_q, controller.q_open, controller.q_open, steps,
-            )
-            pending.append(("release_retreat_path", env_id, request))
-            targets[env_id] = end
-        results = self._run_paths(pending)
-        ids, positions, orientations, acceptance = self._successful_paths(
-            fsm, pending, results
-        )
-        acceptance = [targets[env_id] for env_id in ids]
-        if ids:
-            fsm.install_retreat_plan(ids, positions, orientations, acceptance)
-
-    def plan_restore(self, fsm, device_state, rows):
-        pending, endpoints = [], {}
-        for env_id in self._ids(rows):
-            controller = self.controllers[env_id]
-            state = self._state(device_state, env_id)
-            try:
-                _sample_reachable_arm_retract_pose(
-                    controller, state, self.Stage.RESTORE_GRIPPER.name
-                )
-            except RuntimeError:
-                self.stats["errors"] += 1
-                fsm.fail(torch.as_tensor([env_id], device=fsm.device), 46)
-                continue
-            fsm.active_arm_retract_pose_local[env_id] = torch.as_tensor(
-                controller.active_arm_retract_pose_local,
-                device=fsm.device,
-                dtype=torch.float32,
-            )
-            end = _ee_world_target(controller, controller.active_arm_retract_pose_local[:3])
-            end_q = _ee_world_orientation_target(
-                controller, controller.active_arm_retract_pose_local[3:]
-            )
-            end, end_q = _perturb_ee_target(
-                controller, "restore_gripper", end, end_q
-            )
-            start = state["ee_pos"][0]
-            steps = max(50, int(math.ceil(float(np.linalg.norm(end - start)) / 0.004)))
-            request = self._release_request(
-                controller, state, "release_restore_path", start, end,
-                state["ee_orn"][0], end_q, controller.q_open, controller.q_closed, steps,
-            )
-            pending.append(("release_restore_path", env_id, request))
-            endpoints[env_id] = (end, end_q)
-        results = self._run_paths(pending)
-        ids, positions, orientations, _ = self._successful_paths(fsm, pending, results)
-        if ids:
-            fsm.install_restore_plan(
-                ids, positions, orientations,
-                [endpoints[env_id][0] for env_id in ids],
-                [endpoints[env_id][1] for env_id in ids],
-            )
-
-    def _successful_paths(self, fsm, pending, results):
-        ids, positions, orientations = [], [], []
-        for (_, env_id, _), result in zip(pending, results, strict=True):
-            if result["error"] is not None:
-                self.stats["errors"] += 1
-                fsm.fail(torch.as_tensor([env_id], device=fsm.device), 44)
-                continue
-            ids.append(env_id)
-            positions.append(result["positions"])
-            orientations.append(result["orientations"])
-        return ids, positions, orientations, None
-
-    def _install_simple_path(self, fsm, pending, results, kind):
-        ids, positions, orientations, _ = self._successful_paths(
-            fsm, pending, results
-        )
-        if kind == "open" and ids:
-            fsm.install_release_open_plan(ids, positions, orientations)
-
-    def plan_contact(self, fsm, device_state, rows):
-        pending = []
-        ids, panel, desired, commands, orientations = [], [], [], [], []
-        for env_id in self._ids(rows):
-            controller = self.controllers[env_id]
-            state = self._state(device_state, env_id)
-            if bool(fsm.panel_contact_orientation_seed_valid[env_id].item()):
-                controller.panel_contact_orientation = (
-                    fsm.panel_contact_orientation_seed[env_id]
-                    .detach()
-                    .cpu()
-                    .numpy()
-                    .copy()
-                )
-                fsm.panel_contact_orientation_seed_valid[env_id] = False
+            group = rows[selected]
+            group_samples = {key: value[selected] for key, value in samples.items()}
+            kwargs = dict(frame_edge_m=fsm.pull_frame_edge[group],
+                          wall_front_m=fsm.pull_wall_front[group],
+                          hardware_height_bounds=fsm.pull_hardware_z[group])
+            reference = (fsm.env.get_goal_reference_origin()[group],
+                         fsm.env.get_goal_reference_quat()[group],
+                         fsm.env.get_goal_center_offset_local()[group])
+            if initial:
+                result = plan_first_pull_entry(self.pull_geometry, device_state, group, group_samples,
+                                                config=fsm.pull_panel_config, goal_reference=reference,
+                                                include_approach=True, **kwargs)
             else:
-                controller.panel_contact_orientation = None
-            controller.prepared_panel_contact_command = None
-            controller.defer_steady_inverse = True
-            try:
-                _prepare_panel_contact_command(controller, state)
-                command_position, command_orientation = (
-                    controller.prepared_panel_contact_command
-                )
-                ids.append(env_id)
-                panel.append(controller.panel_contact_target_world)
-                desired.append(controller.panel_contact_desired_ee_world)
-                commands.append(command_position)
-                orientations.append(command_orientation)
-            except DeferredSteadyInverse as request:
-                pending.append((env_id, request))
-            except RuntimeError:
-                self.stats["errors"] += 1
-                fsm.fail(torch.as_tensor([env_id], device=fsm.device), 45)
-            finally:
-                controller.defer_steady_inverse = False
-        if pending:
-            roots, arms, positions, target_orientations, tolerances = [], [], [], [], []
-            for env_id, request in pending:
-                request_state = request.state
-                names = list(request_state["dof_names"])
-                values = np.asarray(request_state["dof_pos"])[0]
-                arm_ids = [names.index(f"joint{index}") for index in range(1, 7)]
-                roots.append(np.asarray(request_state["root_states"])[0])
-                arms.append(torch.as_tensor(values[arm_ids], device=fsm.device, dtype=torch.float32))
-                positions.append(request.desired_position_world)
-                target_orientations.append(request.desired_orientation_world)
-                tolerances.append(
-                        5.0e-3
-                        if request.position_tolerance_m is None
-                        else request.position_tolerance_m
-                )
-            result = self._inverse_gpu_batch(
-                [env_id for env_id, _ in pending],
-                np.asarray(roots),
-                torch.stack(arms),
-                np.asarray(positions),
-                np.asarray(target_orientations),
-                tolerances,
-            )
-            position_error = torch.linalg.vector_norm(result.position_error, dim=-1)
-            orientation_error = torch.linalg.vector_norm(result.orientation_error, dim=-1)
-            for batch_index, (env_id, request) in enumerate(pending):
-                controller = self.controllers[env_id]
-                exact = (
-                    float(position_error[batch_index].item()) <= tolerances[batch_index]
-                    and float(orientation_error[batch_index].item()) <= 1.0e-4
-                )
-                if not exact:
-                    self.stats["errors"] += 1
-                    fsm.fail(torch.as_tensor([env_id], device=fsm.device), 45)
-                    continue
-                ids.append(env_id)
-                panel.append(controller.panel_contact_target_world)
-                desired.append(request.desired_position_world)
-                commands.append(
-                    result.command_position_world[batch_index].detach().cpu().numpy()
-                )
-                orientations.append(
-                    result.command_orientation_world_wxyz[batch_index]
-                    .detach()
-                    .cpu()
-                    .numpy()
-                )
-        if ids:
-            fsm.install_contact_plan(ids, panel, desired, commands, orientations)
+                result = self.pull_geometry.plan(device_state, group, group_samples, **kwargs)
+            radius = insertion_endpoint_radius(result['endpoint'], device_state['root_states'][group], reference)
+            safe = radius <= fsm.pull_panel_config.insertion_max_horizontal_radius_m
+            result['endpoint_horizontal_radius_m'] = radius
+            result['endpoint_radius_safe'] = safe
+            result['feasible'] &= safe
+            for key, value in result.items():
+                if key not in geometry:
+                    geometry[key] = value.new_empty((len(rows), *value.shape[1:]))
+                geometry[key][selected] = value
+        feasible_geometry = geometry["feasible"]
+        candidate_owner, attempt = torch.where(feasible_geometry)
+        positions = geometry["positions"][candidate_owner, attempt]
+        orientations = geometry["orientations"][candidate_owner, attempt]
+        lengths = geometry["lengths"][candidate_owner, attempt]
+        max_position = torch.full(feasible_geometry.shape, torch.inf, device=fsm.device)
+        max_orientation = torch.full_like(max_position, torch.inf)
+        face_gap = torch.full_like(max_position, torch.inf)
+        worst_sample = torch.full(feasible_geometry.shape, -1, device=fsm.device, dtype=torch.int64)
+        worst_desired = torch.full((*feasible_geometry.shape, 3), torch.nan, device=fsm.device)
+        worst_predicted = torch.full_like(worst_desired, torch.nan)
+        worst_command = torch.full_like(worst_desired, torch.nan)
+        worst_joints = torch.full((*feasible_geometry.shape, 6), torch.nan, device=fsm.device)
+        solved_positions = positions.clone()
+        solved_orientations = orientations.clone()
+        solved_joints = positions.new_zeros((*positions.shape[:2], 6))
+        wall_clearance = torch.full_like(max_position, torch.inf)
+        if len(candidate_owner):
+            result, owner, sample = self._inverse_pose_bank(
+                fsm, device_state, rows[candidate_owner], positions, orientations, lengths)
+            solved_positions[owner, sample] = result.command_position_world
+            solved_orientations[owner, sample] = result.command_orientation_world_wxyz
+            solved_joints[owner, sample] = result.arm_joint_positions
+            initial_points = torch.where(first_entry[candidate_owner[owner]])[0]
+            if len(initial_points):
+                from gr00t.rl.auto_open.first_pull_wall import FirstPullArmWallGPU
+                if not hasattr(self, '_first_pull_wall'):
+                    self._first_pull_wall = FirstPullArmWallGPU(device=fsm.device)
+                env_rows = rows[candidate_owner[owner[initial_points]]]
+                gap = self._first_pull_wall.clearance(
+                    device_state['root_states'][env_rows], result.arm_joint_positions[initial_points],
+                    fsm.q_closed[env_rows], self.pull_geometry.hinge_world[env_rows],
+                    self.pull_geometry.door_normal[env_rows], self.pull_geometry.tangent[env_rows],
+                    fsm.pull_frame_edge[env_rows], fsm.pull_wall_front[env_rows])
+                per_candidate_gap = torch.full((len(candidate_owner),), torch.inf, device=fsm.device, dtype=gap.dtype)
+                per_candidate_gap.scatter_reduce_(0, owner[initial_points], gap, reduce='amin')
+                wall_clearance[candidate_owner, attempt] = per_candidate_gap.to(wall_clearance.dtype)
+            error = torch.linalg.vector_norm(result.position_error, dim=-1)
+            angle = 2. * torch.asin(torch.linalg.vector_norm(
+                result.orientation_error, dim=-1).clamp(0., 1.))
+            per_candidate_position = torch.zeros(len(candidate_owner), device=fsm.device).scatter_reduce_(
+                0, owner, torch.nan_to_num(error, nan=torch.inf), reduce="amax")
+            per_candidate_orientation = torch.zeros_like(per_candidate_position).scatter_reduce_(
+                0, owner, torch.nan_to_num(angle, nan=torch.inf), reduce="amax")
+            max_position[candidate_owner, attempt] = per_candidate_position
+            max_orientation[candidate_owner, attempt] = per_candidate_orientation
+            worst = torch.full((len(candidate_owner),), len(sample), dtype=torch.int64, device=fsm.device)
+            diagnostic_error = torch.nan_to_num(error, nan=torch.inf, posinf=torch.inf)
+            maxima = diagnostic_error == per_candidate_position[owner]
+            indices = torch.arange(len(sample), device=fsm.device)
+            worst.scatter_reduce_(0, owner[maxima], indices[maxima], reduce="amin")
+            worst = worst.clamp_max(max(len(sample) - 1, 0))
+            worst_sample[candidate_owner, attempt] = sample[worst]
+            desired = positions[torch.arange(len(candidate_owner), device=fsm.device), sample[worst]]
+            worst_desired[candidate_owner, attempt] = desired
+            worst_predicted[candidate_owner, attempt] = desired + result.position_error[worst]
+            worst_command[candidate_owner, attempt] = result.command_position_world[worst]
+            worst_joints[candidate_owner, attempt] = result.arm_joint_positions[worst]
+            endpoint = lengths.to(torch.int64) - 1
+            candidate_index = torch.arange(len(candidate_owner), device=fsm.device)
+            face = solved_positions[candidate_index, endpoint] + quat_rotate(
+                solved_orientations[candidate_index, endpoint],
+                geometry["face_offset_local"][candidate_owner, attempt])
+            face_gap[candidate_owner, attempt] = ((
+                geometry["contact_point"][candidate_owner, attempt] - face)
+                * geometry["normal"][candidate_owner, attempt]).sum(-1)
+        tolerance = fsm.pull_panel_config.position_tolerance_m
+        feasible = (feasible_geometry & (max_position <= tolerance)
+                    & (max_orientation <= math.radians(1.))
+                    & (first_entry[:, None] | ((face_gap >= -.001) & (face_gap <= .010))))
+        valid_segments = torch.arange(solved_joints.shape[1]-1, device=fsm.device)[None] < lengths[:, None]-1
+        joint_delta = (solved_joints[:, 1:]-solved_joints[:, :-1]).abs().amax(-1)
+        timed_lengths = 1+torch.where(valid_segments, torch.ceil(joint_delta/.01).clamp_min(1), 0).sum(1)
+        path_smooth = torch.where(valid_segments, joint_delta, 0.).amax(1) <= .15
+        path_safe = (wall_clearance[candidate_owner, attempt] >= .01) & path_smooth & (timed_lengths <= positions.shape[1])
+        feasible[candidate_owner, attempt] &= ~first_entry[candidate_owner] | path_safe
+        selected = feasible.to(torch.int64).argmax(1)
+        accepted = feasible.any(1)
+        best_score = torch.maximum(max_position / tolerance, max_orientation / math.radians(1.))
+        diagnostic_attempt = torch.where(accepted, selected, best_score.argmin(1))
+        local_rows = torch.arange(len(rows), device=fsm.device)
+        fsm.record_acceptance(self.Stage.PULL_INSERT, rows, {
+            "endpoint_horizontal_radius_m": (
+                geometry['endpoint_radius_safe'][local_rows, diagnostic_attempt],
+                geometry['endpoint_horizontal_radius_m'][local_rows, diagnostic_attempt],
+                "<=", fsm.pull_panel_config.insertion_max_horizontal_radius_m),
+            "path_inverse_position_residual_m": (max_position[local_rows, diagnostic_attempt] <= tolerance,
+                max_position[local_rows, diagnostic_attempt], "<=", tolerance),
+            "path_inverse_orientation_residual_rad": (max_orientation[local_rows, diagnostic_attempt] <= math.radians(1.),
+                max_orientation[local_rows, diagnostic_attempt], "<=", math.radians(1.)),
+            "insertion_candidate_feasible": (accepted, accepted.to(torch.float32), "==", 1.),
+            "first_approach_wall_clearance_m": (
+                ~first_entry | (wall_clearance[local_rows, diagnostic_attempt] >= .01),
+                wall_clearance[local_rows, diagnostic_attempt], '>=', .01),
+        })
+        lookup = torch.full(feasible.shape, -1, dtype=torch.int64, device=fsm.device)
+        lookup[candidate_owner, attempt] = torch.arange(len(candidate_owner), device=fsm.device)
+        chosen = lookup[local_rows[accepted], selected[accepted]]
+        accepted_rows = rows[accepted]
+        chosen_attempt = selected[accepted]
+        chosen_owner = local_rows[accepted]
+        fsm.pull_cycle_samples[accepted_rows] = draws[chosen_owner, chosen_attempt]
+        final_positions = solved_positions[chosen].clone()
+        final_orientations = solved_orientations[chosen].clone()
+        final_lengths = lengths[chosen].clone()
+        initial_chosen = torch.where(first_entry[chosen_owner])[0]
+        if len(initial_chosen):
+            from gr00t.rl.auto_open.first_pull_wall import retime_first_pull_paths
+            timed_p, timed_q, timed_n, _ = retime_first_pull_paths(
+                final_positions[initial_chosen], final_orientations[initial_chosen],
+                solved_joints[chosen[initial_chosen]], final_lengths[initial_chosen])
+            final_positions[initial_chosen], final_orientations[initial_chosen] = timed_p, timed_q
+            final_lengths[initial_chosen] = timed_n
+        fsm.install_pull_insert_tensor(
+            accepted_rows, final_positions, final_orientations, final_lengths,
+            geometry["contact_point"][chosen_owner, chosen_attempt],
+            geometry["orientation"][chosen_owner, chosen_attempt],
+            geometry["face_offset_local"][chosen_owner, chosen_attempt],
+            endpoint=geometry["endpoint"][chosen_owner, chosen_attempt])
+        fsm.record_pull_cycle(rows, {
+            "cycle": cycle, "candidate_samples": draws,
+            "analytic_first_entry": first_entry,
+            "first_approach_wall_clearance_m": wall_clearance,
+            "first_entry_continuous_approach": first_entry,
+            "pointwise_collision_checked": ~first_entry,
+            "entry_ee_position_world_m": device_state["ee_pos"][rows].clone(),
+            "entry_ee_orientation_world_wxyz": device_state["ee_orn"][rows].clone(),
+            "entry_root_state": device_state["root_states"][rows].clone(),
+            "entry_robot_body_poses_world_wxyz": device_state["robot_body_state_w"][rows, :, :7].clone(),
+            "candidate_endpoint_world_m": geometry["endpoint"],
+            "endpoint_horizontal_radius_m": geometry["endpoint_horizontal_radius_m"],
+            "endpoint_radius_safe": geometry["endpoint_radius_safe"],
+            "insertion_max_horizontal_radius_m": torch.full_like(
+                selected, fsm.pull_panel_config.insertion_max_horizontal_radius_m, dtype=torch.float32),
+            "candidate_orientation_world_wxyz": geometry["orientation"],
+            "candidate_face_offset_local_m": geometry["face_offset_local"],
+            "geometry_feasible": feasible_geometry, "candidate_feasible": feasible,
+            "geometry_constraints_pass": geometry.get("geometry_safe", feasible_geometry),
+            "route_clear": geometry.get("route_safe", feasible_geometry),
+            "route_start_free": geometry.get("route_start_free", feasible_geometry),
+            "route_end_free": geometry.get("route_end_free", feasible_geometry),
+            "route_direct": geometry.get("route_direct", feasible_geometry),
+            "collision_clear": geometry.get("collision_safe", feasible_geometry),
+            "path_buffer_overflow": geometry.get("overflow", torch.zeros_like(feasible_geometry)),
+            "max_position_error_m": max_position, "max_orientation_error_rad": max_orientation,
+            "predicted_face_gap_m": face_gap,
+            "worst_sample": worst_sample, "worst_desired_position_world_m": worst_desired,
+            "worst_predicted_position_world_m": worst_predicted,
+            "worst_command_position_world_m": worst_command, "worst_arm_joints_rad": worst_joints,
+            "selected_attempt": torch.where(accepted, selected, -1),
+            "tip_radius_m": geometry["tip_radius_m"][local_rows, diagnostic_attempt],
+            "ee_tangent_radius_m": geometry["ee_tangent_radius_m"][local_rows, diagnostic_attempt],
+            "gripper_height_bounds_m": geometry["gripper_height_bounds_m"][local_rows, diagnostic_attempt],
+            "hardware_height_bounds_m": fsm.pull_hardware_z[rows].clone(),
+        })
+        retry = torch.zeros_like(accepted)
+        initial_rejected = torch.where(first_entry & ~accepted)[0]
+        if len(initial_rejected):
+            retry[initial_rejected] = (fsm.pull_first_station_attempts[rows[initial_rejected]]
+                                       < fsm.pull_station_config.first_max_station_attempts)
+        fsm.fail(rows[~feasible_geometry.any(1) & ~retry], 50)
+        fsm.fail(rows[feasible_geometry.any(1) & ~accepted & ~retry], 49)
+        if len(rows[retry]):
+            self.retry_first_pull_station(fsm, device_state, rows[retry])
+        self._record_stats("pull_panel_insertion", len(rows), (~accepted).sum())
 
-    def plan_push_retract(self, fsm, device_state, rows):
-        ids, poses = [], []
-        for env_id in self._ids(rows):
-            controller = self.controllers[env_id]
-            state = self._state(device_state, env_id)
-            try:
-                _sample_reachable_arm_retract_pose(
-                    controller, state, self.Stage.PUSH_ARM_RETRACT.name
-                )
-            except RuntimeError:
-                self.stats["errors"] += 1
-                fsm.fail(torch.as_tensor([env_id], device=fsm.device), 46)
-                continue
-            ids.append(env_id)
-            poses.append(controller.active_arm_retract_pose_local.copy())
-        if ids:
-            fsm.install_push_retract_pose(device_state, ids, poses)
+    def finalize_diagnostics(self):
+        """Materialize device diagnostics only after simulation has ended."""
+        self.finalize_gpu_stage_diagnostics()
+        for label, rows, quantities in self.path_diagnostics:
+            values = {name: value.detach().cpu().tolist() for name, value in quantities.items()}
+            for index, env_id in enumerate(rows.detach().cpu().tolist()):
+                self.controllers[env_id].last_acceptance_diagnostics[f"{label}_inverse"] = {
+                    name: value[index] for name, value in values.items()
+                }
+        errors = self.stats["errors"]
+        if isinstance(errors, torch.Tensor):
+            self.stats["errors"] = int(errors.item())

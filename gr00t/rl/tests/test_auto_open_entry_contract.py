@@ -322,12 +322,72 @@ def test_fixed_launcher_has_one_python_invocation_and_one_common_contract():
     for option in (
         "--headless",
         "--device cuda:0",
-        "--batch_contact_ik_backend exact_workers",
-        "--batch_path_backend exact_workers",
-        "--batch_panel_clearance_backend gpu",
-        "--batch_geometry_fallback_backend numpy_batch",
     ):
         assert launcher.count(option) == 1
+
+
+def test_gpu_runtime_has_no_obsolete_backend_selection():
+    removed = (
+        "--steady_path_workers",
+        "--batch_contact_ik_backend",
+        "--batch_path_backend",
+        "--batch_panel_clearance_backend",
+        "--batch_geometry_fallback_backend",
+    )
+    for path in (AUTO_OPEN / "cli.py", SCRIPTS / "run_auto_open.sh", SCRIPTS / "run_auto_open_pitch_probe.sh"):
+        source = path.read_text(encoding="utf-8")
+        assert all(option not in source for option in removed)
+
+
+def test_runtime_keeps_reference_snapshots_out_of_the_online_loop():
+    tree = ast.parse((AUTO_OPEN / "runtime.py").read_text(encoding="utf-8"))
+    loop = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_run_tensor_fsm_loop")
+    calls = [node for node in ast.walk(loop) if isinstance(node, ast.Call)]
+    assert not any(isinstance(node.func, ast.Name) and node.func.id in (
+        "_update_batched_reference_buffers", "_snapshot_initial_reference_buffers",
+        "batched_target_height_invariant_poses",
+    ) for node in calls)
+    finalizers = [node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "finalize_diagnostics"]
+    assert len(finalizers) == 1
+    online_loop = next(node for node in loop.body if isinstance(node, ast.For))
+    assert finalizers[0].lineno > online_loop.end_lineno
+
+
+def test_runtime_has_no_scalar_runner_adapters_or_executor_lifecycle():
+    source = (AUTO_OPEN / "runtime.py").read_text(encoding="utf-8")
+    for removed in (
+        "steady_path_executor", "_BatchedRunnerView", "_BatchedEnvView",
+        "_make_batched_command_buffers", "_batched_state_rows",
+        "_update_batched_reference_buffers", "_snapshot_initial_reference_buffers",
+    ):
+        assert removed not in source
+    tree = ast.parse(source)
+    constructors = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        and node.func.id == "TensorPlanningCoordinator"
+    ]
+    assert len(constructors) == 1
+    assert [arg.id for arg in constructors[0].args] == ["controllers", "Stage"]
+    assert constructors[0].keywords == []
+
+
+def test_runtime_audit_fk_uses_pre_step_device_root_snapshot():
+    tree = ast.parse((AUTO_OPEN / "runtime.py").read_text(encoding="utf-8"))
+    loop = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "_run_tensor_fsm_loop")
+    calls = [node for node in ast.walk(loop) if isinstance(node, ast.Call)]
+    step = next(node for node in calls if isinstance(node.func, ast.Attribute) and node.func.attr == "step_once")
+    snapshot = next(
+        node for node in ast.walk(loop) if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "capture_root_states" for target in node.targets)
+        and isinstance(node.value, ast.Call)
+    )
+    assert snapshot.lineno < step.lineno
+    assert ast.unparse(snapshot.value) == "device_state['root_states'].detach().clone()"
+    for name in ("_target_height_invariant_poses_gpu", "b2z1_gripper_pose_and_jacobian"):
+        call = next(node for node in calls if isinstance(node.func, ast.Name) and node.func.id == name)
+        assert call.lineno > step.lineno
+        assert "capture_root_states" in ast.unparse(call.args[0])
 
 
 def test_standard_collection_uses_one_vectorized_process_per_gpu():

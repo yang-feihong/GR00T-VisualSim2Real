@@ -399,6 +399,11 @@ AUTOOPEN_HANDLE_PRESS_STAGES = frozenset(
 )
 AUTOOPEN_TRAVERSAL_STAGES = frozenset(
     {
+        "PULL_CLEAR_SWEEP",
+        "PULL_INSERT",
+        "PULL_OPEN",
+        "PULL_ARM_RETRACT",
+        "PULL_BASE_ADVANCE",
         "ALIGN_PANEL",
         "CONTACT_PANEL",
         "PUSH_OPEN",

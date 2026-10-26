@@ -4,6 +4,18 @@
 invocation selects official publication, canonical-only validation, or debug
 collection.
 
+Online stage planning uses device-side path banks, batched inverse mapping,
+and masked candidate selection. Controller objects supply immutable asset and
+configuration data at initialization; episode-specific geometry, collision
+checks, and planning decisions do not dispatch per-environment CPU planners.
+File encoding, progress display, and final audit serialization remain host I/O.
+
+Training fisheye cameras randomize only the invalid exterior of the effective
+image circle. The episode-static housing appearance is independent of task
+randomization, preserves all valid and feather-band pixels, and is recorded in
+episode provenance. Diagnostic cameras are unchanged. See
+[fisheye border configuration](../../../docs/fisheye_border_augmentation.md).
+
 ## Robot asset
 
 All B2Z1 entry points use `gr00t/rl/data/robots/b2z1_lab30/b2z1.usd`.
@@ -117,10 +129,58 @@ remain independent of every official dataset.
 Debug outputs also include one stitched six-camera video per episode under
 `six_camera_mosaics/`.
 
-### Pull-door prefix
+### Pull-door workflow
 
 The implemented pull-door workflow shares the push-door control modules and
-currently stops after `RESTORE_GRIPPER`. Run the four diagnostic seeds with:
+continues from `RESTORE_GRIPPER` through `PULL_CLEAR_SWEEP`, then
+`PULL_INSERT` -> `PULL_OPEN` -> `PULL_ARM_RETRACT` -> `PULL_BASE_ADVANCE`.
+The first pry must open the door at least 30 degrees. After retraction,
+`PULL_BASE_ADVANCE` precomputes a trajectory for the front shoulder nearest the
+wall, preserving its wall-normal coordinate. For shoulder A and hinge B, its
+heading angle is arcsin((body width + 10 cm) / |AB|) plus the AB/wall angle,
+clamped between the entry heading angle and 90 degrees. The trajectory is
+independent of the measured door angle. Reference samples advance only while
+the current sample heading angle is below the door angle; otherwise the
+reference holds, with no backward index changes or actual-tracking gate.
+Base travel starts immediately after accepted retraction, even while the door
+is rotating. Completion requires the reference gate to hold and the shared 25-frame zero-command
+stability window to also satisfy door speed below 2 degrees/s throughout.
+After settling, the workflow enters the shared `CONTACT_PANEL` push interface
+instead of planning another pry. Contact planning and measured finger clearance
+use the same selected panel-side normal. Further opening repeats
+`CONTACT_PANEL` -> `PUSH_OPEN` -> `PULL_ARM_RETRACT` -> `PULL_BASE_ADVANCE`;
+it never uses push-door `BASE_ADVANCE` for pull-door repositioning.
+All pull-door retractions use the same entry-planned GPU-inverse restore path
+and measured arm-stability acceptance as the first pry retraction.
+The shared contact grid keeps nine height offsets at 5 cm spacing. Its tangent
+search extends +/-40 cm for pull-door stations, retaining +/-20 cm for push-door
+stations, with the same panel-edge, IK, inverse-residual and joint-margin checks.
+For pull-door stations, the default tangent search baseline is the projection
+onto the current panel of the point 10 cm behind the trunk collider's front,
+along the actual base yaw (38 cm ahead of base on the current asset). Tangent
+offset search remains active around this baseline; push-door baselines are unchanged.
+`PULL_PANEL_CONTACT_BASELINE` selects `base_forward` (base +20 cm), `trunk_front`
+(frontmost trunk collider x), or `trunk_front_minus10` (that front minus 10 cm).
+The selected mode is passed through the same launcher and stored in `workflow.json`.
+The default is `trunk_front_minus10`.
+Shared push/pull contact selection rejects candidate heights whose complete
+closed-jaw collider height interval overlaps the current handle capsule height
+band, expanded by 1 cm. The handle band follows its actual pose. This filter is
+applied before the existing batched IK, without adding solver batches. It is an
+endpoint-selection constraint, not an approach-path collision guarantee.
+At the shared 89-degree opening acceptance, retraction finishes before
+the pull workflow enters `THROUGH` directly, without a frame-alignment stage.
+After opening is accepted, the pull workflow leaves the pushing stages for
+retraction and traversal; it does not keep advancing the push target.
+The original push-door angle and angular-speed protection is unchanged.
+If the door reaches the same opening threshold during the initial
+base motion, it hands off directly to `THROUGH` without a stationary window;
+the final terminal stationary acceptance remains unchanged.
+Insertion candidates are geometrically screened and solved together through one
+GPU inverse batch. Base motion checks separate articulated rigid-body envelopes,
+including the legs and restored arm, and resamples unsafe stations within the
+configured angular range. See [pull validation](../../../docs/auto_open_pull_panel_validation_zh.md).
+Run the four diagnostic seeds with:
 
 ```bash
 DOOR_MOTION=pull AUTO_OPEN_MODE=debug SEED_START=1700 SEED_END=1703 \
@@ -132,6 +192,73 @@ Handle manipulation consists of `PRESS_HANDLE`, `PUSH_PULL_DOOR`, and
 then rotation about the handle axis. A pull prefix's
 `completed_terminal_seeds.txt` records completion of the requested prefix,
 not full-task strict data acceptance or a trainable official release.
+
+`PULL_CLEAR_SWEEP` holds the restored arm joints and closed gripper, moving the
+base toward the free-end side of the door and facing the open gap. It uses the
+same `_track_station` interface and arrival profile as APPROACH: 2/10 cm inner/
+outer position thresholds, 0.05/0.15 rad yaw thresholds, and a 25-frame zero-
+command stability window. No separate locomotion controller is introduced.
+
+The planner reads enabled base_link colliders and the static opening boundary
+from the lintel. It projects the rotated trunk colliders onto the frame-width
+direction. Their entire projection must be beyond the free-side jamb
+(no projection overlap). No door sweep disk or whole-robot sphere is used.
+The same projection operation on the wall-normal axis requires the complete
+trunk to stay at least 2 cm in front of the robot-facing wall surface, read
+from the static jamb collision geometry. One shared two-axis calculation
+is used for both candidate poses and actual-pose acceptance.
+The target remains exactly 0.77 m from the open-gap midpoint. Candidate
+positions on the robot-side/free-end quarter-circle face the gap, including
+sampled yaw noise. Planning reserves a fixed additional 5 cm inside both
+projection constraints, without increasing the 0.77 m distance. This margin
+is independent of the locomotion controller's position/yaw thresholds.
+If no joint position/yaw candidate satisfies both, planning reports failure;
+it never silently expands the distance or relaxes either constraint.
+Acceptance checks the actual trunk projection using the full measured base
+orientation, continuously for 25 zero-command frames, plus shared arrival
+and stability. This is an endpoint condition, not a path collision certificate.
+
+Targets are sampled once on stage entry, deterministically per episode seed:
+positions are selected within a feasible arc of at most 20 cm, centered on
+the midpoint of the jointly feasible angular interval; yaw noise is +/-0.06 rad. There is no
+fixed 45-degree center. Position randomization never changes the target gap distance.
+Position/yaw command and acceptance use the same
+sampled target. The nominal yaw points at the midpoint between the closed
+free edge and the current open free edge. Geometry and randomization defaults
+are maintained in `gr00t/rl/auto_open/pull_station.py`; debug metadata records
+the sampled target, frame boundary, planned clearance, and acceptance predicates.
+
+`PULL_INSERT` keeps the gripper closed, approaches outside the free panel edge,
+passes behind the panel, and inserts the outside jaw face at a 2 mm standoff.
+This is a positioning stage: acceptance checks pose, clearance, and stability,
+not physical contact or contact force. Contact forms during the following arc.
+Contact targets come from measured closed-jaw collision geometry. The entry
+path is checked against panel and wall envelopes before execution.
+
+`PULL_OPEN` moves the EE position along a hinge-centered arc while holding its
+entry world orientation fixed. Contact can migrate from the jaw's outside face
+toward its tip as the door opens; orientation does not follow the panel.
+It shares PUSH_OPEN's PI door-speed feedback (20 deg/s target, 30 deg/s limit,
+2-degree maximum lead) and 0.7 m XY comfort-workspace test. The complete arc
+is mapped once through the common GPU inverse at stage entry and interpolated
+online according to the feedback hinge target. No per-frame inverse solve or
+per-point independent noise is used. At the comfort boundary, the shared
+restore planner retracts the closed gripper; no pull-specific retract detour
+is added. Completion additionally requires a measured door angle of at least
+30 degrees; reaching the workspace boundary alone cannot pass this stage.
+The following wall-parallel shoulder motion uses the same hysteretic arrival
+tracker as APPROACH. Defaults live in `auto_open/panel_motion.py` and
+`auto_open/pull_station.py`.
+
+Use `STOP_AFTER_STAGE=RESTORE_GRIPPER` or `STOP_AFTER_STAGE=PULL_CLEAR_SWEEP`
+to retain an earlier pull prefix; `STOP_AFTER_STAGE=PULL_INSERT` stops before
+the feedback opening motion; `STOP_AFTER_STAGE=PULL_OPEN` stops after the first
+opening cycle rather than completing traversal. `STOP_AFTER_STAGE=PULL_BASE_ADVANCE`
+includes retraction and settling beside the panel, stopping before shared pushing.
+Partial workflows support `canonical` (no cameras) and `debug` (six cameras),
+but cannot be published by `official` mode. Full pull-door runs stop at `THROUGH`
+by default. Their physical validation status is recorded separately in
+`docs/auto_open_pull_panel_validation_zh.md`.
 
 For complete no-camera push validation without subsequent image generation,
 use `AUTO_OPEN_MODE=canonical` with the same seed-range settings.

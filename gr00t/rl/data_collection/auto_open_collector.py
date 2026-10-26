@@ -30,6 +30,7 @@ from .auto_open_standard import (
 )
 from .auto_open_writer import AutoOpenEpisodeData, StreamingVideoEncoder
 from .contact_audit import SubstepContactAudit
+from .fisheye_border import FisheyeBorderAugmenter
 
 
 MIDDLE_PRESET_POSITION_TOLERANCE_RAD = 0.05
@@ -138,6 +139,7 @@ class AutoOpenStandardEpisodeCollector:
         self.actions = []
         self.images = defaultdict(list)
         self.video_encoders = {}
+        self._fisheye_borders = {}
         self.video_staging_root = (
             None if video_staging_root is None else Path(video_staging_root)
         )
@@ -197,7 +199,7 @@ class AutoOpenStandardEpisodeCollector:
             self.timing["image_read_s"] += time.perf_counter() - phase_start
             phase_start = time.perf_counter()
             images = transform_collection_images(
-                {name: _numpy(image) for name, image in rgb_frames.items()},
+                self._augment_data_fisheye_borders(rgb_frames),
                 self.camera_mode,
             )
             self.timing["image_transform_s"] += time.perf_counter() - phase_start
@@ -231,6 +233,19 @@ class AutoOpenStandardEpisodeCollector:
             "frame_index": frame_index,
             "sim_time_ns": sim_time_ns,
         }
+
+    def _augment_data_fisheye_borders(self, frames):
+        """CPU encoding boundary shared by official dual and debug six replay."""
+        manager = self.runner.rgb_camera_manager
+        result = {}
+        for name, image in frames.items():
+            if name not in self._fisheye_borders:
+                spec = manager.camera_spec_for_env(name, self.env_id)
+                self._fisheye_borders[name] = FisheyeBorderAugmenter(
+                    self.seed, name, spec
+                )
+            result[name] = self._fisheye_borders[name].apply(_numpy(image))
+        return result
 
     def _read_current_images(self):
         """Read both 50 Hz sensors once per integer control tick.
@@ -443,7 +458,13 @@ class AutoOpenStandardEpisodeCollector:
             raw_contacts=tuple(self.contacts),
             event_frames=dict(self.events),
             acceptance_reasons=tuple(acceptance_reasons),
-            provenance=dict(provenance or {}),
+            provenance={
+                **dict(provenance or {}),
+                "fisheye_border_augmentation": {
+                    name: border.metadata
+                    for name, border in self._fisheye_borders.items()
+                },
+            },
         )
 
     def _snapshot_state(self, state):

@@ -44,6 +44,8 @@ from legged_gym.utils.ee_steady_state import B2Z1SteadyEeForwardModel  # noqa: E
 from legged_gym.utils.isaaclab_app import launch_app  # noqa: E402
 from gr00t.rl.auto_open.cli import (  # noqa: E402
     DEFAULT_ARM_RETRACT_POSE_LOCAL,
+    DEFAULT_ARM_RETRACT_POSITION_NOISE_RADIUS_M,
+    DEFAULT_ARM_RETRACT_ROTATION_NOISE_DEG,
     _default_paths,
     _parser,
 )
@@ -67,6 +69,11 @@ class Stage(IntEnum):
     OPEN_AND_CLEAR = 9
     RETREAT_ARM = 10
     RESTORE_GRIPPER = 11
+    PULL_CLEAR_SWEEP = 20
+    PULL_INSERT = 21
+    PULL_OPEN = 22
+    PULL_ARM_RETRACT = 23
+    PULL_BASE_ADVANCE = 24
     ALIGN_PANEL = 12
     CONTACT_PANEL = 13
     PUSH_OPEN = 14
@@ -152,7 +159,37 @@ STAGE_SPECS = {
         "restore the arm/gripper posture along the planned path",
         "restore path is complete and measured arm pose is stable",
         300,
-        (Stage.ALIGN_PANEL,),
+        (Stage.ALIGN_PANEL, Stage.PULL_CLEAR_SWEEP),
+    ),
+    Stage.PULL_CLEAR_SWEEP: StageSpec(
+        "back up 0.20 m at entry heading, then move to a clearance- and insertion-validated station while holding restored arm joints",
+        "base is stable at its sampled station and its collider projection clears the frame",
+        1000,
+        (Stage.PULL_INSERT,),
+    ),
+    Stage.PULL_INSERT: StageSpec(
+        "hold the base and insert closed jaws behind the free panel edge",
+        "closed jaws settle at the inner-panel standoff; physical contact is not required",
+        900,
+        (Stage.PULL_OPEN, Stage.PULL_ARM_RETRACT, Stage.PULL_CLEAR_SWEEP),
+    ),
+    Stage.PULL_OPEN: StageSpec(
+        "hold the base, follow a hinge-centered position arc with speed feedback, and hold world orientation",
+        "door is at least 30 degrees open and reaches the opening goal or the arm comfort-workspace boundary",
+        900,
+        (Stage.PULL_ARM_RETRACT,),
+    ),
+    Stage.PULL_ARM_RETRACT: StageSpec(
+        "hold the base and retract closed jaws along the shared restore planner",
+        "restore path is complete and measured arm pose is stable",
+        300,
+        (Stage.PULL_BASE_ADVANCE, Stage.THROUGH),
+    ),
+    Stage.PULL_BASE_ADVANCE: StageSpec(
+        "hold retracted joints and follow the precomputed near-wall shoulder/arcsin-heading curve; advance samples only while the published heading angle is below the door angle",
+        "door-angle gate holds the reference and base settles with door speed below 2 deg/s throughout the shared stability window, or the door reaches the opening threshold and enters THROUGH directly",
+        1000,
+        (Stage.CONTACT_PANEL, Stage.THROUGH),
     ),
     Stage.ALIGN_PANEL: StageSpec(
         "track the panel-aligned base station while holding arm joints",
@@ -170,7 +207,7 @@ STAGE_SPECS = {
         "advance the EE push target while holding the base",
         "door opens sufficiently, or arm extension requests repositioning",
         900,
-        (Stage.PUSH_ARM_RETRACT, Stage.THROUGH),
+        (Stage.PUSH_ARM_RETRACT, Stage.THROUGH, Stage.PULL_ARM_RETRACT),
     ),
     Stage.PUSH_ARM_RETRACT: StageSpec(
         "retract the arm from the panel while holding the base",
@@ -211,6 +248,9 @@ BASE_HOLD_STAGES = frozenset(
         Stage.CONTACT_PANEL,
         Stage.PUSH_OPEN,
         Stage.PUSH_ARM_RETRACT,
+        Stage.PULL_INSERT,
+        Stage.PULL_OPEN,
+        Stage.PULL_ARM_RETRACT,
     }
 )
 
@@ -252,8 +292,8 @@ class DoorController:
         target_noise_seed=0,
         target_noise_config=None,
         arm_retract_pose_local=DEFAULT_ARM_RETRACT_POSE_LOCAL,
-        arm_retract_position_noise_radius_m=0.05,
-        arm_retract_rotation_noise_deg=5.0,
+        arm_retract_position_noise_radius_m=DEFAULT_ARM_RETRACT_POSITION_NOISE_RADIUS_M,
+        arm_retract_rotation_noise_deg=DEFAULT_ARM_RETRACT_ROTATION_NOISE_DEG,
     ):
         self.runner = runner
         self.env = runner.env
@@ -392,7 +432,9 @@ class DoorController:
         self.push_speed_kp = 0.45
         self.push_speed_ki = 0.50
         self.push_speed_integral_limit = math.radians(8.0)
-        self.push_max_angular_lead = math.radians(2.0)
+        self.push_max_angular_lead = math.radians(2.0)  # Initial PULL_OPEN arc only.
+        from gr00t.rl.auto_open.panel_motion import PUSH_TIP_MAX_ANGULAR_LEAD_RAD
+        self.push_tip_max_angular_lead = PUSH_TIP_MAX_ANGULAR_LEAD_RAD
         self.push_max_ee_step = 0.003
         self.push_speed_error_integral = 0.0
         self.push_command_hinge_angle = None

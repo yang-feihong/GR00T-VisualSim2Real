@@ -22,6 +22,23 @@ from gr00t.rl.auto_open.control import (
 )
 from gr00t.rl.auto_open.pregrasp_reachability import PRESS_HANDLE_LATCH_RELEASE_M
 from gr00t.rl.auto_open.contact_surface import separating_rear_contact
+from gr00t.rl.auto_open.base_trajectory import BasePoseTrajectory, frame_traversal_waypoints
+from gr00t.rl.auto_open.geometry import _quat_rotate_points_torch
+from gr00t.rl.auto_open.panel_motion import (
+    PullPanelConfig, hinge_speed_target, outside_comfort_workspace,
+    fingertip_arc_position,
+)
+from gr00t.rl.auto_open.pull_station import (
+    PullStationConfig,
+    angle_to_wall,
+    shoulder_wall_curve,
+    base_collider_points,
+    frame_boundaries,
+    base_projection_clearances,
+    door_hardware_height_bounds,
+    robot_collider_cache,
+    robot_motion_envelope,
+)
 from gr00t.rl.third_party.visual_wholebody_lowlevel.legged_gym.utils.batch_invariant_math import (
     fixed_dot,
     fixed_mean,
@@ -296,6 +313,7 @@ def track_base_pose(
     acceptance_yaw: torch.Tensor,
     *,
     minimum_speed_toward_target_only: bool,
+    reference_velocity_world: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Batched equivalent of the legacy base-pose controller."""
     yaw = _yaw_from_wxyz(root_states[:, 3:7])
@@ -316,6 +334,11 @@ def track_base_pose(
         ),
         dim=-1,
     )
+    if reference_velocity_world is not None:
+        vx, vy, wz = reference_velocity_world.unbind(-1)
+        command[:, 0] += 2.0 * (cosine * vx + sine * vy)
+        command[:, 1] += 2.0 * (-sine * vx + cosine * vy)
+        command[:, 2] += 1.35 * wz
     command = _limit_base_command(command)
     planar_norm = fixed_norm(command[:, :2])
     deadzone = (planar_norm > 1.0e-6) & (planar_norm < 0.15)
@@ -381,6 +404,90 @@ class TensorCommandBuffers:
         env._teleop_inputs_dirty = True
 
 
+class PullTensorHistory:
+    """Append device batches online; materialize one environment only at export."""
+
+    def __init__(self, num_envs, formatter=None):
+        self.num_envs = num_envs
+        self.formatter = formatter
+        self.batches = []
+
+    def append_batch(self, rows, record):
+        def snapshot(value):
+            if isinstance(value, torch.Tensor):
+                if value.shape[0] != len(rows):
+                    raise ValueError("history tensor batch length disagrees with rows")
+                return value.detach().clone()
+            if isinstance(value, dict):
+                return {key: snapshot(item) for key, item in value.items()}
+            return value
+
+        self.batches.append((rows.detach().clone(), snapshot(record)))
+
+    def __getitem__(self, env_id):
+        # This is the final-output boundary, never a planning input.
+        def finite(value):
+            if isinstance(value, list):
+                return [finite(item) for item in value]
+            if isinstance(value, float) and not math.isfinite(value):
+                return None
+            return value
+
+        def materialize(value, index):
+            if isinstance(value, torch.Tensor):
+                return finite(value[index].detach().cpu().tolist())
+            if isinstance(value, dict):
+                return {key: materialize(item, index) for key, item in value.items()}
+            return value
+
+        result = []
+        for rows, record in self.batches:
+            for index in (rows == env_id).nonzero().flatten().cpu().tolist():
+                item = materialize(record, index)
+                result.append(self.formatter(item) if self.formatter else item)
+        return result
+
+
+def _pull_station_history_record(values):
+    return {
+        "entry_root_pose_world_wxyz": values[:7],
+        "entry_hinge_angle_rad": values[7],
+        "waypoint_count": int(values[8]), "sweep_clear": bool(values[9]),
+        "robot_envelope_min_local_m": values[10:13],
+        "robot_envelope_max_local_m": values[13:16],
+        "waypoints_xy_yaw": [values[16:19], values[19:22]][:int(values[8])],
+        "tracking_margin_m": values[25],
+        "sampled_station_angle_noise_rad": values[22],
+        "effective_station_angle_noise_rad": values[23],
+        "rotation_target_admissible": bool(values[24]),
+    }
+
+
+def _pull_cycle_uniform(seeds, cycles, candidate_count):
+    """Stateless uint32 keyed streams, evaluated in int64 on the input device.
+
+    Every multiplication is below 2**63, including before the explicit mask.
+    This replaces NumPy PCG draws; it preserves ranges and batch independence,
+    but deliberately does not claim bitwise compatibility with the old stream.
+    """
+    mask = 0xFFFFFFFF
+
+    def mix(value):
+        value = ((value ^ (value >> 16)) * 0x45D9F3B) & mask
+        value = ((value ^ (value >> 16)) * 0x45D9F3B) & mask
+        return (value ^ (value >> 16)) & mask
+
+    attempts = torch.arange(candidate_count, device=seeds.device, dtype=torch.int64)
+    lanes = torch.arange(4, device=seeds.device, dtype=torch.int64)
+    seed_key = mix(seeds & mask) ^ mix(((seeds >> 32) & mask) ^ 0x243F6A88)
+    cycle_key = mix((cycles & mask) ^ 0x6A09E667) ^ mix(((cycles >> 32) & mask) ^ 0x3C6EF372)
+    key = mix(seed_key[:, None, None] ^ cycle_key[:, None, None]
+              ^ mix(attempts[None, :, None] ^ 0x510E527F)
+              ^ mix(lanes[None, None, :] ^ 0x1F83D9AB))
+    # Use the upper 24 bits so conversion to float32 cannot round up to 1.
+    return (key >> 8).to(torch.float32) * (1.0 / 16777216.0)
+
+
 class PaddedPathBank:
     """Fixed-capacity device paths with independent per-env length/index."""
 
@@ -395,47 +502,30 @@ class PaddedPathBank:
         self.length = torch.zeros(num_envs, dtype=torch.int32, device=device)
         self.index = torch.zeros(num_envs, dtype=torch.int32, device=device)
 
-    def install(self, env_ids, positions, orientations) -> None:
-        """Install sparse planner results; never used from the per-frame path."""
-        if len(env_ids) != len(positions) or len(env_ids) != len(orientations):
-            raise ValueError("path result batch lengths disagree")
-        for env_id, position_path, orientation_path in zip(
-            env_ids, positions, orientations, strict=True
-        ):
-            position = torch.as_tensor(
-                position_path, dtype=torch.float32, device=self.positions.device
-            )
-            orientation = torch.as_tensor(
-                orientation_path,
-                dtype=torch.float32,
-                device=self.orientations.device,
-            )
-            if position.ndim != 2 or position.shape[1] != 3:
-                raise ValueError(f"invalid position path shape {tuple(position.shape)}")
-            if orientation.shape != (position.shape[0], 4):
-                raise ValueError(
-                    "orientation path shape does not match position path: "
-                    f"{tuple(orientation.shape)} vs {tuple(position.shape)}"
-                )
-            count = int(position.shape[0])
-            if count < 1 or count > self.capacity:
-                raise ValueError(
-                    f"path length {count} is outside [1, {self.capacity}]"
-                )
-            row = int(env_id)
-            self.positions[row, :count] = position
-            self.orientations[row, :count] = orientation
-            self.length[row] = count
-            self.index[row] = 0
-
     def clear(self, rows: torch.Tensor) -> None:
         self.length[rows] = 0
         self.index[rows] = 0
 
+    def install_tensor(self, rows, positions, orientations, lengths) -> None:
+        """Install padded device paths without scalar reads or per-row dispatch."""
+        rows = torch.as_tensor(rows, device=self.positions.device, dtype=torch.int64)
+        if positions.ndim != 3 or positions.shape[0] != len(rows) or positions.shape[2] != 3:
+            raise ValueError("expected positions [B, L, 3]")
+        width = positions.shape[1]
+        if not 1 <= width <= self.capacity:
+            raise ValueError(f"padded path width must be in [1, {self.capacity}]")
+        if orientations.shape != (len(rows), width, 4) or lengths.shape != (len(rows),):
+            raise ValueError("orientations/lengths disagree with padded path batch")
+        torch._assert_async(((lengths >= 1) & (lengths <= width)).all(),
+                            "path lengths are outside the padded path")
+        self.positions[rows, :width] = positions
+        self.orientations[rows, :width] = orientations
+        self.length[rows] = lengths.to(dtype=self.length.dtype)
+        self.index[rows] = 0
+
     def current(self, rows: torch.Tensor, *, advance: bool) -> tuple[torch.Tensor, torch.Tensor]:
         length = self.length[rows]
-        if torch.any(length <= 0):
-            raise RuntimeError("stage entered without an installed path")
+        torch._assert_async((length > 0).all(), "stage entered without an installed path")
         index = torch.minimum(self.index[rows], length - 1).to(torch.int64)
         position = self.positions[rows, index]
         orientation = self.orientations[rows, index]
@@ -505,12 +595,15 @@ class TensorDoorFSM:
         approach_nominal_xy=None,
         approach_nominal_yaw=None,
         terminal_stage=None,
+        pull_door=False,
+        pull_panel_contact_baseline="trunk_front_minus10",
     ):
         self.Stage = stage_enum
         self.terminal_stage = (
             stage_enum.THROUGH if terminal_stage is None else terminal_stage
         )
         self.env = env
+        self.pull_door = bool(pull_door)
         self.device = env.device
         self.num_envs = len(controllers)
         device = self.device
@@ -666,6 +759,8 @@ class TensorDoorFSM:
         )
         self.pending_yaw_error = self.pending_station_distance.clone()
         self.arm_align_path = PaddedPathBank(self.num_envs, 512, device)
+        if not self.pull_door:
+            self.panel_arrival_path = PaddedPathBank(self.num_envs,384,device)
         self.arm_forward_path = PaddedPathBank(self.num_envs, 512, device)
         self.release_open_path = PaddedPathBank(self.num_envs, 512, device)
         self.release_retreat_path = PaddedPathBank(self.num_envs, 512, device)
@@ -764,8 +859,62 @@ class TensorDoorFSM:
         self.panel_station_nominal_yaw = torch.atan2(
             self.door_forward[:, 1], self.door_forward[:, 0]
         )
+        points, indices = robot_collider_cache(controllers[0])
+        self.base_motion_points = torch.as_tensor(points, device=device)
+        self.base_motion_body_indices = torch.as_tensor(indices, device=device)
+        if self.pull_door and self.terminal_stage != stage_enum.RESTORE_GRIPPER:
+            self.pull_station_config = PullStationConfig(panel_contact_baseline=pull_panel_contact_baseline)
+            config = self.pull_station_config
+            self.pull_base_points = torch.tensor(base_collider_points(controllers[0]), dtype=torch.float32, device=device)
+            self.pull_motion_points = self.base_motion_points
+            self.pull_motion_body_indices = self.base_motion_body_indices
+            boundaries = torch.tensor([frame_boundaries(c) for c in controllers], dtype=torch.float32, device=device)
+            self.pull_frame_edge, self.pull_wall_front = boundaries[:, 0], boundaries[:, 1]
+            self.pull_hardware_z = torch.tensor([door_hardware_height_bounds(c) for c in controllers], dtype=torch.float32, device=device)
+            self.pull_free_direction = stack("panel_hinge_to_free_direction")[:, :2]
+            self.pull_free_edge = stack("panel_hinge_to_free_edge")
+            self.pull_station_xy = torch.zeros((self.num_envs, 2), device=device)
+            self.pull_shoulder_anchor = torch.zeros_like(self.pull_station_xy)
+            self.pull_shoulder_local = torch.zeros_like(self.pull_station_xy)
+            self.pull_panel_side = torch.ones(self.num_envs, device=device)
+            self.pull_follow_holding = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
+            self.pull_follow_beta = torch.zeros(self.num_envs, device=device)
+            self.pull_follow_velocity = torch.zeros((self.num_envs, 3), device=device)
+            self.pull_door_opened = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
+            self.pull_station_yaw = torch.zeros(self.num_envs, device=device)
+            self.pull_initial_station_xy = torch.zeros_like(self.pull_station_xy)
+            self.pull_initial_station_yaw = torch.zeros_like(self.pull_station_yaw)
+            self.pull_base_path = torch.zeros((self.num_envs, 2, 3), device=device)
+            self.pull_base_path_length = torch.ones_like(self.stage_steps)
+            self.pull_base_path_index = torch.zeros_like(self.stage_steps)
+            self.pull_base_trajectory = BasePoseTrajectory(self.num_envs, device)
+            self.pull_base_entry_pose = torch.zeros((self.num_envs, 3), device=device)
+            self.pull_gap_xy = torch.zeros_like(self.pull_station_xy)
+            self.pull_planned_frame_clearance = torch.zeros(self.num_envs, device=device)
+            self.pull_planned_wall_clearance = torch.zeros(self.num_envs, device=device)
+            self.pull_initial_station_history = PullTensorHistory(self.num_envs)
+            self.pull_first_station_attempts = torch.zeros(self.num_envs, dtype=torch.int64, device=device)
+            self.pull_frame_clear_steps = torch.zeros_like(self.stage_steps)
+            self.pull_panel_config = PullPanelConfig()
+            self.pull_insert_path = PaddedPathBank(self.num_envs, 1024, device)
+            self.pull_open_path = PaddedPathBank(self.num_envs, 256, device)
+            self.pull_insert_goal = torch.zeros((self.num_envs, 3), device=device)
+            self.pull_insert_orientation = torch.zeros((self.num_envs, 4), device=device)
+            self.pull_face_offset_local = torch.zeros((self.num_envs, 3), device=device)
+            self.pull_panel_contact = torch.zeros((self.num_envs, 3), device=device)
+            self.pull_insert_stable_steps = torch.zeros_like(self.stage_steps)
+            self.pull_finished_for_reposition = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
+            self.pull_cycle = torch.zeros(self.num_envs, dtype=torch.int64, device=device)
+            self.pull_cycle_samples = torch.zeros((self.num_envs, 4), device=device)
+            self.prepare_pull_cycle_samples(controllers)
+            self.pull_cycle_history = PullTensorHistory(self.num_envs)
+            self.pull_station_history = PullTensorHistory(self.num_envs, _pull_station_history_record)
+            self.pull_move_start_hinge = torch.zeros(self.num_envs, device=device)
         self.panel_contact_target_world = torch.zeros(vector_shape, device=device)
         self.panel_contact_desired_ee_world = torch.zeros(vector_shape, device=device)
+        self.panel_push_tip_offset_local = torch.zeros(vector_shape, device=device)
+        self.panel_push_tip_surface_world = torch.zeros(vector_shape, device=device)
+        self.panel_push_tip_hinge_angle = torch.zeros(scalar_shape, device=device)
         self.panel_contact_command_target_world = torch.zeros(vector_shape, device=device)
         self.panel_contact_command_orientation_world = torch.zeros(quat_shape, device=device)
         self.panel_contact_orientation_seed = torch.zeros(quat_shape, device=device)
@@ -773,6 +922,7 @@ class TensorDoorFSM:
             self.grasp_latched
         )
         self.panel_contact_plan_valid = torch.zeros_like(self.grasp_latched)
+        self.panel_contact_normal_sign = torch.ones(self.num_envs, device=device)
         self.panel_contact_settle_steps = torch.zeros_like(self.stage_steps)
         self.panel_last_finger_clearance = torch.full(
             scalar_shape, torch.nan, dtype=torch.float32, device=device
@@ -793,9 +943,11 @@ class TensorDoorFSM:
         self.ee_orientation_command = torch.zeros(quat_shape, device=device)
         self.ee_command_valid = torch.zeros_like(self.grasp_latched)
         self.push_start_hinge_angle = torch.zeros(scalar_shape, device=device)
+        self.push_planned_stop_hinge = torch.full(scalar_shape, math.radians(89.), device=device)
         self.push_last_progress_hinge = torch.zeros(scalar_shape, device=device)
         self.push_no_progress_steps = torch.zeros_like(self.stage_steps)
         self.push_contact_world = torch.zeros(vector_shape, device=device)
+        self.push_tip_offset_world = torch.zeros(vector_shape, device=device)
         self.push_orientation = torch.zeros(quat_shape, device=device)
         self.push_command_hinge_angle = torch.zeros(scalar_shape, device=device)
         self.push_speed_error_integral = torch.zeros(scalar_shape, device=device)
@@ -818,6 +970,7 @@ class TensorDoorFSM:
         self.push_speed_ki = stack("push_speed_ki")
         self.push_speed_integral_limit = stack("push_speed_integral_limit")
         self.push_max_angular_lead = stack("push_max_angular_lead")
+        self.push_tip_max_angular_lead = stack("push_tip_max_angular_lead")
         self.push_goal_hinge_angle = stack("push_goal_hinge_angle")
         self.push_reengage_reach_radius = stack("push_reengage_reach_radius")
         self.push_reengage_release_radius = stack("push_reengage_release_radius")
@@ -872,6 +1025,8 @@ class TensorDoorFSM:
         self.through_stop_latched = torch.zeros_like(self.grasp_latched)
         self.through_motion_ready = torch.zeros_like(self.grasp_latched)
         self.through_entry_stable_steps = torch.zeros_like(self.stage_steps)
+        self.through_trajectory = BasePoseTrajectory(self.num_envs, device)
+        self.through_path_previous_index = torch.zeros_like(self.through_trajectory.index)
         self.through_min_base_height = stack("through_min_base_height")
         self.initial_door_root = stack("initial_door_root")
         self.failure_code = torch.zeros(
@@ -1258,6 +1413,7 @@ class TensorDoorFSM:
         rows: torch.Tensor,
         distance: torch.Tensor,
         yaw_error: torch.Tensor,
+        *, stability_condition: torch.Tensor | None = None,
     ) -> torch.Tensor:
         inside_inner = (
             (distance < self.base_arrival_inner_distance[rows])
@@ -1282,7 +1438,8 @@ class TensorDoorFSM:
             max_yaw_error_rad=self.base_arrival_outer_yaw[rows],
             min_base_height_m=self.through_min_base_height[rows],
             min_upright_cos=THROUGH_ENTRY_UPRIGHT_COS,
-            additional_condition=zero_command,
+            additional_condition=(zero_command if stability_condition is None
+                                  else zero_command & stability_condition),
         )
         self.base_stability_confirmed[rows] = confirmed
         self.base_stability_steps[rows] = steps
@@ -1294,48 +1451,6 @@ class TensorDoorFSM:
         self.failure_from_stage[rows] = self.stage[rows].to(torch.int16)
         self.failure_code[rows] = int(code)
         self.stage[rows] = int(self.Stage.FAILURE)
-
-    def install_pregrasp_plan(
-        self,
-        env_ids,
-        positions,
-        orientations,
-        desired_targets,
-    ) -> None:
-        self.arm_align_path.install(env_ids, positions, orientations)
-        rows = torch.as_tensor(env_ids, dtype=torch.int64, device=self.device)
-        self.arm_align_desired_target_world[rows] = torch.as_tensor(
-            desired_targets, dtype=torch.float32, device=self.device
-        )
-        self.arm_align_target_valid[rows] = True
-        self.arm_stability.clear(rows)
-        self.transition(rows, self.Stage.PREGRASP)
-        self.stage_steps[rows] = 1
-
-    def install_center_plan(
-        self,
-        env_ids,
-        positions,
-        orientations,
-        desired_targets,
-    ) -> None:
-        self.arm_forward_path.install(env_ids, positions, orientations)
-        rows = torch.as_tensor(env_ids, dtype=torch.int64, device=self.device)
-        self.arm_forward_desired_target_world[rows] = torch.as_tensor(
-            desired_targets, dtype=torch.float32, device=self.device
-        )
-        lengths = self.arm_forward_path.length[rows].to(torch.int64)
-        self.arm_forward_command_world[rows] = self.arm_forward_path.positions[
-            rows, lengths - 1
-        ]
-        self.arm_forward_command_quat[rows] = self.arm_forward_path.orientations[
-            rows, lengths - 1
-        ]
-        self.arm_forward_target_valid[rows] = True
-        self.arm_stability.clear(rows)
-        self.handle_align_settle_steps[rows] = 0
-        self.transition(rows, self.Stage.CENTER_HANDLE)
-        self.stage_steps[rows] = 1
 
     def _set_cartesian_targets(
         self,
@@ -1415,6 +1530,10 @@ class TensorDoorFSM:
         self, state: dict[str, torch.Tensor], rows: torch.Tensor,
         command_xy: torch.Tensor, command_yaw: torch.Tensor,
         acceptance_xy: torch.Tensor, acceptance_yaw: torch.Tensor,
+        *, rolling: torch.Tensor | None = None,
+        stability_condition: torch.Tensor | None = None,
+        reference_velocity_world: torch.Tensor | None = None,
+        arrival_enabled: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         command, distance, yaw_error = track_base_pose(
             state["root_states"][rows],
@@ -1423,8 +1542,14 @@ class TensorDoorFSM:
             acceptance_xy,
             acceptance_yaw,
             minimum_speed_toward_target_only=True,
+            reference_velocity_world=reference_velocity_world,
         )
-        stop = self._update_base_arrival(state, rows, distance, yaw_error)
+        stability_kwargs = ({} if stability_condition is None
+                            else {"stability_condition": stability_condition})
+        arrival_distance = distance if arrival_enabled is None else torch.where(arrival_enabled, distance, torch.inf)
+        stop = self._update_base_arrival(state, rows, arrival_distance, yaw_error, **stability_kwargs)
+        if rolling is not None:
+            stop = stop & ~rolling
         command[stop] = 0.0
 
         previous = self.base_command_previous[rows]
@@ -1775,11 +1900,6 @@ class TensorDoorFSM:
         closing = fixed_dot(radial, closing_axis[:, None, :])
         return (
             torch.isfinite(points).all(dim=(1, 2))
-            & torch.all(
-                axial.abs()
-                <= (self.handle_half_length[rows] - 0.005).clamp_min(0.0)[:, None],
-                dim=-1,
-            )
             & (closing[:, 0] * closing[:, 1] < 0.0)
             & torch.all(
                 closing.abs() >= 0.25 * self.handle_radius[rows, None], dim=-1
@@ -1818,7 +1938,7 @@ class TensorDoorFSM:
                 state["root_states"][center_rows, 7:10]
             )
             capture_ready = (
-                (geometry["pocket_normal_error"][center].abs() <= 0.005)
+                (geometry["pocket_normal_error"][center].abs() <= 0.008)
                 & (geometry["handle_axle_margin"][center] >= 0.020)
                 & (geometry["handle_free_margin"][center] >= 0.010)
                 & (geometry["channel_vertical_error"][center].abs() <= 0.010)
@@ -1841,7 +1961,7 @@ class TensorDoorFSM:
                     "ee_position_error_m": (center_position_error <= 0.012, center_position_error, "<=", 0.012),
                     "ee_orientation_error_rad": (center_orientation_error <= self.grasp_orientation_tolerance[center_rows], center_orientation_error, "<=", self.grasp_orientation_tolerance[center_rows]),
                     "gripper_open_error_rad": (center_gripper_error < 0.02, center_gripper_error, "<", 0.02),
-                    "pocket_normal_error_m": (geometry["pocket_normal_error"][center].abs() <= 0.005, geometry["pocket_normal_error"][center].abs(), "<=", 0.005),
+                    "pocket_normal_error_m": (geometry["pocket_normal_error"][center].abs() <= 0.008, geometry["pocket_normal_error"][center].abs(), "<=", 0.008),
                     "handle_axle_margin_m": (geometry["handle_axle_margin"][center] >= 0.020, geometry["handle_axle_margin"][center], ">=", 0.020),
                     "handle_free_margin_m": (geometry["handle_free_margin"][center] >= 0.010, geometry["handle_free_margin"][center], ">=", 0.010),
                     "channel_vertical_error_m": (geometry["channel_vertical_error"][center].abs() <= 0.010, geometry["channel_vertical_error"][center].abs(), "<=", 0.010),
@@ -2232,13 +2352,6 @@ class TensorDoorFSM:
         self.stage_steps[rows] += 1
         return rows[settled >= 10]
 
-    def install_release_open_plan(self, env_ids, positions, orientations) -> None:
-        self.release_open_path.install(env_ids, positions, orientations)
-        rows = torch.as_tensor(env_ids, dtype=torch.int64, device=self.device)
-        self.release_stable_steps[rows] = 0
-        self.transition(rows, self.Stage.OPEN_AND_CLEAR)
-        self.stage_steps[rows] = 1
-
     def command_open_and_clear(
         self, state: dict[str, torch.Tensor], buffers: TensorCommandBuffers
     ) -> None:
@@ -2299,18 +2412,6 @@ class TensorDoorFSM:
         self.stage_steps[rows] += 1
         return rows[settled >= 10]
 
-    def install_retreat_plan(
-        self, env_ids, positions, orientations, acceptance_targets
-    ) -> None:
-        self.release_retreat_path.install(env_ids, positions, orientations)
-        rows = torch.as_tensor(env_ids, dtype=torch.int64, device=self.device)
-        self.release_retreat_target_world[rows] = torch.as_tensor(
-            acceptance_targets, dtype=torch.float32, device=self.device
-        )
-        self.release_stable_steps[rows] = 0
-        self.transition(rows, self.Stage.RETREAT_ARM)
-        self.stage_steps[rows] = 1
-
     def command_retreat(
         self, state: dict[str, torch.Tensor], buffers: TensorCommandBuffers
     ) -> None:
@@ -2351,31 +2452,10 @@ class TensorDoorFSM:
         self.stage_steps[rows] += 1
         return rows[settled >= 10]
 
-    def install_restore_plan(
-        self,
-        env_ids,
-        positions,
-        orientations,
-        acceptance_positions,
-        acceptance_orientations,
-    ) -> None:
-        self.release_restore_path.install(env_ids, positions, orientations)
-        rows = torch.as_tensor(env_ids, dtype=torch.int64, device=self.device)
-        self.release_endpoint_world[rows] = torch.as_tensor(
-            acceptance_positions, dtype=torch.float32, device=self.device
-        )
-        self.release_endpoint_quat[rows] = torch.as_tensor(
-            acceptance_orientations, dtype=torch.float32, device=self.device
-        )
-        self.release_stable_steps[rows] = 0
-        self.arm_stability.clear(rows)
-        self.transition(rows, self.Stage.RESTORE_GRIPPER)
-        self.stage_steps[rows] = 1
-
     def command_restore(
         self, state: dict[str, torch.Tensor], buffers: TensorCommandBuffers
     ) -> None:
-        rows = torch.where(self.mask(self.Stage.RESTORE_GRIPPER))[0]
+        rows = torch.where(self.mask(self.Stage.RESTORE_GRIPPER) | self.mask(self.Stage.PULL_ARM_RETRACT))[0]
         if not len(rows):
             return
         command, _, _ = self._base_hold_command(state, rows)
@@ -2386,9 +2466,12 @@ class TensorDoorFSM:
         buffers.gripper[rows, 0] = (
             (1.0 - fraction) * self.q_open[rows] + fraction * self.q_closed[rows]
         )
+        pulling = self.stage[rows] == int(self.Stage.PULL_ARM_RETRACT)
+        buffers.gripper[rows[pulling], 0] = self.q_closed[rows[pulling]]
 
     def advance_restore(self, state: dict[str, torch.Tensor]) -> torch.Tensor:
-        rows = torch.where(self.mask(self.Stage.RESTORE_GRIPPER))[0]
+        rows = torch.where((self.mask(self.Stage.RESTORE_GRIPPER) | self.mask(self.Stage.PULL_ARM_RETRACT))
+                           & (self.stage_steps > 0))[0]
         if not len(rows):
             return torch.empty(0, dtype=torch.int64, device=self.device)
         stable, _, _ = self.arm_stability.update(state, rows)
@@ -2408,26 +2491,35 @@ class TensorDoorFSM:
             & (position_error <= 0.010)
             & stable
         )
-        self.record_acceptance(
-            self.Stage.RESTORE_GRIPPER,
-            rows,
-            {
+        conditions = {
                 "minimum_stage_steps": (self.stage_steps[rows] >= 50, self.stage_steps[rows], ">=", 50),
                 "gripper_closed_error_rad": (gripper_error < 0.03, gripper_error, "<", 0.03),
                 "ee_orientation_error_rad": (orientation_error < 0.05, orientation_error, "<", 0.05),
                 "ee_position_error_m": (position_error <= 0.010, position_error, "<=", 0.010),
                 "arm_stable": (stable, stable.to(torch.float32), "==", 1.0),
-            },
-            required_streak=10,
-        )
+            }
+        for stage in (self.Stage.RESTORE_GRIPPER, self.Stage.PULL_ARM_RETRACT):
+            selected = self.stage[rows] == int(stage)
+            stage_rows = rows[selected]
+            if len(stage_rows):
+                stage_conditions = {key: (p[selected], v[selected], op, t) for key, (p, v, op, t) in conditions.items()}
+                self.record_acceptance(stage, stage_rows,
+                    stage_conditions,
+                    required_streak=10)
         settled = torch.where(
             restored, self.release_stable_steps[rows] + 1, 0
         )
         self.release_stable_steps[rows] = settled
         completed = rows[settled >= 10]
+        pull_completed = completed[self.stage[completed] == int(self.Stage.PULL_ARM_RETRACT)]
+        if len(pull_completed):
+            self.begin_pull_follow_station(state, pull_completed)
+        completed = completed[self.stage[completed] == int(self.Stage.RESTORE_GRIPPER)]
         if len(completed):
             if self.terminal_stage == self.Stage.RESTORE_GRIPPER:
                 self.transition(completed, self.Stage.SUCCESS)
+            elif getattr(self, "pull_door", False):
+                self.begin_pull_clear_sweep(state, completed)
             else:
                 arm_ids = self.env.arm_joint_ids.to(
                     device=self.device, dtype=torch.int64
@@ -2445,8 +2537,480 @@ class TensorDoorFSM:
                 self.reset_base_arrival(completed, ALIGN_PANEL_ARRIVAL)
                 self.transition(completed, self.Stage.ALIGN_PANEL)
                 self.stage_steps[completed] = 1
-        active = self.mask(self.Stage.RESTORE_GRIPPER)
+        active = self.mask(self.Stage.RESTORE_GRIPPER) | self.mask(self.Stage.PULL_ARM_RETRACT)
         self.stage_steps[active] += 1
+        return completed
+
+    def begin_pull_clear_sweep(self, state, rows):
+        # The stage-entry planning event selects a path-validated station before
+        # the next command; hold the current station until it is installed.
+        target = state['root_states'][rows, :2]
+        yaw = _yaw_from_wxyz(state['root_states'][rows, 3:7])
+        retreat = target - 0.20 * torch.stack((yaw.cos(), yaw.sin()), dim=-1)
+        self.pull_base_entry_pose[rows] = torch.cat((target, yaw[:, None]), dim=-1)
+        self.pull_base_trajectory.clear(rows)
+        self.pull_base_path[rows, 0] = torch.cat((retreat, yaw[:, None]), dim=-1)
+        self.pull_base_path_length[rows] = 1
+        self.pull_base_path_index[rows] = 0
+        self.pull_station_xy[rows], self.pull_station_yaw[rows] = target, yaw
+        self.pull_frame_clear_steps[rows] = 0
+        arm_ids = self.env.arm_joint_ids.to(device=self.device, dtype=torch.int64)
+        self.align_panel_arm_joint_target[rows] = state["dof_pos"][rows[:, None], arm_ids[None, :]]
+        self.reset_base_arrival(rows, APPROACH_ARRIVAL)
+        self.transition(rows, self.Stage.PULL_CLEAR_SWEEP)
+        self.stage_steps[rows] = 1
+
+    def install_initial_pull_station(self, rows, target, yaw, gap, clearance, wall_clearance):
+        self.pull_initial_station_xy[rows], self.pull_initial_station_yaw[rows] = target, yaw
+        self.pull_base_path[rows, 1] = torch.cat((target, yaw[:, None]), dim=-1)
+        self.pull_base_path_length[rows] = 2
+        self.pull_base_trajectory.install(rows, self.pull_base_entry_pose[rows], self.pull_base_path[rows], self.dt)
+        self.pull_station_xy[rows], self.pull_station_yaw[rows] = target, yaw
+        self.pull_gap_xy[rows], self.pull_planned_frame_clearance[rows] = gap, clearance
+        self.pull_planned_wall_clearance[rows] = wall_clearance
+
+    def sample_initial_pull_stations(self, rows):
+        visits = self.stage_visit[rows, int(self.Stage.PULL_CLEAR_SWEEP)].to(torch.int64)
+        return _pull_cycle_uniform(self.pull_cycle_seeds[rows], visits + 0x53544154,
+                                   self.pull_station_config.first_candidate_count)[..., :3]
+
+    def command_pull_station(self, state, buffers):
+        if not self.pull_door:
+            return
+        following = torch.where(self.mask(self.Stage.PULL_BASE_ADVANCE))[0]
+        if len(following):
+            self.update_pull_panel_station(state, following)
+        rows = torch.where(self.mask(self.Stage.PULL_CLEAR_SWEEP) | self.mask(self.Stage.PULL_BASE_ADVANCE))[0]
+        if not len(rows):
+            return
+        xy, yaw = self.pull_station_xy[rows], self.pull_station_yaw[rows]
+        reference = torch.cat((xy, yaw[:, None]), dim=-1)
+        velocity = torch.zeros_like(reference)
+        path_complete = torch.ones(len(rows), dtype=torch.bool, device=self.device)
+        initial = self.stage[rows] == int(self.Stage.PULL_CLEAR_SWEEP)
+        initial_rows = rows[initial]
+        if len(initial_rows):
+            pose, feedforward, complete = self.pull_base_trajectory.sample(initial_rows)
+            reference[initial], velocity[initial], path_complete[initial] = pose, feedforward, complete
+        follow_rows = rows[~initial]
+        if len(follow_rows):
+            velocity[~initial] = self.pull_follow_velocity[follow_rows]
+            path_complete[~initial] = self.pull_follow_holding[follow_rows]
+        stability_kwargs = {}
+        if len(following):
+            door_slow = (state['door_joint_velocity'][rows, self.hinge_idx].abs()
+                         < self.turn_release_max_hinge_speed[rows])
+            stability_kwargs['stability_condition'] = (
+                (self.stage[rows] != int(self.Stage.PULL_BASE_ADVANCE)) | door_slow)
+        command, distance, yaw_error = self._track_station(
+            state, rows, reference[:, :2], reference[:, 2], xy, yaw,
+            reference_velocity_world=velocity, arrival_enabled=path_complete,
+            **stability_kwargs,
+        )
+        self.pending_station_distance[rows] = distance
+        self.pending_yaw_error[rows] = yaw_error
+        self.base_hold_target_xy[rows], self.base_hold_nominal_xy[rows] = xy, xy
+        self.base_hold_target_yaw[rows], self.base_hold_nominal_yaw[rows] = yaw, yaw
+        buffers.base[rows] = command
+        buffers.arm_joint_mode[rows] = True
+        buffers.arm_joint[rows] = self.align_panel_arm_joint_target[rows]
+        buffers.gripper[rows, 0] = self.q_closed[rows]
+
+    def advance_pull_clear_sweep(self, state):
+        if not self.pull_door:
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        rows = torch.where(self.mask(self.Stage.PULL_CLEAR_SWEEP))[0]
+        if not len(rows):
+            return torch.empty(0, dtype=torch.int64, device=self.device)
+        path_complete = self.pull_base_trajectory.index[rows] >= self.pull_base_trajectory.length[rows] - 1
+        root = state["root_states"][rows]
+        points = _quat_rotate_points_torch(root[:, 3:7], self.pull_base_points[None, :, :].expand(len(rows), -1, -1)) + root[:, None, :3]
+        clearances = base_projection_clearances(
+            self.hinge_world[rows, :2],
+            torch.stack((self.pull_free_direction[rows], self.door_normal[rows, :2]), dim=1),
+            torch.stack((self.pull_frame_edge[rows], self.pull_wall_front[rows]), dim=1),
+            points[:, :, :2])
+        clearance, wall_clearance = clearances[:, 0], clearances[:, 1]
+        frame_safe = clearance >= self.pull_station_config.clearance_m
+        wall_safe = wall_clearance >= self.pull_station_config.wall_clearance_m
+        safe = frame_safe & wall_safe & path_complete
+        self.pull_frame_clear_steps[rows] = torch.where(
+            safe & (self.base_arrival_settle_steps[rows] > 0),
+            (self.pull_frame_clear_steps[rows] + 1).clamp(max=APPROACH_ARRIVAL.settle_frames),
+            0,
+        )
+        clear_window = self.pull_frame_clear_steps[rows] >= APPROACH_ARRIVAL.settle_frames
+        self.record_acceptance(self.Stage.PULL_CLEAR_SWEEP, rows, {
+            "base_path_complete": (path_complete, self.pull_base_trajectory.index[rows], ">=", self.pull_base_trajectory.length[rows] - 1),
+            "base_arrival_confirmed": (self.base_arrival_confirmed[rows], self.base_arrival_settle_steps[rows], ">=frames", self.base_arrival_required_frames[rows]),
+            "base_stability_confirmed": (self.base_stability_confirmed[rows], self.base_stability_steps[rows], ">=frames", self.base_arrival_required_frames[rows]),
+            "base_frame_projection_clearance_m": (frame_safe, clearance, ">=", self.pull_station_config.clearance_m),
+            "base_wall_clearance_m": (wall_safe, wall_clearance, ">=", self.pull_station_config.wall_clearance_m),
+            "frame_clear_stable_frames": (clear_window, self.pull_frame_clear_steps[rows], ">=", APPROACH_ARRIVAL.settle_frames),
+        })
+        completed = rows[clear_window & self.base_arrival_confirmed[rows] & self.base_stability_confirmed[rows]]
+        if len(completed):
+            if self.terminal_stage == self.Stage.PULL_CLEAR_SWEEP:
+                self.transition(completed, self.Stage.SUCCESS)
+            else:
+                self.transition(completed, self.Stage.PULL_INSERT)
+                self.arm_stability.clear(completed)
+                self.pull_insert_stable_steps[completed] = 0
+        self.stage_steps[rows[self.stage[rows] == int(self.Stage.PULL_CLEAR_SWEEP)]] += 1
+        return completed
+
+    def begin_pull_follow_station(self, state, rows):
+        opened = ((state['door_joint_position'][rows, self.hinge_idx]
+                   >= self.pull_panel_config.opening_angle_rad) | self.pull_door_opened[rows])
+        self.pull_door_opened[rows] |= opened
+        if torch.any(opened):
+            self.begin_through(rows[opened], rolling=True)
+        rows = rows[~opened]
+        if not len(rows):
+            return
+        self.pending_station_distance[rows] = torch.inf
+        self.pending_yaw_error[rows] = torch.inf
+        root = state['root_states'][rows]
+        shoulders = state['robot_body_state_w'][
+            rows[:, None], self.front_shoulder_body_indices[None, :], :3]
+        distances = fixed_dot(shoulders[:, :, :2] - self.hinge_world[rows, None, :2],
+                              self.door_normal[rows, None, :2]) - self.pull_wall_front[rows, None]
+        nearest = distances.abs().argmin(-1)
+        owner = torch.arange(len(rows), device=self.device)
+        shoulder = shoulders[owner, nearest]
+        # Freeze the shoulder's wall-normal coordinate, not the trunk center.
+        self.pull_shoulder_anchor[rows] = shoulder[:, :2]
+        local = _quat_rotate_inverse(root[:, 3:7], shoulder - root[:, :3])
+        self.pull_shoulder_local[rows] = local[:, :2]
+        hinge = state['door_joint_position'][rows, self.hinge_idx]
+        normal = _quat_rotate(_yaw_quat(self.hinge_axis_sign[rows] * hinge), self.door_normal[rows])[:, :2]
+        panel_distance = fixed_dot(shoulder[:, :2] - self.hinge_world[rows, :2], normal)
+        self.pull_panel_side[rows] = torch.where(panel_distance >= 0., 1., -1.)
+        yaw = _yaw_from_wxyz(root[:, 3:7])
+        width = (self.pull_base_points[:, 1].amax() - self.pull_base_points[:, 1].amin()).expand(len(rows))
+        wall_normal = self.door_normal[rows, :2]
+        free_direction = self.pull_free_direction[rows]
+        hinge_left = (wall_normal[:, 0] * free_direction[:, 1]
+                      - wall_normal[:, 1] * free_direction[:, 0]) > 0.
+        left_radius, right_radius = self.pull_station_config.shoulder_hinge_radius_m
+        shoulder_radius = torch.where(hinge_left, left_radius, right_radius)
+        route = shoulder_wall_curve(
+            self.pull_shoulder_anchor[rows], self.pull_shoulder_local[rows],
+            self.hinge_world[rows, :2], self.pull_free_direction[rows], self.door_normal[rows, :2],
+            yaw, width, self.pull_station_config.panel_side_clearance_m,
+            shoulder_hinge_radius_m=shoulder_radius)
+        start = torch.cat((root[:, :2], yaw[:, None]), dim=-1)
+        self.pull_base_trajectory.install(rows, start, route, self.dt)
+        self.pull_station_xy[rows], self.pull_station_yaw[rows] = root[:, :2], yaw
+        self.pull_follow_holding[rows] = False
+        self.pull_follow_velocity[rows] = 0.
+        arm_ids = self.env.arm_joint_ids.to(device=self.device, dtype=torch.int64)
+        self.align_panel_arm_joint_target[rows] = state['dof_pos'][rows[:, None], arm_ids[None]]
+        self.reset_base_arrival(rows, APPROACH_ARRIVAL)
+        self.transition(rows, self.Stage.PULL_BASE_ADVANCE)
+        self.stage_steps[rows] = 1
+
+    def update_pull_panel_station(self, state, rows):
+        hinge = state['door_joint_position'][rows, self.hinge_idx]
+        finished = (hinge >= self.pull_panel_config.opening_angle_rad) | self.pull_door_opened[rows]
+        self.pull_door_opened[rows] = finished
+        if torch.any(finished):
+            self.begin_through(rows[finished], rolling=True)
+        rows = rows[~finished]
+        if not len(rows):
+            return
+        index = self.pull_base_trajectory.index[rows]
+        yaw = self.pull_base_trajectory.poses[rows, index, 2]
+        beta = angle_to_wall(yaw, self.pull_free_direction[rows], self.door_normal[rows, :2])
+        advance = beta < state['door_joint_position'][rows, self.hinge_idx]
+        reference, velocity, complete = self.pull_base_trajectory.sample(rows, advance=advance)
+        self.pull_station_xy[rows], self.pull_station_yaw[rows] = reference[:, :2], reference[:, 2]
+        self.pull_follow_beta[rows] = beta
+        self.pull_follow_holding[rows] = ~advance | complete
+        self.pull_follow_velocity[rows] = velocity
+
+    def advance_pull_station(self, state):
+        empty = torch.empty(0, device=self.device, dtype=torch.int64)
+        if not self.pull_door:
+            return empty
+        rows = torch.where(self.mask(self.Stage.PULL_BASE_ADVANCE))[0]
+        if not len(rows):
+            return empty
+        # Opening can finish while tracking the moving panel.
+        opened = ((state['door_joint_position'][rows, self.hinge_idx] >= self.pull_panel_config.opening_angle_rad)
+                  | self.pull_door_opened[rows])
+        self.pull_door_opened[rows] |= opened
+        if torch.any(opened):
+            self.begin_through(rows[opened], rolling=True)
+        rows = rows[~opened]
+        if not len(rows):
+            return empty
+        ready = self.base_arrival_confirmed[rows] & self.base_stability_confirmed[rows] & self.pull_follow_holding[rows]
+        self.record_acceptance(self.Stage.PULL_BASE_ADVANCE, rows, {
+            'door_speed_rad_s': (
+                state['door_joint_velocity'][rows, self.hinge_idx].abs() < self.turn_release_max_hinge_speed[rows],
+                state['door_joint_velocity'][rows, self.hinge_idx].abs(), '<', self.turn_release_max_hinge_speed[rows]),
+            'base_arrival_confirmed': (self.base_arrival_confirmed[rows], self.base_arrival_settle_steps[rows], '>=frames', self.base_arrival_required_frames[rows]),
+            'base_stability_confirmed': (self.base_stability_confirmed[rows], self.base_stability_steps[rows], '>=frames', self.base_arrival_required_frames[rows]),
+            'trajectory_gate_holding': (self.pull_follow_holding[rows], self.pull_follow_beta[rows], '>=', state['door_joint_position'][rows, self.hinge_idx]),
+        })
+        insert = rows[ready & (self.stage[rows] == int(self.Stage.PULL_BASE_ADVANCE))]
+        if len(insert):
+            if self.terminal_stage == self.Stage.PULL_BASE_ADVANCE:
+                self.transition(insert, self.Stage.SUCCESS)
+            else:
+                self.panel_contact_normal_sign[insert] = self.pull_panel_side[insert]
+                self.ee_command_world[insert] = state['ee_pos'][insert]
+                self.ee_orientation_command[insert] = state['ee_orn'][insert]
+                self.ee_command_valid[insert] = True
+                self.panel_contact_plan_valid[insert] = False
+                self.panel_contact_settle_steps[insert] = 0
+                self.transition(insert, self.Stage.CONTACT_PANEL)
+        self.stage_steps[rows[~ready]] += 1
+        return insert
+
+    def prepare_pull_cycle_samples(self, controllers):
+        """Extract static episode seeds once; no per-visit cache or cycle bound."""
+        if len(controllers) != self.num_envs:
+            raise ValueError("pull seed batch length disagrees with environments")
+        self.pull_cycle_seeds = torch.tensor(
+            [controller.target_noise._seed & 0x7FFFFFFFFFFFFFFF for controller in controllers],
+            dtype=torch.int64, device=self.device,
+        )
+        config = self.pull_panel_config
+        height_offsets = torch.tensor(config.height_offsets_m, dtype=torch.float64, device=self.device)
+        insertion = torch.tensor(config.insertion_lengths_m, dtype=torch.float64, device=self.device)
+        grid = torch.cartesian_prod(height_offsets, insertion)
+        center_insertion = (min(config.insertion_lengths_m) + max(config.insertion_lengths_m)) / 2.
+        distance = grid[:, 0].square() + (grid[:, 1] - center_insertion).square()
+        grid = grid[torch.argsort(distance, stable=True)]
+        grid[:, 0] += config.height_nominal_m
+        self.pull_cycle_pose_grid = grid.to(torch.float32)
+        self.pull_cycle_sample_lower = torch.tensor(
+            (config.height_nominal_m + min(config.height_offsets_m), min(config.insertion_lengths_m),
+             0., -config.station_angle_noise_rad),
+            dtype=torch.float32, device=self.device,
+        )
+        self.pull_cycle_sample_span = torch.tensor(
+            (max(config.height_offsets_m) - min(config.height_offsets_m),
+             max(config.insertion_lengths_m) - min(config.insertion_lengths_m),
+             0., 2. * config.station_angle_noise_rad),
+            dtype=torch.float32, device=self.device,
+        )
+
+    def sample_pull_cycle_candidates(self, rows):
+        """Return [B, candidate_count, 4] and increment each requested cycle once."""
+        cycles = self.pull_cycle[rows].to(torch.int64)
+        config = self.pull_panel_config
+        uniform = _pull_cycle_uniform(self.pull_cycle_seeds[rows], cycles, config.candidate_count)
+        samples = self.pull_cycle_sample_lower + uniform * self.pull_cycle_sample_span
+        samples[..., :2] = self.pull_cycle_pose_grid
+        self.pull_cycle[rows] += 1
+        return samples
+
+    def record_pull_cycle(self, rows, record):
+        """Record batch-first diagnostic tensors, including candidate dimensions."""
+        self.pull_cycle_history.append_batch(rows, record)
+
+    def install_pull_insert_tensor(
+        self, rows, positions, orientations, lengths, contact_points, orientation,
+        face_offset_local, *, endpoint=None, tip_radius=None, ee_tangent_radius=None,
+        **metadata,
+    ):
+        """Install selected inverse paths and desired geometry entirely on-device.
+
+        ``endpoint`` is the desired endpoint, not the inverse command endpoint.
+        Pass it when inverse commands differ from the geometric target. Extra
+        metadata is diagnostic only and never changes the controller's gates.
+        """
+        rows = torch.as_tensor(rows, device=self.device, dtype=torch.int64)
+        self.pull_insert_path.install_tensor(rows, positions, orientations, lengths)
+        if endpoint is None:
+            endpoint = positions[torch.arange(len(rows), device=self.device), lengths.to(torch.int64) - 1]
+        self.pull_insert_goal[rows] = endpoint
+        self.pull_insert_orientation[rows] = orientation
+        self.pull_face_offset_local[rows] = face_offset_local
+        self.pull_panel_contact[rows] = contact_points
+
+    def command_pull_insert(self, state, buffers):
+        if not self.pull_door:
+            return
+        rows = torch.where(self.mask(self.Stage.PULL_INSERT))[0]
+        if not len(rows):
+            return
+        buffers.base[rows] = self._base_hold_command(state, rows)[0]
+        position, orientation = self.pull_insert_path.current(rows, advance=True)
+        self.ee_command_world[rows] = position
+        self.ee_orientation_command[rows] = orientation
+        self._set_cartesian_targets(rows, position, orientation, buffers)
+        buffers.gripper[rows, 0] = self.q_closed[rows]
+
+    def advance_pull_insert(self, state):
+        empty = torch.empty(0, device=self.device, dtype=torch.int64)
+        if not self.pull_door:
+            return empty
+        rows = torch.where(self.mask(self.Stage.PULL_INSERT))[0]
+        if not len(rows):
+            return empty
+        position_error = fixed_norm(state['ee_pos'][rows] - self.pull_insert_goal[rows])
+        orientation_error = _quat_distance(state['ee_orn'][rows], self.pull_insert_orientation[rows])
+        stable = self.arm_stability.update(state, rows)[0]
+        face = state['ee_pos'][rows] + _quat_rotate(state['ee_orn'][rows], self.pull_face_offset_local[rows])
+        hinge = state['door_joint_position'][rows, self.hinge_idx]
+        normal = _quat_rotate(_yaw_quat(self.hinge_axis_sign[rows] * hinge), self.door_normal[rows])
+        gap = fixed_dot(self.pull_panel_contact[rows] - face, normal)
+        base_speed = fixed_norm(state['root_states'][rows, 7:10])
+        gripper_error = (state['gripper_position'][rows, 0] - self.q_closed[rows]).abs()
+        first_entry = self.pull_cycle[rows] == 1
+        gap_ok = first_entry | ((gap >= -.001) & (gap <= .010))
+        ready = ((position_error <= .012) & (orientation_error < .05) & stable
+                 & self.pull_insert_path.complete(rows) & gap_ok
+                 & (base_speed < .02) & (gripper_error < .03))
+        conditions = {
+            'path_complete': (self.pull_insert_path.complete(rows), self.pull_insert_path.index[rows], '>=', self.pull_insert_path.length[rows] - 1),
+            'ee_position_error_m': (position_error <= .012, position_error, '<=', .012),
+            'ee_orientation_error_rad': (orientation_error < .05, orientation_error, '<', .05),
+            'arm_stable': (stable, stable.to(torch.float32), '==', 1.),
+            'base_linear_speed_m_s': (base_speed < .02, base_speed, '<', .02),
+            'gripper_closed_error_rad': (gripper_error < .03, gripper_error, '<', .03),
+        }
+        for initial in (True, False):
+            selected = torch.where(first_entry == initial)[0]
+            if not len(selected):
+                continue
+            group_conditions = {name: (passed[selected], value[selected], relation, threshold)
+                                for name, (passed, value, relation, threshold) in conditions.items()}
+            if not initial:
+                group_conditions.update(
+                    outside_face_gap_min_m=(gap[selected] >= -.001, gap[selected], '>=', -.001),
+                    outside_face_gap_max_m=(gap[selected] <= .010, gap[selected], '<=', .010))
+            self.record_acceptance(self.Stage.PULL_INSERT, rows[selected], group_conditions, required_streak=8)
+        self.pull_insert_stable_steps[rows] = torch.where(ready, self.pull_insert_stable_steps[rows] + 1, 0)
+        completed = rows[self.pull_insert_stable_steps[rows] >= 8]
+        if len(completed):
+            if self.terminal_stage == self.Stage.PULL_INSERT:
+                self.transition(completed, self.Stage.SUCCESS)
+                completed = empty
+            else:
+                opened = state['door_joint_position'][completed, self.hinge_idx] >= self.pull_panel_config.opening_angle_rad
+                self.pull_door_opened[completed] |= opened
+                # If the door coasted open during insertion, retract safely;
+                # do not start a redundant arc or declare the task complete.
+                self.transition(completed[opened], self.Stage.PULL_ARM_RETRACT)
+                pry = completed[~opened]
+                if len(pry):
+                    self.begin_pull_open(state, pry)
+        active = self.mask(self.Stage.PULL_INSERT)
+        self.stage_steps[active] += 1
+        return completed
+
+    def begin_pull_open(self, state, rows):
+        # Follow a hinge-centered positional arc with fixed world orientation.
+        # The sparse planner maps all samples through the shared inverse once.
+        start = state['door_joint_position'][rows, self.hinge_idx]
+        self.push_start_hinge_angle[rows] = start
+        self.push_last_progress_hinge[rows] = start
+        self.push_no_progress_steps[rows] = 0
+        self.push_speed_error_integral[rows] = 0.
+        self.push_overspeed_steps[rows] = 0
+        self.push_command_hinge_angle[rows] = start
+        self.pull_move_start_hinge[rows] = start
+        fraction = torch.linspace(0., 1., 181, device=self.device)
+        delta = self.hinge_axis_sign[rows, None] * (self.push_goal_hinge_angle[rows] - start)[:, None] * fraction[None, :]
+        entry = state['ee_pos'][rows]
+        center = self.hinge_world[rows]
+        relative = entry - center
+        c, s = torch.cos(delta), torch.sin(delta)
+        points = center[:, None, :] + torch.stack((c * relative[:, None, 0] - s * relative[:, None, 1],
+                                                   s * relative[:, None, 0] + c * relative[:, None, 1],
+                                                   relative[:, None, 2].expand_as(c)), dim=-1)
+        q = state['ee_orn'][rows]
+        orientations = q[:, None, :].expand(-1, 181, -1)
+        self.pull_open_path.positions[rows, :181] = points
+        self.pull_open_path.orientations[rows, :181] = orientations
+        origin = self.env.get_goal_reference_origin()[rows]
+        reference = self.env.get_goal_reference_quat()[rows]
+        offset = self.env.get_goal_center_offset_local()[rows]
+        local = _quat_rotate_points_torch(_quat_conjugate(reference), points - origin[:, None, :]) - offset[:, None, :]
+        outside = fixed_norm(local[:, :, :2]) > self.push_comfort_reach_radius[rows, None]
+        first_outside = outside.to(torch.int64).argmax(dim=1)
+        self.pull_open_path.length[rows] = torch.where(
+            outside.any(dim=1), (first_outside + 1).clamp_min(2), 181).to(torch.int32)
+        self.pull_open_path.index[rows] = 0
+        self.transition(rows, self.Stage.PULL_OPEN)
+
+    def command_pull_open(self, state, buffers):
+        if not self.pull_door:
+            return
+        rows = torch.where(self.mask(self.Stage.PULL_OPEN))[0]
+        if not len(rows):
+            return
+        buffers.base[rows] = self._base_hold_command(state, rows)[0]
+        hinge = state['door_joint_position'][rows, self.hinge_idx]
+        target, integral = hinge_speed_target(
+            hinge, state['door_joint_velocity'][rows, self.hinge_idx], self.push_speed_error_integral[rows],
+            dt=self.dt, target_speed=self.push_target_angular_speed[rows], kp=self.push_speed_kp[rows],
+            ki=self.push_speed_ki[rows], integral_limit=self.push_speed_integral_limit[rows],
+            max_lead=self.push_max_angular_lead[rows], goal=self.push_goal_hinge_angle[rows], start=self.push_start_hinge_angle[rows])
+        self.push_speed_error_integral[rows] = integral
+        self.push_command_hinge_angle[rows] = target
+        index = ((target - self.push_start_hinge_angle[rows]) /
+                 (self.push_goal_hinge_angle[rows] - self.push_start_hinge_angle[rows]).clamp_min(1e-6)).clamp(0., 1.) * 180.
+        index = torch.minimum(index, (self.pull_open_path.length[rows] - 1).to(index.dtype))
+        lower = index.floor().to(torch.int64)
+        upper = torch.minimum(lower + 1, (self.pull_open_path.length[rows] - 1).to(torch.int64))
+        weight = (index - lower.to(index.dtype))[:, None]
+        position = (1. - weight) * self.pull_open_path.positions[rows, lower] + weight * self.pull_open_path.positions[rows, upper]
+        q0, q1 = self.pull_open_path.orientations[rows, lower], self.pull_open_path.orientations[rows, upper]
+        q1 = torch.where((fixed_dot(q0, q1) < 0.)[:, None], -q1, q1)
+        orientation = fixed_normalize((1. - weight) * q0 + weight * q1, eps=1e-8)
+        self.ee_command_world[rows] = _slew_position(self.ee_command_world[rows], position, .003)
+        self.ee_orientation_command[rows] = _slew_quaternion(self.ee_orientation_command[rows], orientation, .025)
+        self._set_cartesian_targets(rows, self.ee_command_world[rows], self.ee_orientation_command[rows], buffers)
+        buffers.gripper[rows, 0] = self.q_closed[rows]
+
+    def advance_pull_open(self, state):
+        empty = torch.empty(0, device=self.device, dtype=torch.int64)
+        if not self.pull_door:
+            return empty
+        rows = torch.where(self.mask(self.Stage.PULL_OPEN))[0]
+        if not len(rows):
+            return empty
+        hinge = state['door_joint_position'][rows, self.hinge_idx]
+        speed = state['door_joint_velocity'][rows, self.hinge_idx]
+        self.push_overspeed_steps[rows] = torch.where(speed > self.push_max_angular_speed[rows], self.push_overspeed_steps[rows] + 1, 0)
+        self.fail(rows[self.push_overspeed_steps[rows] >= 3], 52)
+        progressed = hinge >= self.push_last_progress_hinge[rows] + math.radians(.25)
+        self.push_last_progress_hinge[rows] = torch.where(progressed, hinge, self.push_last_progress_hinge[rows])
+        commanded = self.push_command_hinge_angle[rows] > hinge + math.radians(.5)
+        self.push_no_progress_steps[rows] = torch.where(progressed | ~commanded, 0, self.push_no_progress_steps[rows] + 1)
+        self.fail(rows[self.push_no_progress_steps[rows] > 300], 51)
+        fraction = ((self.push_command_hinge_angle[rows] - self.push_start_hinge_angle[rows]) /
+                    (self.push_goal_hinge_angle[rows] - self.push_start_hinge_angle[rows]).clamp_min(1e-6)).clamp(0., 1.)
+        at_path_end = (self.pull_open_path.length[rows] < 181) & (fraction * 180. >= self.pull_open_path.length[rows] - 1)
+        endpoint = self.pull_open_path.positions[rows, (self.pull_open_path.length[rows] - 1).to(torch.int64)]
+        endpoint_commanded = fixed_norm(self.ee_command_world[rows] - endpoint) <= 1e-4
+        needs_reposition = outside_comfort_workspace(state['ee_goal_cart_local'][rows], self.push_comfort_reach_radius[rows]) | (at_path_end & endpoint_commanded)
+        opened = hinge >= self.pull_panel_config.opening_angle_rad
+        minimum_open = hinge >= math.radians(30.)
+        complete = (opened | needs_reposition) & minimum_open
+        reach = fixed_norm(state['ee_goal_cart_local'][rows, :2])
+        self.record_acceptance(self.Stage.PULL_OPEN, rows, {
+            'door_angle_at_least_30deg': (minimum_open, hinge, '>=', math.radians(30.)),
+            'door_open_or_workspace_boundary': (complete, complete.to(torch.float32), '==', 1.),
+            'arm_reach_m': (reach >= 0., reach, '>=', 0.),
+        })
+        completed_mask = complete & self.mask(self.Stage.PULL_OPEN)[rows]
+        completed = rows[completed_mask]
+        if len(completed):
+            self.pull_finished_for_reposition[completed] = (needs_reposition & ~opened)[completed_mask]
+            self.pull_door_opened[completed] |= opened[completed_mask]
+            if self.terminal_stage == self.Stage.PULL_OPEN:
+                self.transition(completed, self.Stage.SUCCESS)
+                completed = empty
+            else:
+                self.transition(completed, self.Stage.PULL_ARM_RETRACT)
+        self.stage_steps[self.mask(self.Stage.PULL_OPEN)] += 1
         return completed
 
     def command_align_panel(
@@ -2506,39 +3070,6 @@ class TensorDoorFSM:
             self.mask(self.Stage.CONTACT_PANEL) & ~self.panel_contact_plan_valid
         )[0]
 
-    def install_contact_plan(
-        self,
-        env_ids,
-        panel_targets,
-        desired_ee_targets,
-        command_targets,
-        command_orientations,
-    ) -> None:
-        rows = torch.as_tensor(env_ids, dtype=torch.int64, device=self.device)
-        self.panel_contact_target_world[rows] = torch.as_tensor(
-            panel_targets, dtype=torch.float32, device=self.device
-        )
-        self.panel_contact_desired_ee_world[rows] = torch.as_tensor(
-            desired_ee_targets, dtype=torch.float32, device=self.device
-        )
-        self.panel_contact_command_target_world[rows] = torch.as_tensor(
-            command_targets, dtype=torch.float32, device=self.device
-        )
-        self.panel_contact_command_orientation_world[rows] = torch.as_tensor(
-            command_orientations, dtype=torch.float32, device=self.device
-        )
-        initialize = ~self.ee_command_valid[rows]
-        if torch.any(initialize):
-            init_rows = rows[initialize]
-            self.ee_command_world[init_rows] = self.panel_contact_command_target_world[
-                init_rows
-            ]
-            self.ee_orientation_command[init_rows] = (
-                self.panel_contact_command_orientation_world[init_rows]
-            )
-            self.ee_command_valid[init_rows] = True
-        self.panel_contact_plan_valid[rows] = True
-
     def command_contact_panel(
         self, state: dict[str, torch.Tensor], buffers: TensorCommandBuffers
     ) -> None:
@@ -2549,16 +3080,15 @@ class TensorDoorFSM:
             return
         command, _, _ = self._base_hold_command(state, rows)
         buffers.base[rows] = command
-        self.ee_command_world[rows] = _slew_position(
-            self.ee_command_world[rows],
-            self.panel_contact_command_target_world[rows],
-            0.003,
-        )
-        self.ee_orientation_command[rows] = _slew_quaternion(
-            self.ee_orientation_command[rows],
-            self.panel_contact_command_orientation_world[rows],
-            0.025,
-        )
+        if not self.pull_door:
+            position,orientation = self.panel_arrival_path.current(rows,advance=True)
+            self.ee_command_world[rows] = position
+            self.ee_orientation_command[rows] = orientation
+        else:
+            self.ee_command_world[rows] = _slew_position(
+                self.ee_command_world[rows],self.panel_contact_command_target_world[rows],0.003)
+            self.ee_orientation_command[rows] = _slew_quaternion(
+                self.ee_orientation_command[rows],self.panel_contact_command_orientation_world[rows],0.025)
         self._set_cartesian_targets(
             rows,
             self.ee_command_world[rows],
@@ -2580,7 +3110,7 @@ class TensorDoorFSM:
         hinge = state["door_joint_position"][rows, self.hinge_idx]
         current_normal = _quat_rotate(
             _yaw_quat(self.hinge_axis_sign[rows] * hinge), self.door_normal[rows]
-        )
+        ) * self.panel_contact_normal_sign[rows, None]
         ee_error = state["ee_pos"][rows] - self.panel_contact_target_world[rows]
         signed = fixed_dot(ee_error, current_normal)
         tangent_error = fixed_norm(ee_error - signed[:, None] * current_normal)
@@ -2588,9 +3118,12 @@ class TensorDoorFSM:
             state["ee_orn"][rows], self.depth_axis_local[rows]
         )
         insertion_axis = fixed_normalize(insertion_axis, eps=1e-8)
-        orientation_error = torch.acos(
+        normal_axis_error = torch.acos(
             fixed_dot(insertion_axis, -current_normal).clamp(-1.0, 1.0)
         )
+        orientation_error = _quat_distance(
+            state['ee_orn'][rows], self.panel_contact_command_orientation_world[rows])
+        axis_allowed = normal_axis_error <= math.radians(30.) + self.grasp_orientation_tolerance[rows]
         ee_speed = fixed_norm(state["ee_vel"][rows, :3])
         clearance = finger_clearance[rows]
         self.panel_last_finger_clearance[rows] = clearance
@@ -2602,6 +3135,7 @@ class TensorDoorFSM:
             & (clearance <= self.panel_standoff_acceptance_clearance[rows])
             & (tangent_error < 0.035)
             & (orientation_error <= self.grasp_orientation_tolerance[rows])
+            & axis_allowed
             & (ee_speed < 0.06)
         )
         gripper_closed = state["gripper_position"][rows, 0].abs() < 0.20
@@ -2613,6 +3147,7 @@ class TensorDoorFSM:
                 "finger_clearance_max_m": (clearance <= self.panel_standoff_acceptance_clearance[rows], clearance, "<=", self.panel_standoff_acceptance_clearance[rows]),
                 "lateral_error_m": (tangent_error < 0.035, tangent_error, "<", 0.035),
                 "insertion_axis_error_rad": (orientation_error <= self.grasp_orientation_tolerance[rows], orientation_error, "<=", self.grasp_orientation_tolerance[rows]),
+                "panel_normal_axis_error_rad": (axis_allowed, normal_axis_error, "<=", math.radians(30.) + self.grasp_orientation_tolerance[rows]),
                 "ee_speed_m_s": (ee_speed < 0.06, ee_speed, "<", 0.06),
                 "gripper_closed_abs_rad": (gripper_closed, state["gripper_position"][rows, 0].abs(), "<", 0.20),
             },
@@ -2639,10 +3174,14 @@ class TensorDoorFSM:
         self.push_start_hinge_angle[rows] = hinge
         self.push_last_progress_hinge[rows] = hinge
         self.push_no_progress_steps[rows] = 0
-        # The push arc follows the physical panel contact point.  The inverse
-        # command is only the actuator-side target used to reach the standoff.
-        self.push_contact_world[rows] = self.panel_contact_target_world[rows]
         self.push_orientation[rows] = state["ee_orn"][rows]
+        self.push_tip_offset_world[rows] = _quat_rotate(
+            self.push_orientation[rows], self.panel_push_tip_offset_local[rows])
+        surface = _rotate_about_z(
+            self.panel_push_tip_surface_world[rows], self.hinge_world[rows],
+            self.hinge_axis_sign[rows] * (hinge - self.panel_push_tip_hinge_angle[rows]))
+        self.push_contact_world[rows] = (
+            surface - self.push_tip_offset_world[rows])
         self.push_command_hinge_angle[rows] = hinge
         self.push_speed_error_integral[rows] = 0.0
         self.push_overspeed_steps[rows] = 0
@@ -2663,20 +3202,15 @@ class TensorDoorFSM:
         rows = torch.where(self.mask(self.Stage.PUSH_OPEN))[0]
         if not len(rows):
             return torch.empty(0, dtype=torch.int64, device=self.device)
-        reach = fixed_norm(state["ee_goal_cart_local"][rows, :2])
-        return rows[reach > self.push_comfort_reach_radius[rows]]
-
-    def install_push_retract_pose(
-        self, state: dict[str, torch.Tensor], env_ids, poses_local
-    ) -> None:
-        rows = torch.as_tensor(env_ids, dtype=torch.int64, device=self.device)
-        self.active_arm_retract_pose_local[rows] = torch.as_tensor(
-            poses_local, dtype=torch.float32, device=self.device
-        )
-        self.push_arm_detached[rows] = True
-        self.push_recovery_settle_steps[rows] = 0
-        self.push_detached_ee_goal_local[rows] = state["ee_goal_cart_local"][rows]
-        self.transition(rows, self.Stage.PUSH_ARM_RETRACT)
+        retract = outside_comfort_workspace(state["ee_goal_cart_local"][rows], self.push_comfort_reach_radius[rows])
+        planned_stop = self.push_planned_stop_hinge[rows]
+        retract |= ((planned_stop < math.radians(89.) - 1.e-5)
+                    & (self.push_command_hinge_angle[rows] >= planned_stop - 1.e-4)
+                    & (state['door_joint_position'][rows, self.hinge_idx] >= planned_stop - math.radians(2.)))
+        if self.pull_door:
+            retract |= (self.pull_door_opened[rows]
+                        | (state['door_joint_position'][rows, self.hinge_idx] >= self.pull_panel_config.opening_angle_rad))
+        return rows[retract]
 
     def _world_orientation_from_local_rpy(
         self, rows: torch.Tensor, local_rpy: torch.Tensor
@@ -2698,29 +3232,23 @@ class TensorDoorFSM:
         buffers.base[rows] = command
         hinge = state["door_joint_position"][rows, self.hinge_idx]
         hinge_velocity = state["door_joint_velocity"][rows, self.hinge_idx]
-        speed_error = self.push_target_angular_speed[rows] - hinge_velocity
-        integral = (
-            self.push_speed_error_integral[rows] + speed_error * self.dt
-        ).clamp(
-            -self.push_speed_integral_limit[rows],
-            self.push_speed_integral_limit[rows],
-        )
+        target_hinge, integral = hinge_speed_target(
+            hinge, hinge_velocity, self.push_speed_error_integral[rows],
+            dt=self.dt, target_speed=self.push_target_angular_speed[rows],
+            kp=self.push_speed_kp[rows], ki=self.push_speed_ki[rows],
+            integral_limit=self.push_speed_integral_limit[rows],
+            max_lead=self.push_tip_max_angular_lead[rows],
+            goal=torch.minimum(self.push_goal_hinge_angle[rows], self.push_planned_stop_hinge[rows]),
+            start=self.push_start_hinge_angle[rows])
         self.push_speed_error_integral[rows] = integral
-        angular_offset = (
-            self.push_speed_kp[rows] * speed_error
-            + self.push_speed_ki[rows] * integral
-        ).clamp(-self.push_max_angular_lead[rows], self.push_max_angular_lead[rows])
-        target_hinge = torch.maximum(
-            torch.minimum(hinge + angular_offset, self.push_goal_hinge_angle[rows]),
-            self.push_start_hinge_angle[rows] - math.radians(2.0),
-        )
         self.push_command_hinge_angle[rows] = target_hinge
         delta = self.hinge_axis_sign[rows] * (
             target_hinge - self.push_start_hinge_angle[rows]
         )
-        target = _rotate_about_z(
-            self.push_contact_world[rows], self.hinge_world[rows], delta
-        )
+        tip_offset = self.push_tip_offset_world[rows]
+        target = fingertip_arc_position(
+            self.push_contact_world[rows] + tip_offset, tip_offset,
+            self.hinge_world[rows], delta)
         self.ee_command_world[rows] = _slew_position(
             self.ee_command_world[rows], target, 0.003
         )
@@ -2890,9 +3418,10 @@ class TensorDoorFSM:
         delta = self.hinge_axis_sign[rows] * (
             hinge - self.push_start_hinge_angle[rows]
         )
-        return _rotate_about_z(
-            self.push_contact_world[rows], self.hinge_world[rows], delta
-        )
+        tip_offset = self.push_tip_offset_world[rows]
+        return fingertip_arc_position(
+            self.push_contact_world[rows] + tip_offset, tip_offset,
+            self.hinge_world[rows], delta)
 
     def _base_advance_targets(
         self, state: dict[str, torch.Tensor], rows: torch.Tensor
@@ -3105,12 +3634,14 @@ class TensorDoorFSM:
         self.stage_steps[active] += 1
         return completed
 
-    def begin_through(self, rows: torch.Tensor) -> None:
+    def begin_through(self, rows: torch.Tensor, *, rolling: bool = False) -> None:
+        self.through_trajectory.clear(rows)
+        self.through_path_previous_index[rows] = 0
         self.through_best_station_error[rows] = torch.inf
         self.through_no_progress_steps[rows] = 0
         self.through_settle_steps[rows] = 0
         self.through_stop_latched[rows] = False
-        self.through_motion_ready[rows] = False
+        self.through_motion_ready[rows] = rolling
         self.through_entry_stable_steps[rows] = 0
         self.transition(rows, self.Stage.THROUGH)
         self.stage_steps[rows] = 1
@@ -3123,13 +3654,26 @@ class TensorDoorFSM:
         )[0]
         if not len(rows):
             return
+        entering = rows[self.through_trajectory.length[rows] == 0]
+        if len(entering):
+            root = state['root_states'][entering]
+            start = torch.cat((root[:, :2], _yaw_from_wxyz(root[:, 3:7])[:, None]), dim=-1)
+            envelope = robot_motion_envelope(root, state['robot_body_state_w'][entering],
+                                            self.base_motion_points, self.base_motion_body_indices)
+            radius = fixed_norm(envelope[..., :2]).flatten(1).amax(-1)
+            finish = torch.cat((self.through_command_xy[entering], self.through_command_yaw[entering, None]), dim=-1)
+            route = frame_traversal_waypoints(start, self.initial_door_root[entering, :2],
+                                             self.door_forward[entering, :2], finish, radius)
+            self.through_trajectory.install(entering, start, route, self.dt)
+        reference, velocity, _ = self.through_trajectory.sample(rows)
         command, distance, yaw_error = track_base_pose(
             state["root_states"][rows],
-            self.through_command_xy[rows],
-            self.through_command_yaw[rows],
+            reference[:, :2],
+            reference[:, 2],
             self.through_station_xy[rows],
             self.through_station_yaw[rows],
             minimum_speed_toward_target_only=False,
+            reference_velocity_world=velocity,
         )
         tail_clearance = self._tail_clearance(state, rows)
         latched = self.through_stop_latched[rows]
@@ -3202,12 +3746,14 @@ class TensorDoorFSM:
         self.through_motion_ready[rows] |= entry_confirmed
         distance = self.pending_station_distance[rows]
         improved = distance < self.through_best_station_error[rows] - 0.01
+        path_progress = self.through_trajectory.index[rows] > self.through_path_previous_index[rows]
+        self.through_path_previous_index[rows] = self.through_trajectory.index[rows]
         self.through_best_station_error[rows] = torch.where(
             improved, distance, self.through_best_station_error[rows]
         )
         no_progress = torch.where(
             ~self.through_motion_ready[rows]
-            | improved
+            | improved | path_progress
             | (distance < BASE_STATION_TOLERANCE_M),
             0,
             self.through_no_progress_steps[rows] + 1,
@@ -3313,6 +3859,9 @@ class TensorDoorFSM:
         self.command_open_and_clear(state, buffers)
         self.command_retreat(state, buffers)
         self.command_restore(state, buffers)
+        self.command_pull_station(state, buffers)
+        self.command_pull_insert(state, buffers)
+        self.command_pull_open(state, buffers)
         self.command_align_panel(state, buffers)
         self.command_contact_panel(state, buffers)
         self.command_push_open(state, finger_clearance, buffers)
@@ -3335,7 +3884,10 @@ class TensorDoorFSM:
         events["success"] = self.advance_through(state)
         push_to_through = self.advance_push_common(state)
         if len(push_to_through):
-            self.begin_through(push_to_through)
+            if self.pull_door:
+                self.pull_door_opened[push_to_through] = True
+            else:
+                self.begin_through(push_to_through)
         events["contact_replan"] = self.advance_base_advance(state)
         self.advance_push_retract(state)
         push_rows = torch.where(self.mask(self.Stage.PUSH_OPEN))[0]
@@ -3344,8 +3896,18 @@ class TensorDoorFSM:
         if len(contact_to_push):
             self.begin_push(state, contact_to_push, finger_clearance)
         events["contact_plan"] = self.advance_align_panel(state)
-        self.advance_restore(state)
-        events["restore_plan"] = self.advance_retreat(state)
+        pull_retract = self.advance_pull_open(state)
+        pull_insert_ready = self.advance_pull_insert(state)
+        events["pull_open_plan"] = pull_insert_ready[self.stage[pull_insert_ready] == int(self.Stage.PULL_OPEN)]
+        pull_retract = torch.cat((pull_retract, pull_insert_ready[self.stage[pull_insert_ready] == int(self.Stage.PULL_ARM_RETRACT)]))
+        pull_next_insert = self.advance_pull_station(state)
+        events["contact_plan"] = torch.cat((events["contact_plan"],
+            pull_next_insert[self.stage[pull_next_insert] == int(self.Stage.CONTACT_PANEL)]))
+        pull_station_complete = self.advance_pull_clear_sweep(state)
+        events["pull_insert_plan"] = pull_station_complete[self.stage[pull_station_complete] == int(self.Stage.PULL_INSERT)]
+        restored = self.advance_restore(state)
+        events["pull_station_plan"] = restored[self.stage[restored] == int(self.Stage.PULL_CLEAR_SWEEP)]
+        events["restore_plan"] = torch.cat((self.advance_retreat(state), pull_retract))
         events["retreat_plan"] = self.advance_open_and_clear(state)
         events["release_open_plan"] = self.advance_return(state)
         push_pull_to_return = self.advance_push_pull_door(state)

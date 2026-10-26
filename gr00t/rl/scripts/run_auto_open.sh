@@ -39,7 +39,7 @@ if [[ ! -d /workspace/isaaclab ]]; then
     HEARTBEAT_PID="$!"
     docker_args=(exec -e "AUTO_OPEN_LAUNCH_LEASE=${CONTAINER_LEASE}")
     for name in SEED_START SEED_END AUTO_OPEN_MODE DOOR_MOTION GPU_IDS \
-        STOP_AFTER_STAGE MAX_STEPS REPLAY_RENDER_BATCH_SIZE STEADY_PATH_WORKERS; do
+        STOP_AFTER_STAGE MAX_STEPS REPLAY_RENDER_BATCH_SIZE PULL_PANEL_CONTACT_BASELINE; do
         if [[ -v "${name}" ]]; then
             docker_args+=(-e "${name}=${!name}")
         fi
@@ -62,16 +62,17 @@ fi
 # from two source trees.
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
 GPU_IDS_CSV="${GPU_IDS:-0,1,2,3}"
-MAX_STEPS="${MAX_STEPS:-4000}"
 REPLAY_RENDER_BATCH_SIZE="${REPLAY_RENDER_BATCH_SIZE:-8}"
 AUTO_OPEN_MODE="${AUTO_OPEN_MODE:-official}"
 DOOR_MOTION="${DOOR_MOTION:-push}"
+PULL_PANEL_CONTACT_BASELINE="${PULL_PANEL_CONTACT_BASELINE:-trunk_front_minus10}"
+if [[ "${DOOR_MOTION}" == pull ]]; then
+    MAX_STEPS="${MAX_STEPS:-16000}"
+else
+    MAX_STEPS="${MAX_STEPS:-4000}"
+fi
 if [[ -z "${STOP_AFTER_STAGE:-}" ]]; then
-    if [[ "${DOOR_MOTION}" == pull ]]; then
-        STOP_AFTER_STAGE=RESTORE_GRIPPER
-    else
-        STOP_AFTER_STAGE=THROUGH
-    fi
+    STOP_AFTER_STAGE=THROUGH
 fi
 FORMAL_DATA_ROOT="${REPO_ROOT}/datasets/auto_open"
 RELEASE_VERSION="v1"
@@ -131,8 +132,18 @@ if [[ "${DOOR_MOTION}" != push && "${DOOR_MOTION}" != pull ]]; then
     echo "DOOR_MOTION must be push or pull." >&2
     exit 2
 fi
-if [[ "${STOP_AFTER_STAGE}" != THROUGH && "${STOP_AFTER_STAGE}" != RESTORE_GRIPPER ]]; then
-    echo "STOP_AFTER_STAGE must be THROUGH or RESTORE_GRIPPER." >&2
+if [[ "${STOP_AFTER_STAGE}" != THROUGH && "${STOP_AFTER_STAGE}" != RESTORE_GRIPPER \
+      && "${STOP_AFTER_STAGE}" != PULL_CLEAR_SWEEP && "${STOP_AFTER_STAGE}" != PULL_INSERT \
+      && "${STOP_AFTER_STAGE}" != PULL_OPEN && "${STOP_AFTER_STAGE}" != PULL_BASE_ADVANCE ]]; then
+    echo "STOP_AFTER_STAGE must be THROUGH, RESTORE_GRIPPER, PULL_CLEAR_SWEEP, PULL_INSERT, PULL_OPEN, or PULL_BASE_ADVANCE." >&2
+    exit 2
+fi
+if [[ "${DOOR_MOTION}" == push && "${STOP_AFTER_STAGE}" == PULL_* ]]; then
+    echo "PULL_* terminal stages require DOOR_MOTION=pull." >&2
+    exit 2
+fi
+if [[ "${AUTO_OPEN_MODE}" == official && "${STOP_AFTER_STAGE}" != THROUGH ]]; then
+    echo "Partial workflows cannot be published as official datasets; use canonical or debug." >&2
     exit 2
 fi
 if [[ "${DOOR_MOTION}" == push ]]; then
@@ -230,6 +241,7 @@ run_phase() {
     local seed_array_name="$4"
     local -n phase_seeds="${seed_array_name}"
     local phase_start rank_count rank gpu_id offset failures elapsed seeds_csv
+    local rank_status phase_status report_path
     local -a common_args collection_args rank_seeds
 
     if [[ -e "${dataset_root}" ]]; then
@@ -241,14 +253,11 @@ run_phase() {
         --headless
         --device cuda:0
         --max_steps "${MAX_STEPS}"
-        --batch_contact_ik_backend exact_workers
-        --batch_path_backend exact_workers
-        --batch_panel_clearance_backend gpu
-        --batch_geometry_fallback_backend numpy_batch
         --summary_only
         --collection_camera_mode "${camera_mode}"
         --doorman_door_open_io "${DOOR_OPEN_IO}"
         --terminal_stage "${STOP_AFTER_STAGE}"
+        --pull_panel_contact_baseline "${PULL_PANEL_CONTACT_BASELINE}"
     )
     if [[ "${AUTO_OPEN_MODE}" == debug ]]; then
         common_args+=(--debug_trace)
@@ -284,11 +293,10 @@ run_phase() {
         for ((offset=rank; offset<${#phase_seeds[@]}; offset+=rank_count)); do
             rank_seeds+=("${phase_seeds[offset]}")
         done
-        setsid env CUDA_VISIBLE_DEVICES="${gpu_id}" python "${ENTRY}" \
+        setsid --wait env CUDA_VISIBLE_DEVICES="${gpu_id}" python "${ENTRY}" \
             "${common_args[@]}" "${collection_args[@]}" \
             --seed "${rank_seeds[0]}" --episode_seeds "${rank_seeds[@]}" \
             --batched_envs "${#rank_seeds[@]}" \
-            --steady_path_workers "${STEADY_PATH_WORKERS:-4}" \
             --standard_dataset_dir "${dataset_root}/shards" \
             --output_dir "${dataset_root}/logs/rank${rank}-control" \
             >"${dataset_root}/logs/rank${rank}.console.log" 2>&1 &
@@ -325,21 +333,42 @@ run_phase() {
     ACTIVE_MONITOR_PID="$!"
 
     failures=0
+    phase_status=0
     for rank in "${!ACTIVE_PIDS[@]}"; do
-        wait "${ACTIVE_PIDS[rank]}" || failures=$((failures + 1))
+        if wait "${ACTIVE_PIDS[rank]}"; then
+            if [[ "${camera_mode}" != dual && ! -s "${dataset_root}/logs/rank${rank}-control/summary.json" ]]; then
+                echo "AutoOpen rank=${rank} gpu=${GPU_IDS_ARRAY[rank]} exited 0 without completed summary: ${dataset_root}/logs/rank${rank}-control/summary.json; log=${dataset_root}/logs/rank${rank}.console.log" >&2
+                failures=$((failures + 1))
+                if (( phase_status == 0 )); then phase_status=1; fi
+            fi
+            # A clean process exit must still have finalized every assigned shard.
+            for ((offset=rank; offset<${#phase_seeds[@]}; offset+=rank_count)); do
+                report_path="${dataset_root}/shards/episode-seed${phase_seeds[offset]}/meta/acceptance_report.json"
+                if [[ ! -s "${report_path}" ]]; then
+                    echo "AutoOpen rank=${rank} gpu=${GPU_IDS_ARRAY[rank]} exited 0 without finalized shard: ${report_path}; log=${dataset_root}/logs/rank${rank}.console.log" >&2
+                    failures=$((failures + 1))
+                    if (( phase_status == 0 )); then phase_status=1; fi
+                fi
+            done
+        else
+            rank_status="$?"
+            failures=$((failures + 1))
+            if (( phase_status == 0 )); then phase_status="${rank_status}"; fi
+            echo "AutoOpen rank=${rank} gpu=${GPU_IDS_ARRAY[rank]} pid=${ACTIVE_PIDS[rank]} failed with exit=${rank_status}; log=${dataset_root}/logs/rank${rank}.console.log" >&2
+        fi
     done
     wait "${ACTIVE_MONITOR_PID}" 2>/dev/null || true
     ACTIVE_MONITOR_PID=""
     ACTIVE_PIDS=()
     if (( failures != 0 )); then
         echo "AutoOpen ${camera_mode} phase failed; aggregation was skipped." >&2
-        return 1
+        return "${phase_status}"
     fi
 
     seeds_csv="$(IFS=,; echo "${phase_seeds[*]}")"
     elapsed=$(( $(date +%s) - phase_start ))
     PHASE_OUTPUT_ROOT="${dataset_root}" PHASE_SEEDS_CSV="${seeds_csv}" \
-    PHASE_CAMERAS="${camera_mode}" COLLECTION_WALL_TIME_S="${elapsed}" python - <<'PY'
+    PHASE_CAMERAS="${camera_mode}" COLLECTION_WALL_TIME_S="${elapsed}" python - <<'PY' || return "$?"
 import os
 from pathlib import Path
 from gr00t.rl.data_collection.auto_open_writer import aggregate_standard_shards
@@ -369,6 +398,7 @@ if [[ "${AUTO_OPEN_MODE}" == debug ]]; then
     debug_result_count="$(SOURCE_FINGERPRINT="${SOURCE_FINGERPRINT}" \
         SEED_START="${SEED_START}" SEED_END="${SEED_END}" \
         STOP_AFTER_STAGE="${STOP_AFTER_STAGE}" DOOR_MOTION="${DOOR_MOTION}" \
+        PULL_PANEL_CONTACT_BASELINE="${PULL_PANEL_CONTACT_BASELINE}" \
         python - "${debug_pending_root}" <<'PY'
 import json
 import os
@@ -421,6 +451,7 @@ else:
             "source_fingerprint_sha256": os.environ["SOURCE_FINGERPRINT"],
             "requested_episodes": int(report["total_episodes"]),
             "door_motion": os.environ["DOOR_MOTION"],
+            "pull_panel_contact_baseline": os.environ["PULL_PANEL_CONTACT_BASELINE"],
             "requested_terminal_stage": terminal_stage,
             "result_label": result_label,
             "completed_requested_terminal": len(completed),
@@ -483,6 +514,27 @@ else
     echo "[workflow] phase 1/2: canonical no-camera collection (${#ALL_SEEDS[@]} seeds)"
 fi
 run_phase "${canonical_root}" none "" ALL_SEEDS
+if [[ "${STOP_AFTER_STAGE}" != THROUGH ]]; then
+    python - "${canonical_root}" "${STOP_AFTER_STAGE}" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root, terminal = Path(sys.argv[1]), sys.argv[2]
+metadata = [json.loads(p.read_text()) for p in root.glob("logs/rank*-control/seed_*/metadata.json")]
+completed = sorted(m["seed"] for m in metadata if m.get("success") and
+                   m.get("result", {}).get("requested_terminal_stage") == terminal)
+report = {"requested_terminal_stage": terminal, "episodes": len(metadata),
+          "completed_terminal_seeds": completed, "not_full_workflow_acceptance": True}
+(root / "partial_workflow_report.json").write_text(json.dumps(report, indent=2) + "\n")
+(root / "completed_terminal_seeds.txt").write_text("".join(f"{s}\n" for s in completed))
+print(f"[workflow] {terminal} prefix completion: {len(completed)}/{len(metadata)}; not full-task data acceptance")
+PY
+    rmdir "${work_root}"
+    echo "[workflow] partial canonical validation completed: ${canonical_root}"
+    trap - INT TERM EXIT
+    exit 0
+fi
 SOURCE_FINGERPRINT="${SOURCE_FINGERPRINT}" SEED_START="${SEED_START}" \
 SEED_END="${SEED_END}" python - "${canonical_root}/workflow_source.json" <<'PY'
 import json

@@ -352,6 +352,7 @@ class SimRgbCameraManager:
         self.preview_window_name = "RGB Cameras"
         self._cv2 = None
         self._episode_specs = {}
+        self._camera_specs = {}
         self._configured_env_by_slot = {}
 
         config = load_rgb_camera_config(config_path)
@@ -371,6 +372,13 @@ class SimRgbCameraManager:
             parsed[int(env_id)] = value["cameras"]
         self._episode_specs = parsed
         self._configured_env_by_slot = {}
+
+    def camera_spec_for_env(self, camera_name, env_id=0):
+        """Return the effective source calibration, not a sidecar slot's spec."""
+        if self._episode_specs:
+            specs = self._episode_specs[int(env_id)]
+            return next(spec for spec in specs if spec["name"] == camera_name)
+        return self._camera_specs[camera_name]
 
     def _configure_episode_camera(self, env_id):
         if not self._episode_specs:
@@ -397,6 +405,8 @@ class SimRgbCameraManager:
         parsed = rgb_camera_specs_from_config(config)
         if not parsed["enabled"]:
             return
+
+        self._camera_specs = {spec["name"]: spec for spec in parsed["cameras"]}
 
         draw_in_viewer = bool(parsed["draw_in_viewer"])
         self.preview_enabled = bool(parsed["preview_window"])
