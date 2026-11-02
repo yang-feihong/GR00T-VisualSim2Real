@@ -161,4 +161,8 @@ PUSH_PANEL_OPEN超前量定义在指定夹爪尖端，动态上限4度，门速�
 
 外部/背筐抓取复用同一入口、StageSpec编排、控制接口和数据链路，分别选择`AUTO_OPEN_TASK=pick_external|pick_basket`。阶段、场景随机化、成功率/耗时总表和失败分布见[抓取主线说明](pick_gpu_batch_status_zh.md)。最近有效抓取基线为212/400（53.0%）、1085秒，以及313/400（78.25%）、1197秒；共享动力学与资产变更后尚未复测，不冒充本轮新结果。
 
-配套远程采集规划：wholebody3推门从110000起、wholebody4拉门从210000起；每批两卡各100seed，official模式连续执行新seed。使用冻结源码和受控滤波配置覆盖，不跟随本地未提交改动；具体部署状态、版本和健康检查维护在[台账](door_baseline_validation_progress_zh.md)。
+配套远程采集已切换：wholebody3推门从110000起、wholebody4拉门从210000起；每批两卡各100seed，official模式连续执行新seed。冻结源码提交`b62b0f7`，目录为`.official_service/b62b0f7/source`，附声明且校验哈希的True滤波覆盖，不跟随本地未提交改动。旧服务已停止，旧数据保留。
+
+首批远程canonical：推门175/200（87.5%，1048秒）、拉门161/200（80.5%，1505秒），均进入双鱼眼回放且无监控告警。此时整批official发布数仍为0，图像补录完成和发布由持续服务继续执行；这些首批结果不替代上面的1000seed基线。
+
+服务状态位于`.official_service/b62b0f7/{push,pull}_continuous/status.json`，逐批记录canonical请求数、严格通过数、实际发布数和首因分类，二者不混算；监控每60秒刷新。STOP文件阻止继续分配新批次；立即停止当前批次还需对对应`service.pid`中的容器PID发送TERM。具体部署与首批验收进度维护在[台账](door_baseline_validation_progress_zh.md)。
