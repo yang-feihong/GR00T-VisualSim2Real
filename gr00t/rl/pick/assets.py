@@ -91,6 +91,9 @@ def prepare_mesh_asset(name, directory, mesh_path, *, provenance, mass_kg=0.10, 
         and dimensions.max() <= 0.22
     ):
         raise ValueError(f"Scan is not a small graspable object: {name} {dimensions}")
+    uv = getattr(mesh.visual, "uv", None)
+    if texture_path is not None and uv is None:
+        raise ValueError(f"Explicit source texture has no mesh UV coordinates: {mesh_path}")
     vertices -= (vertices.min(0) + vertices.max(0)) / 2
     usd_path = directory / "object.usda"
     stage = Usd.Stage.CreateNew(str(usd_path))
@@ -113,13 +116,14 @@ def prepare_mesh_asset(name, directory, mesh_path, *, provenance, mass_kg=0.10, 
     shader = UsdShade.Shader.Define(stage, "/Object/Material/Surface")
     shader.CreateIdAttr("UsdPreviewSurface")
     shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(0.6)
-    uv = getattr(mesh.visual, "uv", None)
     if uv is not None:
-        image = mesh.visual.material.image
-        if image is None and texture_path is not None:
+        # OBJ loaders may invent a placeholder; explicit source metadata takes precedence.
+        if texture_path is not None:
             from PIL import Image
 
             image = Image.open(texture_path)
+        else:
+            image = mesh.visual.material.image
         if image is None:
             raise ValueError(f"Textured scan has no readable texture: {mesh_path}")
         image.save(directory / "albedo.png")

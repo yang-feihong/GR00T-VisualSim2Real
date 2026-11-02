@@ -1,5 +1,6 @@
 """Stable-face screening is a generic offline asset audit, not a seed-specific grasp."""
 
+import inspect
 import math
 
 import numpy as np
@@ -8,15 +9,83 @@ import torch
 
 from gr00t.rl.auto_open.motion_math import _euler_xyz_quat, _quat_multiply
 from gr00t.rl.auto_open.planning_geometry import _quat_rotate
+from gr00t.rl.pick.grasp_clearance import GRASP_CLEARANCE_M
 from gr00t.rl.pick.grasp_quality import convex_grasp_quality
 from gr00t.rl.pick.planning import object_frame_grasp_bank
 from gr00t.rl.pick.pocket import BASKET_MINIMUM_CENTER_DEPTH_M
 from gr00t.rl.pick.supported_asset_audit import (
+    audit_asset,
     basket_supported_shapes,
     gripper_collision_clouds,
     stable_pose_bank,
+    static_resting_pose_bank,
     support_plane_clearance,
 )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU resting-face proposals")
+def test_gpu_static_faces_support_scaled_box_and_are_right_handed():
+    import trimesh
+
+    mesh = trimesh.creation.box(extents=[0.04, 0.06, 0.08])
+    scale = np.array([0.91, 1.05, 1.08])
+    points = mesh.vertices * scale
+    bank = static_resting_pose_bank(points, mesh.faces)
+    assert len(bank) == 6
+    for pose in bank:
+        rotation = np.asarray(pose["rotation"])
+        np.testing.assert_allclose(rotation @ rotation.T, np.eye(3), atol=1e-10)
+        assert np.linalg.det(rotation) == pytest.approx(1)
+        assert pose["resting_basin_probability"] is None
+        baked = points @ rotation.T
+        assert (np.isclose(baked[:, 2], baked[:, 2].min())).sum() == 4
+    with pytest.raises(ValueError, match="At least one"):
+        static_resting_pose_bank(points, mesh.faces, max_poses=0)
+
+
+def test_external_and_basket_share_the_same_clearance_defaults():
+    from gr00t.rl.pick import planning
+    from gr00t.rl.pick.basket import BASKET_GRASP_CLEARANCE_M
+    from gr00t.rl.pick.grasp_inverse import solve_default_grasp_inverse
+    from gr00t.rl.pick.grasp_paths import score_default_grasp_paths
+
+    assert GRASP_CLEARANCE_M == BASKET_GRASP_CLEARANCE_M == 0.006
+    for function, parameter in (
+        (convex_grasp_quality, "minimum_environment_clearance_m"),
+        (audit_asset, "minimum_clearance_m"),
+        (planning.pocket_pose_targets, "minimum_environment_clearance_m"),
+        (planning.grasp_environment_clearance, "minimum_clearance_m"),
+        (planning.grasp_candidate_bank, "collider_clearance_m"),
+        (planning.plan_grasp, "collider_clearance_m"),
+        (score_default_grasp_paths, "collider_clearance_m"),
+        (solve_default_grasp_inverse, "collider_clearance_m"),
+    ):
+        assert inspect.signature(function).parameters[parameter].default == GRASP_CLEARANCE_M
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="GPU contact audit")
+def test_cached_resting_poses_preserve_audit_results(tmp_path, monkeypatch):
+    import trimesh
+
+    from gr00t.rl.pick import supported_asset_audit
+
+    mesh = trimesh.creation.box(extents=[0.04, 0.04, 0.06])
+    np.save(tmp_path / "collision_support.npy", mesh.vertices.astype(np.float32))
+    np.save(tmp_path / "collision_faces.npy", mesh.faces.astype(np.int32))
+    asset = {
+        "name": "test",
+        "category": "test",
+        "size_m": [0.04, 0.04, 0.06],
+        "usd_path": str(tmp_path / "object.usda"),
+    }
+    first = audit_asset(asset)
+
+    def no_recompute(*args, **kwargs):
+        raise AssertionError("Resting poses must be reused")
+
+    monkeypatch.setattr(supported_asset_audit, "stable_pose_bank", no_recompute)
+    repeated = audit_asset(asset, pose_bank=first["poses"])
+    assert repeated == first
 
 
 def test_basket_publication_does_not_admit_generic_top_down_only_shapes():

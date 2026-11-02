@@ -7,6 +7,7 @@ import torch
 
 from gr00t.rl.auto_open.planning_geometry import _quat_rotate, _slerp
 from gr00t.rl.auto_open.pose_planning import solve_pose_grid, solve_pose_targets
+from gr00t.rl.pick.grasp_clearance import GRASP_CLEARANCE_M
 from gr00t.rl.pick.planning import (
     GRASP_LIFT_SPEED_M_S,
     GRASP_WITHDRAW_SPEED_M_S,
@@ -98,7 +99,7 @@ def solve_default_grasp_inverse(
     *,
     excluded=None,
     excluded_mask=None,
-    collider_clearance_m=0.002,
+    collider_clearance_m=GRASP_CLEARANCE_M,
     support_normal_world=None,
     minimum_object_height_m=None,
     withdraw_distance_m=None,

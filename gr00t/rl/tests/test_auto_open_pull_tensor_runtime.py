@@ -56,6 +56,8 @@ def test_follow_station_entry_reads_environment_arm_indices(device):
     from gr00t.rl.scripts.doorman_auto_open import Stage
 
     fsm = TensorDoorFSM.__new__(TensorDoorFSM)
+    from gr00t.rl.tests.test_auto_open_doorway_clearance import install_doorway
+    install_doorway(fsm, 2, device)
     fsm.device, fsm.Stage = device, Stage
     fsm.env = SimpleNamespace(arm_joint_ids=torch.arange(6, device=device))
     fsm.front_shoulder_body_indices = torch.tensor([0, 1], device=device)
@@ -128,6 +130,8 @@ def test_follow_reference_gate_is_monotonic_and_uses_only_the_door_angle(device)
     from gr00t.rl.scripts.doorman_auto_open import Stage
 
     fsm = TensorDoorFSM.__new__(TensorDoorFSM)
+    from gr00t.rl.tests.test_auto_open_doorway_clearance import install_doorway
+    install_doorway(fsm, 1, device)
     fsm.device, fsm.Stage = device, Stage
     fsm.hinge_idx = 0
     fsm.pull_panel_config = PullPanelConfig()
@@ -165,9 +169,11 @@ def test_follow_reference_gate_is_monotonic_and_uses_only_the_door_angle(device)
 
 def test_push_retract_preserves_push_station_controller(device):
     from gr00t.rl.scripts.doorman_auto_open import Stage
+    from gr00t.rl.auto_open.base_trajectory import BasePoseTrajectory
 
     fsm = TensorDoorFSM.__new__(TensorDoorFSM)
     fsm.device, fsm.Stage, fsm.pull_door = device, Stage, False
+    fsm.panel_station_trajectory = BasePoseTrajectory(2, device)
     rows = torch.tensor([0, 1], device=device)
     quat = torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=device).repeat(2, 1)
     zero = torch.zeros(2, 3, device=device)
@@ -184,6 +190,8 @@ def test_push_retract_preserves_push_station_controller(device):
     fsm.base_advance_arm_joint_target = torch.zeros(2, 6, device=device)
     fsm.push_reengage_reachable = torch.ones(2, dtype=torch.bool, device=device)
     fsm.base_advance_target_longitudinal = torch.zeros(2, device=device)
+    fsm.base_advance_closest_fallback = torch.ones(2, dtype=torch.bool, device=device)
+    fsm.reset_base_arrival = lambda rows, profile: None
     fsm._world_orientation_from_local_rpy = lambda rows, rpy: quat[rows]
     fsm.record_acceptance = lambda *args, **kwargs: None
     fsm.transition = lambda rows, stage: fsm.stage.index_fill_(0, rows, int(stage))
@@ -236,6 +244,8 @@ def test_push_angle_guard_remains_active(device):
     from gr00t.rl.scripts.doorman_auto_open import Stage
 
     fsm = TensorDoorFSM.__new__(TensorDoorFSM)
+    from gr00t.rl.tests.test_auto_open_doorway_clearance import install_doorway
+    install_doorway(fsm, 2, device)
     fsm.device, fsm.Stage, fsm.pull_door = device, Stage, False
     fsm.stage = torch.full((2,), int(Stage.STOW_ARM_AFTER_PUSH), device=device)
     fsm.hinge_idx = 0
@@ -252,13 +262,13 @@ def test_push_angle_guard_remains_active(device):
     fsm.fail = fail
     state = dict(
         door_joint_position=torch.tensor(
-            [[math.radians(95.0)], [math.radians(80.0)]], device=device
+            [[math.radians(95.0)], [math.radians(82.0)]], device=device
         ),
         door_joint_velocity=torch.zeros(2, 1, device=device),
     )
     opened = fsm.advance_push_panel_open(state)
     assert failures == [(0, 22)]
-    assert opened.tolist() == []
+    assert opened.tolist() == [1]
 
 
 def test_insert_retains_desired_endpoint_not_inverse_command(device):

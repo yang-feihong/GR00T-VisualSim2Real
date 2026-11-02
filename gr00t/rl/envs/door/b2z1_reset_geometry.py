@@ -341,13 +341,13 @@ def closed_door_obstacle_obbs(
 
     latch_center_local = torch.stack(
         (
-            torch.full_like(zero, 0.043),
-            (half_width - 0.0028) * door_open_lr,
+            zero,
+            (half_width - 0.005) * door_open_lr,
             door_handle_height,
         ),
         dim=-1,
     )
-    latch_half = torch.full_like(latch_center_local, 0.026)
+    latch_half = latch_center_local.new_tensor([0.008, 0.025, 0.008]).expand_as(latch_center_local)
 
     total_half_width = torch.full_like(half_width, 10.0)
     side_half_width = 0.5 * (total_half_width - half_width)

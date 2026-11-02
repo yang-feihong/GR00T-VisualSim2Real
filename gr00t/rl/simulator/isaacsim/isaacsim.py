@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from pxr import Sdf, UsdGeom
+from gr00t.rl.utils.z1_gains import Z1_DAMPING, Z1_STIFFNESS
 
 try:
     with open("./rl/simulator/isaacsim/.isaacsim_version", "r", encoding="utf-8") as f:
@@ -1023,24 +1024,8 @@ class IsaacSim(BaseSimulator):
                     joint_names_expr=arm_gripper_names,
                     effort_limit_sim=80.0,
                     velocity_limit_sim=20.0,
-                    stiffness={
-                        "joint1": 400.0,
-                        "joint2": 400.0,
-                        "joint3": 400.0,
-                        "joint4": 400.0,
-                        "joint5": 400.0,
-                        "joint6": 400.0,
-                        "jointGripper": 400.0,
-                    },
-                    damping={
-                        "joint1": 40.0,
-                        "joint2": 40.0,
-                        "joint3": 40.0,
-                        "joint4": 40.0,
-                        "joint5": 40.0,
-                        "joint6": 40.0,
-                        "jointGripper": 40.0,
-                    },
+                    stiffness=dict(Z1_STIFFNESS),
+                    damping=dict(Z1_DAMPING),
                     armature=0.0,
                     friction=0.0,
                 ),

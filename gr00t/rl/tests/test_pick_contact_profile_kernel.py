@@ -8,6 +8,37 @@ from gr00t.rl.pick.contact_profile_kernel import first_profile_contact, moving_p
 from gr00t.rl.pick.grasp_quality import first_closing_contact
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA bounded contact geometry")
+@pytest.mark.parametrize("masked", [False, True])
+def test_chunked_contact_preserves_global_extrema_and_patch_statistics(monkeypatch, masked):
+    from gr00t.rl.pick import contact_profile_kernel as kernel
+    from gr00t.rl.pick.pocket import gripper_contact_profiles
+
+    g = torch.Generator(device="cuda").manual_seed(731)
+    local = torch.rand(2, 3, 257, 3, device="cuda", generator=g) * 0.08 - 0.04
+    centers = torch.rand(2, 3, 4, 3, device="cuda", generator=g) * 0.02
+    angles = torch.full(centers.shape[:-1], torch.pi / 3, device="cuda")
+    profiles = gripper_contact_profiles("cuda")
+    fixed, moving = profiles.maps["fixed"], profiles.maps["moving"]
+    mask = None
+    if masked:
+        mask = torch.arange(257, device="cuda")[None].expand(2, -1) % 3 != 0
+
+    def evaluate():
+        placed, valid = kernel.fixed_profile_centers(local, centers, fixed)
+        closed = kernel.first_profile_contact(local, placed, angles, moving)
+        gap = kernel.moving_profile_minimum(local, placed, closed, moving)
+        contacts, normals, minima = kernel.profile_contact_statistics(
+            local, placed, closed, fixed, moving, mask
+        )
+        return placed, valid, closed, gap, contacts, normals, minima
+
+    expected = evaluate()
+    monkeypatch.setattr(kernel, "MAX_CONTACT_POINTS", 97)
+    for actual, reference in zip(evaluate(), expected):
+        torch.testing.assert_close(actual, reference, rtol=1e-5, atol=2e-6)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA fused geometry")
 @pytest.mark.parametrize("sweep", [False, True])
 @pytest.mark.parametrize("point_count", [97, 257])

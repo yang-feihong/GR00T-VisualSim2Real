@@ -10,6 +10,10 @@ import numpy as np
 import torch
 
 from gr00t.rl.auto_open.control import _through_tail_clearance
+from gr00t.rl.auto_open.acceptance import (
+    MIDDLE_PRESET_POSITION_TOLERANCE_RAD,
+    MIDDLE_PRESET_STABLE_FRAMES,
+)
 from gr00t.rl.envs.door.b2z1_reset_geometry import (
     b2z1_gripper_pose_and_jacobian,
 )
@@ -31,10 +35,6 @@ from .auto_open_standard import (
 from .auto_open_writer import AutoOpenEpisodeData, StreamingVideoEncoder
 from .contact_audit import SubstepContactAudit
 from .fisheye_border import FisheyeBorderAugmenter
-
-
-MIDDLE_PRESET_POSITION_TOLERANCE_RAD = 0.05
-MIDDLE_PRESET_STABLE_FRAMES = 10
 
 
 def _numpy(value):
@@ -355,6 +355,12 @@ class AutoOpenStandardEpisodeCollector:
         self.audit["arm_teleop_inactive_dispatched"].append(inactive)
         self.audit["arm_reset_pre"].append(reset)
         self.audit["arm_reset_dispatched"].append(reset)
+        self.audit["release_separating_handle_contacts"].append(
+            _numpy(post_state.get("release_separating_handle_contacts", np.zeros((1, 2), dtype=bool)))[0]
+        )
+        self.audit["doorway_projection_gap_m"].append(
+            float(_numpy(post_state.get("doorway_projection_gap_m", np.full(1, np.nan)))[0])
+        )
         if self.debug_diagnostics:
             self._append_debug_post_state_audit(post_state, pending["frame_index"] + 1)
         for row in contacts:

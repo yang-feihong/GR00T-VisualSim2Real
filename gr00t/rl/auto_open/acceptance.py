@@ -13,6 +13,9 @@ from gr00t.rl.third_party.visual_wholebody_lowlevel.legged_gym.utils.batch_invar
     fixed_normalize,
 )
 
+MIDDLE_PRESET_POSITION_TOLERANCE_RAD = 0.05
+MIDDLE_PRESET_STABLE_FRAMES = 10
+
 
 @dataclass(frozen=True)
 class RobotStabilityProfile:

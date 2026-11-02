@@ -456,6 +456,93 @@ def test_pull_panel_contact_uses_existing_panel_penetration_limit(stage, penetra
     assert bool(summary["penetration_violations"]) == (penetration > 0.003)
 
 
+def test_push_to_through_inherits_only_the_contact_until_first_separation():
+    from types import SimpleNamespace
+
+    def contact(frame, body="gripperMover", penetration=0.001):
+        return {"frame_index": frame, "body_a_path": f"/World/Robot/{body}",
+                "body_b_path": "/World/door/door_panel", "max_contact_force": 30.,
+                "max_normal_impulse": 0.15, "max_penetration_depth": penetration}
+
+    episode = SimpleNamespace(
+        raw_audit={"arm_reset_dispatched": [False, True, True, True, True]},
+        raw_contacts=[contact(0), contact(1), contact(2, "link06", 0.004), contact(4)],
+    )
+    stages = np.array(["PUSH_PANEL_OPEN"] + ["PASS_THROUGH_DOORWAY"] * 4)
+    summary = _contact_acceptance_summary(episode, stages)
+    assert [r["frame"] for r in summary["push_to_through_release_contacts"]] == [1, 2]
+    assert [r["frame"] for r in summary["abnormal"]] == [4]
+    assert [r["frame"] for r in summary["penetration_violations"]] == [2]
+
+
+@pytest.mark.parametrize("prior_contact,prior_stage,reset", [
+    (False, "PUSH_PANEL_OPEN", True),
+    (True, "STOW_ARM_AFTER_PUSH", True),
+    (True, "PUSH_PANEL_OPEN", False),
+])
+def test_through_contact_is_not_exempt_without_push_continuity_and_stowing(prior_contact, prior_stage, reset):
+    from types import SimpleNamespace
+
+    def contact(frame):
+        return {"frame_index": frame, "body_a_path": "/World/Robot/link06",
+                "body_b_path": "/World/door/door_panel", "max_contact_force": 30.,
+                "max_normal_impulse": .15, "max_penetration_depth": .001}
+
+    episode = SimpleNamespace(raw_audit={"arm_reset_dispatched": [False, reset]},
+                              raw_contacts=([contact(0)] if prior_contact else []) + [contact(1)])
+    summary = _contact_acceptance_summary(episode, np.array([prior_stage, "PASS_THROUGH_DOORWAY"]))
+    assert not summary["push_to_through_release_contacts"]
+    assert any(row["frame"] == 1 for row in summary["abnormal"])
+
+
+@pytest.mark.parametrize("body,finger", [("link06", 0), ("gripperMover", 1)])
+def test_handle_retreat_only_inherits_separating_rear_contact(body, finger):
+    from types import SimpleNamespace
+
+    def contact(frame, penetration=.001):
+        return {"frame_index": frame, "body_a_path": f"/World/Robot/{body}",
+                "body_b_path": "/World/door/door_handle", "max_contact_force": 4.,
+                "max_normal_impulse": .02, "max_penetration_depth": penetration}
+
+    flags = np.zeros((5, 2), dtype=bool)
+    flags[:, finger] = True
+    episode = SimpleNamespace(
+        raw_audit={"release_separating_handle_contacts": flags},
+        raw_contacts=[contact(0), contact(1), contact(2, .004), contact(4)],
+    )
+    stages = np.array(["RELEASE_HANDLE"] + ["WITHDRAW_FROM_HANDLE"] * 4)
+    summary = _contact_acceptance_summary(episode, stages)
+    assert [r["frame"] for r in summary["handle_release_separating_contacts"]] == [1, 2]
+    assert [r["frame"] for r in summary["abnormal"]] == [4]
+    assert [r["frame"] for r in summary["penetration_violations"]] == [2]
+    flags[1, finger] = False
+    summary = _contact_acceptance_summary(episode, stages)
+    assert not summary["handle_release_separating_contacts"]
+    assert [r["frame"] for r in summary["abnormal"]] == [1, 2, 4]
+
+
+@pytest.mark.parametrize("flags,previous_stage,previous_contact", [
+    (None, "RELEASE_HANDLE", True),
+    ([[False, False], [True, False]], "RELEASE_HANDLE", True),
+    ([[True, False], [True, False]], "RELEASE_HANDLE", False),
+    ([[True, False], [True, False]], "STOW_ARM_AFTER_PULL", True),
+])
+def test_handle_retreat_requires_prior_rear_classification_and_contact(flags, previous_stage, previous_contact):
+    from types import SimpleNamespace
+
+    def contact(frame):
+        return {"frame_index": frame, "body_a_path": "/World/Robot/link06",
+                "body_b_path": "/World/door/door_handle", "max_contact_force": 4.}
+
+    episode = SimpleNamespace(
+        raw_audit={} if flags is None else {"release_separating_handle_contacts": flags},
+        raw_contacts=([contact(0)] if previous_contact else []) + [contact(1)],
+    )
+    summary = _contact_acceptance_summary(episode, np.array([previous_stage, "WITHDRAW_FROM_HANDLE"]))
+    assert not summary["handle_release_separating_contacts"]
+    assert any(r["frame"] == 1 for r in summary["abnormal"])
+
+
 def test_contact_aggregation_drops_zero_rows_and_merges_mirrors():
     rows = (
         ContactPairMaximum("/A", "/B", 0.2, 4.0, 0.001, (1, 2, 3), (1, 0, 0)),
@@ -500,6 +587,7 @@ def test_physical_validator_requires_standard_full_open_target():
     action[:, 3] = inactive
     action[:, 14] = gripper
     audit = {
+        "doorway_projection_gap_m": np.full(frames, 0.10),
         "sim_time_ns": np.arange(frames, dtype=np.int64) * 20_000_000,
         "base_image_capture_time_ns": np.arange(frames, dtype=np.int64) * 20_000_000,
         "wrist_image_capture_time_ns": np.arange(frames, dtype=np.int64) * 20_000_000,
@@ -550,6 +638,12 @@ def test_physical_validator_requires_standard_full_open_target():
         raw_contacts=raw_contacts,
         event_frames={"handle_unlocked": 70, "door_gap_20mm": 77, "robot_clear": 90},
     )
+    assert _physical_acceptance_reasons(episode, boundary) == []
+    for invalid_gap in (0.099, float("nan")):
+        audit["doorway_projection_gap_m"][89] = invalid_gap
+        assert any("through_projection_clearance" in reason
+                   for reason in _physical_acceptance_reasons(episode, boundary))
+    audit["doorway_projection_gap_m"][89] = 0.10
     assert _physical_acceptance_reasons(episode, boundary) == []
     metrics = _episode_acceptance_metrics(episode, boundary, [])
     assert metrics["physical_result"]["max_door_gap_before_release_m"] == pytest.approx(0.03)

@@ -220,6 +220,10 @@ DINOv3_models/*
 data/door_assets/*
 
 /artifacts
+# Generated catalog exports; keep binary deliverables outside versioned docs.
+/docs/assets/pick_object_catalog/
+/docs/pick_object_catalog*.pdf
+/docs/pick_object_catalog*.html
 /materials
 /models/b2z1_lowlevel
 **/.asset_hash

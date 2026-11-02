@@ -151,7 +151,7 @@ def test_future_joint_limit_rejects_point_only_candidate():
     )
     assert selected.item() == 1
     assert accepted.item() and complete.item()
-    assert math.isclose(stop.item(), math.radians(89.0), abs_tol=1.0e-6)
+    assert math.isclose(stop.item(), angles[0, 1, -1].item(), abs_tol=1.0e-6)
 
 
 def test_joint_safe_prefix_retains_lead_margin_and_requires_progress():
@@ -231,6 +231,8 @@ def test_forecast_batches_candidates_and_keeps_original_when_full_arc_is_safe(ra
         env=SimpleNamespace(get_goal_center_offset_local=lambda: torch.zeros(1, 3)),
         fail=lambda rows, code: failed.extend(rows.tolist()),
     )
+    from gr00t.rl.tests.test_auto_open_doorway_clearance import install_doorway
+    install_doorway(fsm, 1)
     theta = math.radians(40.0)
     normal = torch.tensor([[math.cos(theta), math.sin(theta), 0.0]])
     tangent = torch.tensor([[-math.sin(theta), math.cos(theta), 0.0]])
@@ -254,5 +256,5 @@ def test_forecast_batches_candidates_and_keeps_original_when_full_arc_is_safe(ra
     assert rows.tolist() == [0]
     assert not failed
     assert torch.allclose(actual, desired, atol=1.0e-6)
-    assert math.isclose(fsm.push_planned_stop_hinge.item(), math.radians(89.0), abs_tol=1.0e-6)
+    assert torch.allclose(fsm.push_planned_stop_hinge, fsm.through_goal_hinge, atol=1.0e-6)
     assert coordinator.path_diagnostics[-1][2]["candidate_geometry_valid"].any()

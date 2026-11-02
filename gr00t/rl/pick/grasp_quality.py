@@ -7,6 +7,7 @@ from pathlib import Path
 import torch
 
 from gr00t.rl.auto_open.planning_geometry import _quat_rotate
+from gr00t.rl.pick.grasp_clearance import GRASP_CLEARANCE_M
 from gr00t.rl.pick.pocket import (
     GRASP_FRICTION,
     gripper_contact_profiles,
@@ -101,7 +102,7 @@ def convex_grasp_quality(
     *,
     depth_clearance=None,
     depth_preference=0.0,
-    minimum_environment_clearance_m=0.002,
+    minimum_environment_clearance_m=GRASP_CLEARANCE_M,
     minimum_center_depth_m=0.0015,
     masked_depth_clearance=False,
     support_normal_world=None,

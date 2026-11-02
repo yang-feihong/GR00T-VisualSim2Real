@@ -11,6 +11,8 @@ from pathlib import Path
 
 import torch
 
+from gr00t.rl.pick.grasp_clearance import GRASP_CLEARANCE_M
+
 
 def command_bank(trace, path, stations, frames):
     """Cross every station with recorded reference goals and a proposed goal."""
@@ -268,7 +270,7 @@ def main():
                     for index, fit in enumerate(quality["pocket_fit"][0])
                     if fit
                     and quality["antipodal_margin"][0][index] >= 0
-                    and quality["environment_clearance_m"][0][index] >= 0.002
+                    and quality["environment_clearance_m"][0][index] >= GRASP_CLEARANCE_M
                 ]
                 if not args.candidate_indices:
                     parser.error("Recorded grasp has no geometrically admitted candidate")
@@ -497,7 +499,7 @@ def main():
             physical = (
                 quality["pocket_fit"]
                 & (quality["antipodal_margin"] >= 0)
-                & (quality["environment_clearance_m"] >= 0.002)
+                & (quality["environment_clearance_m"] >= GRASP_CLEARANCE_M)
             )[0, inverse_quats]
             pocket_diagnostics = {
                 key: quality[key][0, inverse_quats].cpu().tolist()

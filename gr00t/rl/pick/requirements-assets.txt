@@ -1,0 +1,3 @@
+# Optional offline asset conversion only; not needed to collect installed assets.
+pymeshlab==2023.12.post3
+mapbox-earcut==1.0.3

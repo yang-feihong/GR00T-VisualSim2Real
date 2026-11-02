@@ -17,6 +17,12 @@ from isaaclab.sim.utils import bind_visual_material, clone
 from isaaclab.utils import configclass
 from pxr import Gf, PhysxSchema, Sdf, Usd, UsdGeom, UsdPhysics, Vt
 
+from gr00t.rl.isaac_utils.playground.env_rand.latch_geometry import (
+    LATCH_MODEL,
+    build_latch_bolt,
+    build_strike_pocket,
+)
+
 def _get_material_randomization():
     """Lazy import to avoid loading omni.kit.scripting before SimulationApp is ready."""
     from gr00t.rl.isaac_utils.playground.scripts.material_randomization import (
@@ -78,6 +84,9 @@ def _source_usd_attribute_value(attribute, value):
             return Gf.Quatf(float(value["real"]), Gf.Vec3f(*imaginary))
         return Gf.Quatd(float(value["real"]), Gf.Vec3d(*imaginary))
     if isinstance(value, list):
+        if type_name in {"matrix4d", "matrix4f"}:
+            matrix = Gf.Matrix4d if type_name == "matrix4d" else Gf.Matrix4f
+            return matrix(*[float(item) for row in value for item in row])
         if type_name in {"float2", "texCoord2f"}:
             return Gf.Vec2f(*value)
         if type_name == "double2":
@@ -112,6 +121,10 @@ def _source_usd_type(value):
         return Sdf.ValueTypeNames.Token
     if isinstance(value, dict):
         return Sdf.ValueTypeNames.Quatd
+    if isinstance(value, list) and len(value) == 4 and all(
+        isinstance(row, list) and len(row) == 4 for row in value
+    ):
+        return Sdf.ValueTypeNames.Matrix4d
     if isinstance(value, list) and value and isinstance(value[0], list):
         return Sdf.ValueTypeNames.Float3Array
     if isinstance(value, list) and len(value) == 3:
@@ -162,7 +175,7 @@ def _restore_source_asset_snapshot(stage, prim_path, snapshot, inherited_snapsho
 
     for path, expected in expected_by_path.items():
         prim = stage.GetPrimAtPath(path)
-        if not prim.IsValid() or not prim.IsActive():
+        if not prim.IsValid() or not prim.IsActive() or prim.GetTypeName() != expected["type"]:
             prim = stage.DefinePrim(path, expected["type"])
             prim.SetActive(True)
         for name, value in expected["attributes"].items():
@@ -732,13 +745,8 @@ def spawn_door(
 
     # build latch
     if cfg.build_latch:
-        # The latch must sit on the side of the jamb opposite the commanded
-        # opening motion.  The old fixed -X placement only worked for pull
-        # doors; after switching to push doors it moved away from the jamb.
-        latch_x = -0.02 + 0.063 * door_open_io
-        # This inset gives the latch about 19.5 mm of engagement in the jamb:
-        # 19 mm remains locked, while the intended 20 mm travel clears it.
-        latch_edge_inset = 0.0028
+        latch_x = 0.0
+        latch_edge_inset = 0.0
         latch_z = door_handle_height
         latch_link_prim_path = os.path.join(prim_path, "latch_link")
         create_prim(latch_link_prim_path, "Xform")
@@ -752,20 +760,16 @@ def spawn_door(
         add_rigid_body(stage, latch_link_prim_path)
 
         latch_geom_prim_path = os.path.join(latch_link_prim_path, "latch_geom")
-        create_prim(latch_geom_prim_path, "Cone")
-        set_prim_transform(
+        build_latch_bolt(stage, latch_geom_prim_path, door_open_lr, door_open_io)
+        build_strike_pocket(
             stage,
-            latch_geom_prim_path,
-            (0, 0, 0),
-            (-90 * door_open_lr, 0, 26.56 * door_open_lr * door_open_io),
-            (1.0, 1.0, 1.0),
+            left_frame_prim_path if door_open_lr == 1 else right_frame_prim_path,
+            half_door_width,
+            half_wall_length,
+            half_wall_height,
+            door_open_lr,
+            door_handle_height,
         )
-        cone_geom: UsdGeom.Cone = UsdGeom.Cone.Define(stage, latch_geom_prim_path)
-        cone_geom.GetRadiusAttr().Set(0.025)
-        cone_geom.GetHeightAttr().Set(0.05)
-        cone_geom.GetPurposeAttr().Set("guide")
-        add_mass(stage, latch_geom_prim_path, mass=0.1)
-        add_collider(stage, latch_geom_prim_path)
 
         latch_joint_prim_path = os.path.join(panel_prim_path, "latch_joint")
         latch_joint = UsdPhysics.PrismaticJoint.Define(stage, latch_joint_prim_path)
@@ -1247,6 +1251,7 @@ def spawn_door(
         "hingeDriveDamping": hinge_drive.GetDampingAttr().Get(),
         "hingeDriveStiffness": hinge_drive.GetStiffnessAttr().Get(),
         "handleDriveMaxForce": handle_drive.GetMaxForceAttr().Get(),
+        "latchModel": LATCH_MODEL if cfg.build_latch else "none",
         "visual": visual_metadata,
     }
     if cfg.add_walls:

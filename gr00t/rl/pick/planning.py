@@ -9,6 +9,7 @@ from gr00t.rl.auto_open.motion_math import _euler_xyz_quat, _quat_multiply
 from gr00t.rl.auto_open.planning_geometry import _quat_rotate, _slerp, align_vectors
 from gr00t.rl.auto_open.pose_planning import best_feasible, solve_pose_targets
 from gr00t.rl.envs.door.b2z1_reset_geometry import b2z1_gripper_pose_and_jacobian
+from gr00t.rl.pick.grasp_clearance import GRASP_CLEARANCE_M
 from gr00t.rl.pick.grasp_quality import convex_grasp_quality
 from gr00t.rl.pick.pocket import GRASP_FRICTION, gripper_pocket_geometry
 from gr00t.rl.utils.b2z1_asset import read_arm_mount
@@ -564,7 +565,7 @@ def grasp_environment_clearance(
     aperture,
     *,
     query_mask=None,
-    minimum_clearance_m=0.002,
+    minimum_clearance_m=GRASP_CLEARANCE_M,
 ):
     """Query only packed active poses, preserving each pose's scene owner."""
     cap = minimum_clearance_m + 0.0001
@@ -607,7 +608,7 @@ def pocket_pose_targets(
     geometry,
     *,
     depth_preference=0.0,
-    minimum_environment_clearance_m=0.002,
+    minimum_environment_clearance_m=GRASP_CLEARANCE_M,
     minimum_center_depth_m=0.0015,
     compact_environment_queries=True,
     support_normal_world=None,
@@ -801,7 +802,7 @@ def refine_grasp_candidates(
     if orientations.shape[1] < 2:
         return orientations, goals, quality
     feasible = quality["pocket_fit"] & (quality["antipodal_margin"] >= 0)
-    feasible &= quality["environment_clearance_m"] >= 0.002
+    feasible &= quality["environment_clearance_m"] >= GRASP_CLEARANCE_M
     similarity = (orientations * reference[:, None]).sum(-1).abs()
     index = similarity.masked_fill(~feasible, -torch.inf).argmax(-1)
     rows = torch.arange(len(orientations), device=orientations.device)
@@ -901,7 +902,7 @@ def grasp_candidate_bank(
     object_frame_fallback=None,
     fallback_tool_tilt_deg=None,
     refine_orientations=False,
-    collider_clearance_m=0.002,
+    collider_clearance_m=GRASP_CLEARANCE_M,
     support_normal_world=None,
     minimum_center_depth_m=0.0015,
     pocket_depth_preference=0.0,
@@ -1039,7 +1040,7 @@ def plan_grasp(
     withdraw_distance_m=None,
     require_precise_carry=False,
     require_safe_arm_path=False,
-    collider_clearance_m=0.002,
+    collider_clearance_m=GRASP_CLEARANCE_M,
     support_normal_world=None,
     wrist_motion_weight=0.02,
     validate_carry_preview=True,

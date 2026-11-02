@@ -9,6 +9,11 @@ from typing import Tuple
 from legged_gym.utils.math import orientation_error
 from legged_gym.utils.constrained_ik import batched_constrained_dls_delta
 from legged_gym.utils.trunk_control_filter import TrunkControlFilter
+from legged_gym.utils.arm_gravity import ArmGravityCompensation
+from legged_gym.utils.joint_friction import (
+    ARM_GRIPPER_COULOMB_FRICTION_SCALE,
+    restore_urdf_friction_efforts,
+)
 from legged_gym.utils.batch_invariant_math import (
     fixed_mean,
     fixed_norm,
@@ -141,6 +146,18 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        restore_urdf_friction_efforts(self.robot, torch.cat((self.arm_joint_ids, self.gripper_joint_ids)))
+        self._arm_gravity = ArmGravityCompensation(self.robot, self.arm_joint_ids, self.torque_limits)
+        self.arm_dynamics = {
+            "reference_commit": "visual_wholebody_lab30:c32e252",
+            "gravity_compensation": bool(self.cfg.arm_gravity_compensation),
+            "arm_joint_names": [self.robot.joint_names[index] for index in self.arm_joint_ids.cpu().tolist()],
+            "stiffness": self.robot.data.joint_stiffness[0, self.arm_joint_ids].cpu().tolist(),
+            "damping": self.robot.data.joint_damping[0, self.arm_joint_ids].cpu().tolist(),
+            "friction_units": "Nm, imported URDF legacy load-scaled friction converted at initialization",
+            "arm_gripper_coulomb_friction_scale": ARM_GRIPPER_COULOMB_FRICTION_SCALE,
+        }
+        print(f"[arm_dynamics] {self.arm_dynamics}")
         self._rgb_camera_debug_draw_enabled = False
         self._init_task_state()
         self._arm_pos_targets_for_step = None
@@ -1655,6 +1672,7 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         profile_start = time.perf_counter()
         section_start = time.perf_counter()
         self.torques = self._compute_torques(self.actions)
+        self._arm_gravity.apply(self.torques, self.cfg.arm_gravity_compensation)
         self._profile_record("torques", time.perf_counter() - section_start)
 
         section_start = time.perf_counter()

@@ -60,7 +60,8 @@ def test_tip_surface_reference_removes_standoff_without_hidden_preload():
 
 
 @pytest.mark.parametrize("sign", [-1.0, 1.0])
-def test_command_push_uses_four_degree_tip_limit_and_fixed_attitude(sign):
+@pytest.mark.parametrize("hinge_angle", [0.25, math.radians(88.7794), math.radians(90.0)])
+def test_command_push_uses_four_degree_tip_limit_and_fixed_attitude(sign, hinge_angle):
     fsm = TensorDoorFSM.__new__(TensorDoorFSM)
     fsm.Stage = Stage
     fsm.stage = torch.tensor([int(Stage.PUSH_PANEL_OPEN)])
@@ -87,7 +88,7 @@ def test_command_push_uses_four_degree_tip_limit_and_fixed_attitude(sign):
         surface,
         fsm.push_tip_offset_world,
         fsm.hinge_world,
-        torch.tensor([sign * (0.25 + PUSH_TIP_MAX_ANGULAR_LEAD_RAD)]),
+        torch.tensor([sign * (hinge_angle + PUSH_TIP_MAX_ANGULAR_LEAD_RAD)]),
     )
     fsm.q_closed = torch.zeros(1)
     fsm.push_previous_finger_clearance = torch.zeros(1)
@@ -95,14 +96,31 @@ def test_command_push_uses_four_degree_tip_limit_and_fixed_attitude(sign):
     fsm.arm_pose_target = lambda *args: None
     buffers = SimpleNamespace(base=torch.zeros(1, 3), gripper=torch.zeros(1, 1))
     state = {
-        "door_joint_position": torch.tensor([[0.25]]),
+        "door_joint_position": torch.tensor([[hinge_angle]]),
         "door_joint_velocity": torch.zeros(1, 1),
     }
     fsm.command_push_panel_open(state, torch.tensor([0.03]), buffers)
     tip = fsm.ee_command_world + fsm.push_tip_offset_world
-    lead = torch.atan2(tip[:, 1], tip[:, 0]) / sign - 0.25
+    lead = torch.atan2(tip[:, 1], tip[:, 0]) / sign - hinge_angle
     torch.testing.assert_close(lead, torch.full_like(lead, PUSH_TIP_MAX_ANGULAR_LEAD_RAD))
     torch.testing.assert_close(fsm.ee_orientation_command, fsm.push_orientation)
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_push_pi_keeps_bounded_lead_beyond_acceptance_angle(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA unavailable")
+    hinge = torch.deg2rad(torch.tensor([88.7794, 89.0, 90.0], device=device))
+    target, _ = hinge_speed_target(
+        hinge, torch.zeros_like(hinge), torch.zeros_like(hinge),
+        dt=0.02, target_speed=math.radians(20.0), kp=0.45, ki=0.5,
+        integral_limit=math.radians(8.0), max_lead=PUSH_TIP_MAX_ANGULAR_LEAD_RAD,
+        start=torch.zeros_like(hinge),
+    )
+    torch.testing.assert_close(
+        target - hinge, torch.full_like(hinge, PUSH_TIP_MAX_ANGULAR_LEAD_RAD)
+    )
+    assert torch.all(target > math.radians(89.0))
 
 
 def test_shared_pi_is_bitwise_equal_to_push_baseline():
@@ -258,6 +276,8 @@ def test_complete_pose_sequences_use_one_inverse_batch_and_report_bad_env(monkey
 
 def test_workspace_boundary_requires_thirty_degree_opening_before_retraction():
     fsm = TensorDoorFSM.__new__(TensorDoorFSM)
+    from gr00t.rl.tests.test_auto_open_doorway_clearance import install_doorway
+    install_doorway(fsm, 2)
     fsm.Stage, fsm.pull_door, fsm.device = Stage, True, "cpu"
     fsm.pull_panel_config = PullPanelConfig()
     fsm.terminal_stage = Stage.PASS_THROUGH_DOORWAY
@@ -470,6 +490,8 @@ def test_door_coasting_open_during_insertion_returns_a_retract_planning_request(
 
 def test_retract_completion_selects_follow_station_or_direct_through():
     fsm = TensorDoorFSM.__new__(TensorDoorFSM)
+    from gr00t.rl.tests.test_auto_open_doorway_clearance import install_doorway
+    install_doorway(fsm, 2)
     from gr00t.rl.auto_open.pull_station import PullStationConfig
 
     fsm.pull_station_config = PullStationConfig()
@@ -534,6 +556,8 @@ def test_retract_completion_selects_follow_station_or_direct_through():
 
 def _station_fsm(stages):
     fsm = TensorDoorFSM.__new__(TensorDoorFSM)
+    from gr00t.rl.tests.test_auto_open_doorway_clearance import install_doorway
+    install_doorway(fsm, len(stages))
     fsm.Stage, fsm.device, fsm.pull_door = Stage, "cpu", True
     fsm.stage = torch.tensor([int(s) for s in stages])
     n = len(stages)
@@ -559,7 +583,7 @@ def test_open_door_during_base_motion_redirects_without_another_pry():
     fsm.begin_pass_through_doorway = lambda rows, *, rolling=False: redirected.append(
         (rows.tolist(), rolling)
     )
-    fsm.advance_follow_wall_to_panel({"door_joint_position": torch.tensor([[math.radians(94.8)]])})
+    fsm.advance_follow_wall_to_panel({"door_joint_position": torch.tensor([[math.radians(82.0)]])})
     assert redirected == [([0], True)]
     assert fsm.stage_steps.tolist() == [1]
 
@@ -639,10 +663,14 @@ def test_through_entry_motion_ready_matches_handoff(rolling):
         "through_best_station_error",
         "through_no_progress_steps",
         "through_settle_steps",
+        "through_middle_ready_steps",
         "through_entry_stable_steps",
     ):
         setattr(fsm, name, torch.zeros(1))
     fsm.through_stop_latched = torch.ones(1, dtype=torch.bool)
+    fsm.through_arm_restore_ready = torch.ones(1, dtype=torch.bool)
+    fsm.through_arm_carry_initialized = torch.ones(1, dtype=torch.bool)
+    fsm.through_arm_carry_ready = torch.ones(1, dtype=torch.bool)
     fsm.through_motion_ready = torch.zeros(1, dtype=torch.bool)
     fsm.begin_pass_through_doorway(torch.tensor([0]), rolling=rolling)
     assert fsm.through_motion_ready.item() == rolling

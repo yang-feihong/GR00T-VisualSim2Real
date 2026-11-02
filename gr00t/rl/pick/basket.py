@@ -10,6 +10,7 @@ from pathlib import Path
 import torch
 
 from gr00t.rl.auto_open.planning_geometry import _quat_rotate
+from gr00t.rl.pick.grasp_clearance import GRASP_CLEARANCE_M
 from gr00t.rl.pick.prepare import NoValidInitialScene, reject_preparation
 from gr00t.rl.pick.scene_geometry import SceneGeometry
 from gr00t.rl.utils.b2z1_asset import ROBOT_USD
@@ -28,7 +29,7 @@ class BasketConfig:
     lift_above_rim_m: float = 0.10
 
 
-BASKET_GRASP_CLEARANCE_M = 0.006
+BASKET_GRASP_CLEARANCE_M = GRASP_CLEARANCE_M
 
 
 class NoValidBasketLayout(NoValidInitialScene):

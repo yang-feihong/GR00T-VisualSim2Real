@@ -191,7 +191,7 @@ def test_approach_large_reversal_crosses_zero_for_one_frame(monkeypatch):
 
 
 def test_point_target_stages_use_the_shared_arrival_interface():
-    for method_name in ("command_approach_handle", "command_move_to_panel_station"):
+    for method_name in ("command_approach_handle",):
         source = inspect.getsource(getattr(TensorDoorFSM, method_name))
         assert "_track_station" in source
     for method_name in ("_track_station", "_base_hold_command"):
@@ -199,6 +199,13 @@ def test_point_target_stages_use_the_shared_arrival_interface():
         assert "self.base_target(" in source
         assert "arrival=True" in source
     assert "_update_base_arrival" in inspect.getsource(TensorDoorFSM.base_target)
+    for method in (TensorDoorFSM.command_move_to_panel_station,
+                   TensorDoorFSM.command_advance_to_next_push_station):
+        assert "self._command_push_station(" in inspect.getsource(method)
+    trajectory_source = inspect.getsource(TensorDoorFSM._command_push_station)
+    assert "self.panel_station_trajectory.sample_forward_target(" in trajectory_source
+    assert "self.base_target(" in trajectory_source
+    assert "task_stop=reachable & prefix_done" in trajectory_source
 
 
 def test_base_target_remains_a_stateless_feedback_controller():
@@ -289,7 +296,7 @@ def test_point_target_profiles_use_benchmarked_thresholds():
 
 
 def test_semantic_target_stages_stop_on_their_physical_condition():
-    base_advance = inspect.getsource(TensorDoorFSM.command_advance_to_next_push_station)
+    base_advance = inspect.getsource(TensorDoorFSM._command_push_station)
     through = inspect.getsource(TensorDoorFSM.command_pass_through_doorway)
     assert "task_stop=reachable" in base_advance
     assert "self.base_target(" in base_advance

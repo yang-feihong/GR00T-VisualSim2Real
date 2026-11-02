@@ -12,13 +12,18 @@ import math
 import torch
 
 from gr00t.rl.auto_open.acceptance import (
+    MIDDLE_PRESET_POSITION_TOLERANCE_RAD,
+    MIDDLE_PRESET_STABLE_FRAMES,
     StageAcceptanceMixin,
     TensorStabilityWindow,
     consecutive_steps,
     update_robot_stability,
 )
-from gr00t.rl.auto_open.base_trajectory import BasePoseTrajectory, frame_traversal_waypoints
+from gr00t.rl.auto_open.base_trajectory import (
+    BasePoseTrajectory, frame_traversal_waypoints, panel_station_waypoints, wrapped_angle,
+)
 from gr00t.rl.auto_open.contact_surface import separating_rear_contact
+from gr00t.rl.auto_open.doorway_clearance import DoorwayProjection, THROUGH_PROJECTION_CLEARANCE_M
 from gr00t.rl.auto_open.control import (
     ALIGN_PANEL_ARRIVAL,
     APPROACH_ARRIVAL,
@@ -28,6 +33,7 @@ from gr00t.rl.auto_open.control import (
 )
 from gr00t.rl.auto_open.execution import StageExecutionMixin, TensorCommandBuffers
 from gr00t.rl.auto_open.geometry import _quat_rotate_points_torch
+from gr00t.rl.auto_open.planning_geometry import align_vectors
 from gr00t.rl.auto_open.motion_math import (
     _axis_angle_quat,
     _euler_xyz_quat,
@@ -47,10 +53,12 @@ from gr00t.rl.auto_open.motion_targets import PaddedPathBank
 from gr00t.rl.auto_open.panel_motion import (
     PullPanelConfig,
     fingertip_arc_position,
+    panel_fingertip_reference,
     hinge_speed_target,
     outside_comfort_workspace,
 )
 from gr00t.rl.auto_open.pregrasp_reachability import PRESS_HANDLE_LATCH_RELEASE_M
+from gr00t.rl.auto_open.panel_push_forecast import PANEL_PUSH_MIN_HINGE_DISTANCE_M
 from gr00t.rl.auto_open.pull_station import (
     PullStationConfig,
     angle_to_wall,
@@ -79,6 +87,7 @@ TERMINAL_ARM_JOINT_SPEED_RAD_S = 0.08
 TERMINAL_GRIPPER_SPEED_RAD_S = 0.05
 TERMINAL_DOOR_SPEED_RAD_S = math.radians(2.0)
 TERMINAL_STABILITY_FRAMES = 50
+HANDLE_RELEASE_HEIGHT_TOLERANCE_M = 0.006
 ROBOT_TRUNK_REAR_X = -0.284
 
 
@@ -272,6 +281,7 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         self.grasp_vertical_balance_started = torch.zeros_like(self.grasp_latched)
         self.grasp_vertical_lift = torch.zeros(self.num_envs, dtype=torch.float32, device=device)
         self.grasp_vertical_lift_target = torch.zeros_like(self.grasp_vertical_lift)
+        self.grasp_preclose_height_world = torch.full_like(self.grasp_vertical_lift, torch.nan)
         self.handle_contact_last_seen = torch.full(
             (self.num_envs, 2), -1000, dtype=torch.int32, device=device
         )
@@ -385,7 +395,7 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         self.release_return_offset_world = torch.zeros(vector_shape, device=device)
         self.release_return_start_quat = torch.zeros(quat_shape, device=device)
         self.release_return_angle = torch.zeros(scalar_shape, device=device)
-        self.release_vertical_delta = torch.zeros(scalar_shape, device=device)
+        self.release_open_target_world = torch.zeros(vector_shape, device=device)
         self.release_stable_steps = torch.zeros_like(self.stage_steps)
         self.release_retreat_target_world = torch.zeros(vector_shape, device=device)
         self.release_endpoint_world = torch.zeros(vector_shape, device=device)
@@ -394,6 +404,26 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         self.panel_align_ee_goal_local = torch.zeros(vector_shape, device=device)
         self.panel_align_ee_orientation_local = torch.zeros(quat_shape, device=device)
         self.panel_station_xy = stack("panel_station_xy")
+        self.panel_station_trajectory = BasePoseTrajectory(self.num_envs, device)
+        self.panel_station_prefix_steps = torch.zeros_like(self.stage_steps)
+        self.panel_station_search_center = stack("panel_push_world")
+        tangent = stack("panel_hinge_to_free_direction")
+        radius = (stack("panel_contact_edge_margin").clamp_min(PANEL_PUSH_MIN_HINGE_DISTANCE_M)
+                  + stack("panel_hinge_to_free_edge") - stack("panel_contact_edge_margin")) * 0.5
+        self.panel_station_search_center += (
+            radius - stack("panel_push_tangent_offset")
+        )[:, None] * tangent
+        self.panel_station_search_center[:, 2] += 0.05  # Center of [-0.20, +0.30] m.
+        self.panel_station_half_thickness = stack("panel_half_thickness")
+        geometry = controllers[0].center_geometry
+        self.panel_station_fixed_points = torch.as_tensor(
+            geometry["fixed_finger"].points_body, device=device, dtype=torch.float32
+        )
+        self.panel_station_moving_points = torch.as_tensor(
+            geometry["moving_finger"].points_body, device=device, dtype=torch.float32
+        )
+        self.panel_station_fixed_body = controllers[0].fixed_finger_body_idx
+        self.panel_station_moving_body = controllers[0].moving_finger_body_idx
         self.door_forward = stack("door_forward")
         align_targets = [
             controller.target_noise.perturb_base(
@@ -409,12 +439,6 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         ]
         self.panel_station_command_xy = torch.as_tensor(
             [target[0] for target in align_targets], dtype=torch.float32, device=device
-        )
-        self.panel_station_command_yaw = torch.as_tensor(
-            [target[1] for target in align_targets], dtype=torch.float32, device=device
-        )
-        self.panel_station_nominal_yaw = torch.atan2(
-            self.door_forward[:, 1], self.door_forward[:, 0]
         )
         points, indices = robot_collider_cache(controllers[0])
         self.base_motion_points = torch.as_tensor(points, device=device)
@@ -505,7 +529,7 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         self.ee_orientation_command = torch.zeros(quat_shape, device=device)
         self.ee_command_valid = torch.zeros_like(self.grasp_latched)
         self.push_start_hinge_angle = torch.zeros(scalar_shape, device=device)
-        self.push_planned_stop_hinge = torch.full(scalar_shape, math.radians(89.0), device=device)
+        self.push_planned_stop_hinge = torch.zeros(scalar_shape, device=device)
         self.push_last_progress_hinge = torch.zeros(scalar_shape, device=device)
         self.push_no_progress_steps = torch.zeros_like(self.stage_steps)
         self.push_contact_world = torch.zeros(vector_shape, device=device)
@@ -523,6 +547,7 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         self.active_arm_retract_pose_local = stack("active_arm_retract_pose_local")
         self.push_recovery_settle_steps = torch.zeros_like(self.stage_steps)
         self.push_reengage_reachable = torch.zeros_like(self.grasp_latched)
+        self.base_advance_closest_fallback = torch.zeros_like(self.grasp_latched)
         self.push_previous_finger_clearance = torch.full(
             scalar_shape, torch.nan, dtype=torch.float32, device=device
         )
@@ -553,8 +578,28 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         )
         self.push_shoulder_collision_radius = stack("push_shoulder_collision_radius")
         self.push_shoulder_safety_margin = stack("push_shoulder_safety_margin")
+        # Freeze the sampled dog posture; rotate/center it hypothetically, excluding the arm.
+        dog_ids = [i for i, body in enumerate(indices)
+                   if env.body_names[body].lower() == "base_link"
+                   or env.body_names[body].lower().startswith(("fl_", "fr_", "rl_", "rr_"))]
+        dog = robot_motion_envelope(
+            env.robot.data.root_state_w, env.robot.data.body_state_w,
+            self.base_motion_points[dog_ids], self.base_motion_body_indices[dog_ids],
+        )
+        robot_bounds = torch.stack((dog[..., 1].amin((1, 2)), dog[..., 1].amax((1, 2))), -1)
+        self.doorway_projection = DoorwayProjection.from_world(
+            stack("panel_projection_corners_world"), self.hinge_world,
+            stack("panel_hinge_to_free_direction"), self.hinge_axis_sign,
+            self.panel_center_world, self.door_forward, robot_bounds,
+        )
+        self.through_goal_hinge = self.doorway_projection.required_angle()
+        self.push_planned_stop_hinge.copy_(self.through_goal_hinge)
         self.dt = float(env.dt)
         self.middle_arm_joint_target = stack("middle_arm_joint_target")
+        self.through_arm_hold_joint_target = torch.zeros_like(self.initial_arm_joint_target)
+        self.through_arm_restore_ready = torch.zeros(self.num_envs, dtype=torch.bool, device=device)
+        self.through_arm_carry_initialized = torch.zeros_like(self.through_arm_restore_ready)
+        self.through_arm_carry_ready = torch.zeros_like(self.through_arm_restore_ready)
         self.through_station_xy = stack("through_station_xy")
         self.through_station_yaw = stack("through_station_yaw")
         through_targets = [
@@ -580,6 +625,7 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         )
         self.through_no_progress_steps = torch.zeros_like(self.stage_steps)
         self.through_settle_steps = torch.zeros_like(self.stage_steps)
+        self.through_middle_ready_steps = torch.zeros_like(self.stage_steps)
         self.through_stop_latched = torch.zeros_like(self.grasp_latched)
         self.through_motion_ready = torch.zeros_like(self.grasp_latched)
         self.through_entry_stable_steps = torch.zeros_like(self.stage_steps)
@@ -1067,8 +1113,7 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
             self.handle_align_settle_steps[center_rows] = settled
             to_grasp = center_rows[settled >= 5]
             if len(to_grasp):
-                self.transition(to_grasp, self.Stage.GRASP_HANDLE)
-                self.grasp_settle_steps[to_grasp] = 0
+                self.begin_grasp_handle(state, to_grasp)
 
         grasp_rows = torch.where(self.mask(self.Stage.GRASP_HANDLE))[0]
         turn_rows = torch.empty(0, dtype=torch.int64, device=self.device)
@@ -1343,6 +1388,11 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         self.stage_steps[rows] += 1
         return rows[complete]
 
+    def begin_grasp_handle(self, state: dict[str, torch.Tensor], rows: torch.Tensor) -> None:
+        self.grasp_preclose_height_world[rows] = state["ee_pos"][rows, 2]
+        self.transition(rows, self.Stage.GRASP_HANDLE)
+        self.grasp_settle_steps[rows] = 0
+
     def begin_reset_handle(self, state: dict[str, torch.Tensor], rows: torch.Tensor) -> None:
         handle_pose = state["door_body_state_w"][rows, self.handle_body_idx, :7]
         panel_pose = state["door_body_state_w"][rows, self.panel_body_idx, :7]
@@ -1356,7 +1406,6 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         self.release_return_offset_world[rows] = start - handle_pose[:, :3]
         self.release_return_start_quat[rows] = start_q
         self.release_return_angle[rows] = -self.turn_gap_gripper_angle[rows]
-        self.release_vertical_delta[rows] = -self.grasp_vertical_lift[rows]
         self.release_stable_steps[rows] = 0
         self.turn_path.clear(rows)
         counts = self.release_return_steps[rows].to(torch.int32) + 1
@@ -1437,7 +1486,6 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         local_shaft[:, 0] = 1.0
         shaft = _quat_rotate(state["ee_orn"][rows], local_shaft)
         retreat = 0.10 * self.door_normal[rows]
-        retreat[:, 2] += 0.02
         for finger, body_index in enumerate(self.release_contact_body_indices):
             rear = separating_rear_contact(
                 points[:, finger],
@@ -1457,10 +1505,17 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         contact_clear = ~torch.any(blocking, dim=-1)
         gripper_open = (state["gripper_position"][rows, 0] - self.q_open[rows]).abs() < 0.08
         gripper_error = (state["gripper_position"][rows, 0] - self.q_open[rows]).abs()
+        path_complete = self.release_open_path.complete(rows)
+        height_error = (state["ee_pos"][rows, 2] - self.release_open_target_world[rows, 2]).abs()
+        height_restored = height_error <= HANDLE_RELEASE_HEIGHT_TOLERANCE_M
         self.record_acceptance(
             self.Stage.RELEASE_HANDLE,
             rows,
             {
+                "path_complete": (path_complete, path_complete.to(torch.float32), "==", 1.0),
+                "release_height_error_m": (
+                    height_restored, height_error, "<=", HANDLE_RELEASE_HEIGHT_TOLERANCE_M,
+                ),
                 "fixed_jaw_contact_clear": (
                     ~blocking[:, 0],
                     (~blocking[:, 0]).to(torch.float32),
@@ -1477,10 +1532,17 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
             },
             required_streak=10,
         )
-        settled = consecutive_steps(contact_clear & gripper_open, self.release_stable_steps[rows])
+        settled = consecutive_steps(
+            contact_clear & gripper_open & path_complete & height_restored,
+            self.release_stable_steps[rows],
+        )
         self.release_stable_steps[rows] = settled
         self.stage_steps[rows] += 1
         return rows[settled >= 10]
+
+    def release_separating_handle_contacts(self, state, rows):
+        present, _, _ = self._handle_contacts(state, rows)
+        return present & ~self._release_blocking_handle_contacts(state, rows)
 
     def command_withdraw_from_handle(
         self, state: dict[str, torch.Tensor], buffers: TensorCommandBuffers
@@ -1594,6 +1656,11 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
                     _quat_conjugate(reference), state["ee_orn"][completed]
                 )
                 self.reset_base_arrival(completed, ALIGN_PANEL_ARRIVAL)
+                self.panel_station_trajectory.clear(completed)
+                self.push_recovery_settle_steps[completed] = 0
+                self.push_reengage_reachable[completed] = False
+                self.base_advance_closest_fallback[completed] = False
+                self.base_advance_target_longitudinal[completed] = -torch.inf
                 self.transition(completed, self.Stage.MOVE_TO_PANEL_STATION)
                 self.stage_steps[completed] = 1
         active = self.mask(self.Stage.STOW_ARM_AND_CLOSE_GRIPPER) | self.mask(
@@ -1783,11 +1850,14 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         self.stage_steps[rows[self.stage[rows] == int(self.Stage.MOVE_TO_GAP_STATION)]] += 1
         return completed
 
+    def _doorway_gap(self, state, rows):
+        return self.doorway_projection.gap(state["door_joint_position"][rows, self.hinge_idx], rows)
+
+    def _doorway_open(self, state, rows):
+        return self._doorway_gap(state, rows) >= THROUGH_PROJECTION_CLEARANCE_M
+
     def begin_follow_wall_to_panel(self, state, rows):
-        opened = (
-            state["door_joint_position"][rows, self.hinge_idx]
-            >= self.pull_panel_config.opening_angle_rad
-        ) | self.pull_door_opened[rows]
+        opened = self._doorway_open(state, rows)
         self.pull_door_opened[rows] |= opened
         if torch.any(opened):
             self.begin_pass_through_doorway(rows[opened], rolling=True)
@@ -1854,8 +1924,7 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         self.stage_steps[rows] = 1
 
     def update_pull_panel_station(self, state, rows):
-        hinge = state["door_joint_position"][rows, self.hinge_idx]
-        finished = (hinge >= self.pull_panel_config.opening_angle_rad) | self.pull_door_opened[rows]
+        finished = self._doorway_open(state, rows)
         self.pull_door_opened[rows] = finished
         if torch.any(finished):
             self.begin_pass_through_doorway(rows[finished], rolling=True)
@@ -1880,10 +1949,7 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         if not len(rows):
             return empty
         # Opening can finish while tracking the moving panel.
-        opened = (
-            state["door_joint_position"][rows, self.hinge_idx]
-            >= self.pull_panel_config.opening_angle_rad
-        ) | self.pull_door_opened[rows]
+        opened = self._doorway_open(state, rows)
         self.pull_door_opened[rows] |= opened
         if torch.any(opened):
             self.begin_pass_through_doorway(rows[opened], rolling=True)
@@ -2112,10 +2178,7 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
                 self.transition(completed, self.Stage.SUCCESS)
                 completed = empty
             else:
-                opened = (
-                    state["door_joint_position"][completed, self.hinge_idx]
-                    >= self.pull_panel_config.opening_angle_rad
-                )
+                opened = self._doorway_open(state, completed)
                 self.pull_door_opened[completed] |= opened
                 # If the door coasted open during insertion, retract safely;
                 # do not start a redundant arc or declare the task complete.
@@ -2248,7 +2311,7 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         needs_reposition = outside_comfort_workspace(
             state["ee_goal_cart_local"][rows], self.push_comfort_reach_radius[rows]
         ) | (at_path_end & endpoint_commanded)
-        opened = hinge >= self.pull_panel_config.opening_angle_rad
+        opened = self._doorway_open(state, rows)
         minimum_open = hinge >= math.radians(30.0)
         complete = (opened | needs_reposition) & minimum_open
         reach = fixed_norm(state["ee_goal_cart_local"][rows, :2])
@@ -2281,64 +2344,58 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         self.stage_steps[self.mask(self.Stage.PRY_DOOR_OPEN)] += 1
         return completed
 
+    def _initialize_first_push_reference(self, state, rows):
+        angle = self.hinge_axis_sign[rows] * state["door_joint_position"][rows, self.hinge_idx]
+        normal = _quat_rotate(_yaw_quat(angle), self.door_normal[rows])
+        surface = _rotate_about_z(
+            self.panel_station_search_center[rows], self.hinge_world[rows], angle
+        ) + self.panel_station_half_thickness[rows, None] * normal
+        seed = state["ee_orn"][rows]
+        orientation = align_vectors(
+            _quat_rotate(seed, self.depth_axis_local[rows]), -normal, seed
+        )
+        bodies = state["robot_body_state_w"]
+        fixed = bodies[rows, self.panel_station_fixed_body, :7]
+        moving = bodies[rows, self.panel_station_moving_body, :7]
+        fixed_points = fixed[:, None, :3] + _quat_rotate_points_torch(
+            fixed[:, 3:7], self.panel_station_fixed_points
+        )
+        moving_points = moving[:, None, :3] + _quat_rotate_points_torch(
+            moving[:, 3:7], self.panel_station_moving_points
+        )
+        local = _quat_rotate_points_torch(
+            _quat_conjugate(seed), torch.cat((fixed_points, moving_points), 1) - state["ee_pos"][rows, None]
+        )
+        offsets = _quat_rotate_points_torch(orientation, local)
+        support = fixed_dot(offsets, normal[:, None]).amin(-1)
+        target = surface - support[:, None] * normal
+        tip, tip_surface = panel_fingertip_reference(
+            target, offsets, _quat_rotate(orientation, self.depth_axis_local[rows]),
+            normal, torch.zeros_like(angle),
+        )
+        self.push_contact_world[rows] = tip_surface - tip
+        self.push_tip_offset_world[rows] = tip
+        self.push_start_hinge_angle[rows] = state["door_joint_position"][rows, self.hinge_idx]
+        self.push_orientation[rows] = orientation
+
     def command_move_to_panel_station(
         self, state: dict[str, torch.Tensor], buffers: TensorCommandBuffers
     ) -> None:
         rows = torch.where(self.mask(self.Stage.MOVE_TO_PANEL_STATION))[0]
         if not len(rows):
             return
-        command, distance, yaw_error = self._track_station(
-            state,
-            rows,
-            self.panel_station_command_xy[rows],
-            self.panel_station_command_yaw[rows],
-            self.panel_station_xy[rows],
-            self.panel_station_nominal_yaw[rows],
-            buffers=buffers,
+        entering = rows[self.panel_station_trajectory.length[rows] == 0]
+        if len(entering):
+            self._initialize_first_push_reference(state, entering)
+        self._command_push_station(
+            state, rows, buffers, first=True, stage=self.Stage.MOVE_TO_PANEL_STATION
         )
-        self.pending_station_distance[rows] = distance
-        self.pending_yaw_error[rows] = yaw_error
-        self.base_hold_target_xy[rows] = self.panel_station_command_xy[rows]
-        self.base_hold_target_yaw[rows] = self.panel_station_command_yaw[rows]
-        self.base_hold_nominal_xy[rows] = self.panel_station_xy[rows]
-        self.base_hold_nominal_yaw[rows] = self.panel_station_nominal_yaw[rows]
-        self.arm_joint_target(rows, self.align_panel_arm_joint_target[rows], buffers)
-        self.gripper_target(rows, self.q_closed[rows], buffers)
         self.ee_command_world[rows] = state["ee_pos"][rows]
         self.ee_orientation_command[rows] = state["ee_orn"][rows]
         self.ee_command_valid[rows] = True
 
     def advance_move_to_panel_station(self, state: dict[str, torch.Tensor]) -> torch.Tensor:
-        rows = torch.where(self.mask(self.Stage.MOVE_TO_PANEL_STATION))[0]
-        if not len(rows):
-            return torch.empty(0, dtype=torch.int64, device=self.device)
-        self.record_acceptance(
-            self.Stage.MOVE_TO_PANEL_STATION,
-            rows,
-            {
-                "base_arrival_confirmed": (
-                    self.base_arrival_confirmed[rows],
-                    self.base_arrival_settle_steps[rows],
-                    ">=frames",
-                    self.base_arrival_required_frames[rows],
-                ),
-                "base_stability_confirmed": (
-                    self.base_stability_confirmed[rows],
-                    self.base_stability_steps[rows],
-                    ">=frames",
-                    self.base_arrival_required_frames[rows],
-                ),
-            },
-        )
-        completed = rows[self.base_arrival_confirmed[rows] & self.base_stability_confirmed[rows]]
-        if len(completed):
-            self.panel_contact_plan_valid[completed] = False
-            self.panel_contact_settle_steps[completed] = 0
-            self.transition(completed, self.Stage.MOVE_TO_PANEL_STANDOFF)
-            self.stage_steps[completed] = 1
-        active = self.mask(self.Stage.MOVE_TO_PANEL_STATION)
-        self.stage_steps[active] += 1
-        return completed
+        return self._advance_push_station(state, self.Stage.MOVE_TO_PANEL_STATION)
 
     def contact_plan_requests(self) -> torch.Tensor:
         return torch.where(
@@ -2502,7 +2559,7 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         )
         planned_stop = self.push_planned_stop_hinge[rows]
         retract |= (
-            (planned_stop < math.radians(89.0) - 1.0e-5)
+            (planned_stop < self.through_goal_hinge[rows] - 1.0e-5)
             & (self.push_command_hinge_angle[rows] >= planned_stop - 1.0e-4)
             & (
                 state["door_joint_position"][rows, self.hinge_idx]
@@ -2510,10 +2567,7 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
             )
         )
         if self.pull_door:
-            retract |= self.pull_door_opened[rows] | (
-                state["door_joint_position"][rows, self.hinge_idx]
-                >= self.pull_panel_config.opening_angle_rad
-            )
+            retract |= self._doorway_open(state, rows)
         return rows[retract]
 
     def _world_orientation_from_local_rpy(
@@ -2543,9 +2597,6 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
             ki=self.push_speed_ki[rows],
             integral_limit=self.push_speed_integral_limit[rows],
             max_lead=self.push_tip_max_angular_lead[rows],
-            goal=torch.minimum(
-                self.push_goal_hinge_angle[rows], self.push_planned_stop_hinge[rows]
-            ),
             start=self.push_start_hinge_angle[rows],
         )
         self.push_speed_error_integral[rows] = integral
@@ -2650,8 +2701,11 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
             self.base_advance_arm_joint_target[completed] = state["dof_pos"][
                 completed[:, None], arm_ids[None, :]
             ]
+            self.panel_station_trajectory.clear(completed)
             self.push_reengage_reachable[completed] = False
             self.base_advance_target_longitudinal[completed] = -torch.inf
+            self.base_advance_closest_fallback[completed] = False
+            self.reset_base_arrival(completed, APPROACH_ARRIVAL)
             self.transition(completed, self.Stage.ADVANCE_TO_NEXT_PUSH_STATION)
         active = self.mask(self.Stage.STOW_ARM_AFTER_PUSH)
         self.stage_steps[active] += 1
@@ -2680,7 +2734,7 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         failure = overspeed_failure | hinge_limit_failure
         self.fail(rows[overspeed_failure], 20)
         self.fail(rows[hinge_limit_failure], 22)
-        through = rows[(~failure) & (hinge >= math.radians(89.0))]
+        through = rows[(~failure) & self._doorway_open(state, rows)]
         push = (self.stage[rows] == int(self.Stage.PUSH_PANEL_OPEN)) & ~failure
         push_rows = rows[push]
         if len(push_rows):
@@ -2689,11 +2743,11 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
                 self.Stage.PUSH_PANEL_OPEN,
                 push_rows,
                 {
-                    "door_hinge_angle_rad": (
-                        push_hinge >= math.radians(89.0),
-                        push_hinge,
+                    "doorway_projection_gap_m": (
+                        self._doorway_open(state, push_rows),
+                        self._doorway_gap(state, push_rows),
                         ">=",
-                        math.radians(89.0),
+                        THROUGH_PROJECTION_CLEARANCE_M,
                     )
                 },
             )
@@ -2724,15 +2778,17 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         )
 
     def _base_advance_targets(
-        self, state: dict[str, torch.Tensor], rows: torch.Tensor
+        self, state: dict[str, torch.Tensor], rows: torch.Tensor, *, contact=None, line_origin=None
     ) -> tuple[torch.Tensor, torch.Tensor]:
         base = state["root_states"][rows]
         forward = self.door_forward[rows, :2]
         yaw = torch.atan2(forward[:, 1], forward[:, 0])
-        line_origin = self.panel_station_xy[rows]
+        if line_origin is None:
+            line_origin = self.panel_station_xy[rows]
         current_longitudinal = fixed_dot(base[:, :2] - line_origin, forward)
         line_position = line_origin + current_longitudinal[:, None] * forward
-        contact = self._tracked_push_contact(state, rows)
+        if contact is None:
+            contact = self._tracked_push_contact(state, rows)
         origin = self.env.get_goal_reference_origin()[rows]
         reference = self.env.get_goal_reference_quat()[rows]
         offset = self.env.get_goal_center_offset_local()[rows]
@@ -2755,16 +2811,22 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         interval_start = (b - root) / a.clamp_min(1e-10)
         interval_end = (b + root) / a.clamp_min(1e-10)
         solvable = (c > 0.0) & (a > 1e-10) & (discriminant >= 0.0) & (interval_end >= 0.0)
+        closest_fallback = (c > 0.0) & ~solvable
+        self.base_advance_closest_fallback[rows] = closest_fallback
+        # Without a circle intersection, minimize distance on the forward ray.
+        closest_advance = (b / a.clamp_min(1e-10)).clamp_min(0.0)
         required = torch.where(
             c <= 0.0,
             torch.zeros_like(c),
-            torch.where(solvable, interval_start.clamp_min(0.0), torch.zeros_like(c)),
+            torch.where(solvable, interval_start.clamp_min(0.0), closest_advance),
         )
         required += torch.where(
             (c <= 0.0) | solvable,
             self.push_reengage_target_lead[rows],
             torch.zeros_like(required),
         )
+        frame_longitudinal = fixed_dot(self.hinge_world[rows, :2] - line_origin, forward)
+        required = torch.minimum(required, (frame_longitudinal - current_longitudinal).clamp_min(0))
 
         closed_free_end = 2.0 * self.panel_center_world[rows] - self.hinge_world[rows]
         hinge = state["door_joint_position"][rows, self.hinge_idx]
@@ -2822,17 +2884,14 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         longitudinal = torch.where(
             self.push_reengage_reachable[rows], current_longitudinal, longitudinal
         )
+        # The doorway plane is a hard trunk-target limit until THROUGH owns motion.
+        at_frame_limit = longitudinal >= frame_longitudinal
+        longitudinal = torch.minimum(longitudinal, frame_longitudinal)
+        self.base_advance_closest_fallback[rows] |= at_frame_limit
         self.base_advance_target_longitudinal[rows] = longitudinal
         return line_origin + longitudinal[:, None] * forward, yaw
 
-    def command_advance_to_next_push_station(
-        self, state: dict[str, torch.Tensor], buffers: TensorCommandBuffers
-    ) -> None:
-        rows = torch.where(self.mask(self.Stage.ADVANCE_TO_NEXT_PUSH_STATION))[0]
-        if not len(rows):
-            return
-        target_xy, target_yaw = self._base_advance_targets(state, rows)
-        contact = self._tracked_push_contact(state, rows)
+    def _recontact_reachable(self, state, rows, contact):
         origin = self.env.get_goal_reference_origin()[rows]
         reference = self.env.get_goal_reference_quat()[rows]
         offset = self.env.get_goal_center_offset_local()[rows]
@@ -2845,14 +2904,71 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
             reach <= self.push_reengage_reach_radius[rows],
         )
         self.push_reengage_reachable[rows] = reachable
+        return reach, reachable
+
+    def command_advance_to_next_push_station(
+        self, state: dict[str, torch.Tensor], buffers: TensorCommandBuffers
+    ) -> None:
+        rows = torch.where(self.mask(self.Stage.ADVANCE_TO_NEXT_PUSH_STATION))[0]
+        if not len(rows):
+            return
+        self._command_push_station(
+            state, rows, buffers, first=False, stage=self.Stage.ADVANCE_TO_NEXT_PUSH_STATION
+        )
+
+    def _command_push_station(self, state, rows, buffers, *, first, stage):
+        line_origin = self.panel_station_command_xy[rows] if first else self.panel_station_xy[rows]
+        target_xy, target_yaw = self._base_advance_targets(
+            state, rows, line_origin=line_origin
+        )
+        contact = self._tracked_push_contact(state, rows)
+        reach, reachable = self._recontact_reachable(state, rows, contact)
+        entering_mask = self.panel_station_trajectory.length[rows] == 0
+        entering = rows[entering_mask]
+        if len(entering):
+            root = state["root_states"][entering]
+            start = torch.cat((root[:, :2], _yaw_from_wxyz(root[:, 3:7])[:, None]), -1)
+            forward = self.door_forward[entering, :2]
+            origin = line_origin[entering_mask]
+            longitudinal = fixed_dot(self.hinge_world[entering, :2] - origin, forward)
+            finish = origin + longitudinal[:, None] * forward
+            yaw = target_yaw[entering_mask]
+            if first:
+                route = panel_station_waypoints(start, origin, forward, finish, yaw)
+                duration = torch.maximum(
+                    fixed_norm(route[:, 0, :2] - start[:, :2])
+                    / self.panel_station_trajectory.config.linear_speed_m_s,
+                    wrapped_angle(yaw - start[:, 2]).abs()
+                    / self.panel_station_trajectory.config.angular_speed_rad_s,
+                )
+                self.panel_station_prefix_steps[entering] = torch.ceil(duration / self.dt).to(torch.int32)
+            else:
+                route = torch.cat((finish, yaw[:, None]), -1)[:, None]
+                self.panel_station_prefix_steps[entering] = 0
+            self.panel_station_trajectory.install(entering, start, route, self.dt)
+        reference, velocity, prefix_done, _ = self.panel_station_trajectory.sample_forward_target(
+            rows, target_xy, self.door_forward[rows, :2], self.panel_station_prefix_steps[rows]
+        )
+        remaining = fixed_dot(
+            target_xy - state["root_states"][rows, :2], self.door_forward[rows, :2]
+        )
+        at_endpoint = prefix_done & (remaining <= self.base_arrival_inner_distance[rows])
+        # Arrival of the actual base ends translation even while yaw is settling.
+        reference[:, :2] = torch.where(at_endpoint[:, None], target_xy, reference[:, :2])
+        velocity = torch.where(at_endpoint[:, None], 0.0, velocity)
         _, distance, yaw_error = self.base_target(
             state,
             rows,
-            target_xy,
-            target_yaw,
+            reference[:, :2],
+            reference[:, 2],
             buffers,
-            task_stop=reachable,
+            acceptance_xy=target_xy,
+            acceptance_yaw=target_yaw,
+            reference_velocity_world=velocity,
+            task_stop=reachable & prefix_done,
             enforce_task_stop=False,
+            arrival=True,
+            arrival_enabled=prefix_done,
         )
         self.pending_station_distance[rows] = distance
         self.pending_yaw_error[rows] = yaw_error
@@ -2860,8 +2976,13 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         self.base_hold_target_yaw[rows] = target_yaw
         self.base_hold_nominal_xy[rows] = target_xy
         self.base_hold_nominal_yaw[rows] = target_yaw
-        self.arm_joint_target(rows, self.base_advance_arm_joint_target[rows], buffers)
+        arm_target = self.align_panel_arm_joint_target if first else self.base_advance_arm_joint_target
+        self.arm_joint_target(rows, arm_target[rows], buffers)
         self.gripper_target(rows, self.q_closed[rows], buffers)
+        closest_arrived = (
+            self.base_advance_closest_fallback[rows] & self.base_arrival_confirmed[rows]
+        )
+        recontact_station_ready = prefix_done & (reachable | closest_arrived)
         _, settled, stable = update_robot_stability(
             state["root_states"][rows],
             self.push_recovery_settle_steps[rows],
@@ -2872,7 +2993,7 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
             min_upright_cos=THROUGH_ENTRY_UPRIGHT_COS,
             door_speed_rad_s=state["door_joint_velocity"][rows, self.hinge_idx],
             max_door_speed_rad_s=self.turn_release_max_hinge_speed[rows],
-            additional_condition=reachable,
+            additional_condition=recontact_station_ready,
         )
         self.push_recovery_settle_steps[rows] = settled
         base = state["root_states"][rows]
@@ -2884,14 +3005,14 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         )[:, 2]
         door_speed = state["door_joint_velocity"][rows, self.hinge_idx].abs()
         self.record_acceptance(
-            self.Stage.ADVANCE_TO_NEXT_PUSH_STATION,
+            stage,
             rows,
             {
-                "contact_reachable": (
-                    reachable,
+                "recontact_station_ready": (
+                    recontact_station_ready,
                     reach,
-                    "<=hysteresis_threshold",
-                    self.push_reengage_release_radius[rows],
+                    "<=entry_radius_or_bounded_station_arrived",
+                    self.push_reengage_reach_radius[rows],
                 ),
                 "base_linear_speed_m_s": (base_linear_speed < 0.04, base_linear_speed, "<", 0.04),
                 "base_angular_speed_rad_s": (
@@ -2924,7 +3045,10 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         )
 
     def advance_advance_to_next_push_station(self, state: dict[str, torch.Tensor]) -> torch.Tensor:
-        rows = torch.where(self.mask(self.Stage.ADVANCE_TO_NEXT_PUSH_STATION))[0]
+        return self._advance_push_station(state, self.Stage.ADVANCE_TO_NEXT_PUSH_STATION)
+
+    def _advance_push_station(self, state, stage):
+        rows = torch.where(self.mask(stage))[0]
         if not len(rows):
             return torch.empty(0, dtype=torch.int64, device=self.device)
         completed = rows[self.push_recovery_settle_steps[rows] >= 10]
@@ -2942,7 +3066,7 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
             self.panel_contact_settle_steps[completed] = 0
             self.transition(completed, self.Stage.MOVE_TO_PANEL_STANDOFF)
             self.stage_steps[completed] = 1
-        active = self.mask(self.Stage.ADVANCE_TO_NEXT_PUSH_STATION)
+        active = self.mask(stage)
         self.stage_steps[active] += 1
         return completed
 
@@ -2952,8 +3076,12 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         self.through_best_station_error[rows] = torch.inf
         self.through_no_progress_steps[rows] = 0
         self.through_settle_steps[rows] = 0
+        self.through_middle_ready_steps[rows] = 0
         self.through_stop_latched[rows] = False
         self.through_motion_ready[rows] = rolling
+        self.through_arm_restore_ready[rows] = False
+        self.through_arm_carry_initialized[rows] = False
+        self.through_arm_carry_ready[rows] = False
         self.through_entry_stable_steps[rows] = 0
         self.transition(rows, self.Stage.PASS_THROUGH_DOORWAY)
         self.stage_steps[rows] = 1
@@ -2966,17 +3094,25 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         )[0]
         if not len(rows):
             return
-        entering = rows[self.through_trajectory.length[rows] == 0]
+        through = self.stage[rows] == int(self.Stage.PASS_THROUGH_DOORWAY)
+        motion_ready = ~through | self.through_motion_ready[rows]
+        if self.pull_door:
+            arm_ids = self.env.arm_joint_ids.to(device=self.device, dtype=torch.int64)
+            arm_position = state["dof_pos"][rows[:, None], arm_ids[None]]
+            initialize = through & ~self.through_arm_carry_initialized[rows]
+            target = arm_position.clone()
+            # Fold in place without turning the shoulder across the doorway.
+            target[:, 1:] = target.new_tensor([1.45, -0.8, 1.1, 0.0, 0.0])
+            self.through_arm_hold_joint_target[rows[initialize]] = target[initialize]
+            self.through_arm_carry_initialized[rows[initialize]] = True
+            carry_error = (arm_position - self.through_arm_hold_joint_target[rows]).abs().amax(-1)
+            self.through_arm_carry_ready[rows] |= through & (carry_error < 0.08)
+            motion_ready &= ~through | self.through_arm_carry_ready[rows]
+        moving = rows[motion_ready]
+        entering = moving[self.through_trajectory.length[moving] == 0]
         if len(entering):
             root = state["root_states"][entering]
             start = torch.cat((root[:, :2], _yaw_from_wxyz(root[:, 3:7])[:, None]), dim=-1)
-            envelope = robot_motion_envelope(
-                root,
-                state["robot_body_state_w"][entering],
-                self.base_motion_points,
-                self.base_motion_body_indices,
-            )
-            radius = fixed_norm(envelope[..., :2]).flatten(1).amax(-1)
             finish = torch.cat(
                 (self.through_command_xy[entering], self.through_command_yaw[entering, None]),
                 dim=-1,
@@ -2986,10 +3122,15 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
                 self.initial_door_root[entering, :2],
                 self.door_forward[entering, :2],
                 finish,
-                radius,
             )
             self.through_trajectory.install(entering, start, route, self.dt)
-        reference, velocity, _ = self.through_trajectory.sample(rows)
+        reference = torch.cat(
+            (state["root_states"][rows, :2], _yaw_from_wxyz(state["root_states"][rows, 3:7])[:, None]),
+            dim=-1,
+        )
+        velocity = torch.zeros_like(reference)
+        if len(moving):
+            reference[motion_ready], velocity[motion_ready], _ = self.through_trajectory.sample(moving)
         tail_clearance = self._tail_clearance(state, rows)
         latched = self.through_stop_latched[rows]
         latched = torch.where(
@@ -2998,7 +3139,6 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
             tail_clearance >= THROUGH_TAIL_TARGET_DISTANCE,
         )
         self.through_stop_latched[rows] = latched
-        through = self.stage[rows] == int(self.Stage.PASS_THROUGH_DOORWAY)
         _, distance, yaw_error = self.base_target(
             state,
             rows,
@@ -3009,12 +3149,17 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
             acceptance_yaw=self.through_station_yaw[rows],
             reference_velocity_world=velocity,
             task_stop=through & latched,
-            motion_allowed=~through | self.through_motion_ready[rows],
+            motion_allowed=motion_ready,
             final_allowed=through,
         )
         self.pending_station_distance[rows] = distance
         self.pending_yaw_error[rows] = yaw_error
-        self.arm_joint_target(rows, self.middle_arm_joint_target[rows], buffers)
+        arm_target = self.middle_arm_joint_target[rows]
+        if self.pull_door:
+            self.through_arm_restore_ready[rows] |= latched
+            carry = through & ~self.through_arm_restore_ready[rows]
+            arm_target = torch.where(carry[:, None], self.through_arm_hold_joint_target[rows], arm_target)
+        self.arm_joint_target(rows, arm_target, buffers)
         self.gripper_target(rows, self.q_closed[rows], buffers)
 
     def _tail_clearance(self, state: dict[str, torch.Tensor], rows: torch.Tensor) -> torch.Tensor:
@@ -3034,7 +3179,6 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
             return torch.empty(0, dtype=torch.int64, device=self.device)
         base = state["root_states"][rows]
         hinge = state["door_joint_position"][rows, self.hinge_idx]
-        hinge_speed = state["door_joint_velocity"][rows, self.hinge_idx]
         up = _quat_rotate(
             base[:, 3:7],
             torch.tensor([0.0, 0.0, 1.0], device=self.device).expand(len(rows), -1),
@@ -3047,8 +3191,6 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
             max_angular_speed_rad_s=TERMINAL_BASE_ANGULAR_SPEED_RAD_S,
             min_base_height_m=self.through_min_base_height[rows],
             min_upright_cos=THROUGH_ENTRY_UPRIGHT_COS,
-            door_speed_rad_s=hinge_speed,
-            max_door_speed_rad_s=TERMINAL_DOOR_SPEED_RAD_S,
         )
         self.through_entry_stable_steps[rows] = entry_steps
         self.through_motion_ready[rows] |= entry_confirmed
@@ -3076,10 +3218,23 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
         gripper_id = int(self.env.gripper_joint_ids[0].item())
         gripper_speed = self.control_joint_speed(state, rows, gripper_id)
         door_speed = state["door_joint_velocity"][rows].abs().amax(dim=-1)
+        # The recorder confirms reset completion before counting inactive hold frames.
+        middle_reached = (
+            (middle_error < MIDDLE_PRESET_POSITION_TOLERANCE_RAD)
+            & (arm_speed < TERMINAL_ARM_JOINT_SPEED_RAD_S)
+        )
+        previous_ready_steps = self.through_middle_ready_steps[rows]
+        middle_ready_steps = torch.where(
+            previous_ready_steps >= MIDDLE_PRESET_STABLE_FRAMES,
+            previous_ready_steps,
+            consecutive_steps(middle_reached, previous_ready_steps),
+        )
+        self.through_middle_ready_steps[rows] = middle_ready_steps
+        middle_ready = middle_ready_steps >= MIDDLE_PRESET_STABLE_FRAMES
         terminal_extra = (
             self.through_stop_latched[rows]
-            & (middle_error < 0.05)
-            & (arm_speed < TERMINAL_ARM_JOINT_SPEED_RAD_S)
+            & middle_ready
+            & middle_reached
             & (gripper_speed < TERMINAL_GRIPPER_SPEED_RAD_S)
         )
         terminal_confirmed, settled, terminal_stable = update_robot_stability(
@@ -3107,7 +3262,15 @@ class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMi
                     ">=hysteresis_threshold",
                     THROUGH_TAIL_RELEASE_DISTANCE,
                 ),
-                "middle_joint_error_rad": (middle_error < 0.05, middle_error, "<", 0.05),
+                "middle_joint_error_rad": (
+                    middle_error < MIDDLE_PRESET_POSITION_TOLERANCE_RAD,
+                    middle_error,
+                    "<",
+                    MIDDLE_PRESET_POSITION_TOLERANCE_RAD,
+                ),
+                "middle_reset_confirmed": (
+                    middle_ready, middle_ready_steps, ">=", MIDDLE_PRESET_STABLE_FRAMES,
+                ),
                 "arm_speed_rad_s": (
                     arm_speed < TERMINAL_ARM_JOINT_SPEED_RAD_S,
                     arm_speed,

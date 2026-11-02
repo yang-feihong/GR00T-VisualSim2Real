@@ -443,7 +443,18 @@ def _run_tensor_fsm_loop(
         if standard_collectors:
             standard_complete_start = time.perf_counter()
             contacts_by_env = standard_collectors[0].contact_audit.end_tick_by_env()
-            post_state_host = _control_state_to_host(result["state"], num_envs)
+            post_state = dict(result["state"])
+            separating = torch.zeros((num_envs, 2), dtype=torch.bool, device=env.device)
+            release_rows = torch.where(
+                fsm.mask(Stage.RELEASE_HANDLE) | fsm.mask(Stage.WITHDRAW_FROM_HANDLE)
+            )[0]
+            if len(release_rows):
+                separating[release_rows] = fsm.release_separating_handle_contacts(post_state, release_rows)
+            post_state["release_separating_handle_contacts"] = separating
+            post_state["doorway_projection_gap_m"] = fsm._doorway_gap(
+                post_state, torch.arange(num_envs, device=env.device)
+            )
+            post_state_host = _control_state_to_host(post_state, num_envs)
             post_states = _slice_all_control_states(post_state_host, num_envs)
             target_poses = (
                 _target_height_invariant_poses_gpu(

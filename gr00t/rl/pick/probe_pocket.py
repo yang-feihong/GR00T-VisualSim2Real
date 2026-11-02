@@ -12,6 +12,7 @@ from legged_gym.utils.ee_steady_inverse_gpu import _matrix_to_quaternion_wxyz
 from gr00t.rl.auto_open.arm_model import read_arm_joint_limits
 from gr00t.rl.envs.door.b2z1_reset_geometry import b2z1_gripper_pose_and_jacobian
 from gr00t.rl.pick.collision import ArmCollisionSamples
+from gr00t.rl.pick.grasp_clearance import GRASP_CLEARANCE_M
 from gr00t.rl.pick.planning import inverse_bank, pocket_pose_targets
 from gr00t.rl.pick.pocket import gripper_pocket_geometry
 from gr00t.rl.pick.scene_geometry import SceneGeometry, read_scene_triangles
@@ -163,7 +164,7 @@ def main():
         )
         residual = (position - goals[0]).norm(dim=-1)
         physical = quality["pocket_fit"][0] & (quality["antipodal_margin"][0] >= 0)
-        physical &= quality["environment_clearance_m"][0] >= 0.002
+        physical &= quality["environment_clearance_m"][0] >= GRASP_CLEARANCE_M
         stages.append(
             {
                 "iteration": iteration,

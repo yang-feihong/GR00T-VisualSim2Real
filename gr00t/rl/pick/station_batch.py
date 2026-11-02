@@ -5,6 +5,7 @@ import torch
 from gr00t.rl.auto_open.control import APPROACH_ARRIVAL
 from gr00t.rl.auto_open.motion_math import _euler_xyz_quat, _quat_multiply
 from gr00t.rl.auto_open.pose_planning import solve_pose_grid
+from gr00t.rl.pick.grasp_clearance import GRASP_CLEARANCE_M
 from gr00t.rl.pick.planning import (
     grasp_approach_origin,
     grasp_pose_bank,
@@ -228,7 +229,7 @@ def _select_station_chunk(
     physical = (
         quality["pocket_fit"]
         & (quality["antipodal_margin"] >= 0)
-        & (quality["environment_clearance_m"] >= 0.002)
+        & (quality["environment_clearance_m"] >= GRASP_CLEARANCE_M)
     )
     owner, body, candidate = joint_station_requests(
         physical,

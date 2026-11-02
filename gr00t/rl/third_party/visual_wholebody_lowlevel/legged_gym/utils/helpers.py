@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 import torch
+from gr00t.rl.utils.z1_gains import Z1_DAMPING, Z1_STIFFNESS
 
 LOW_LEVEL_ROOT = Path(__file__).resolve().parents[2]
 for p in [str(LOW_LEVEL_ROOT)]:
@@ -226,6 +227,9 @@ def _apply_checkpoint_policy_control_args(cfg, metadata: dict):
     cfg.control.damping = {
         str(name): float(value) for name, value in control_metadata["damping"].items()
     }
+    # Policy-training metadata still governs the legs, not today's arm drives.
+    cfg.control.stiffness.update(Z1_STIFFNESS)
+    cfg.control.damping.update(Z1_DAMPING)
     cfg.control.clip_actions = float(normalization_metadata["clip_actions"])
     cfg.control.clip_observations = float(normalization_metadata["clip_observations"])
     cfg.obs_scales = {

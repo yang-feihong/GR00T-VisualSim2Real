@@ -10,6 +10,7 @@ import torch
 from gr00t.rl.auto_open.arm_model import read_arm_joint_limits
 from gr00t.rl.auto_open.motion_math import _quat_multiply
 from gr00t.rl.auto_open.planning_geometry import _quat_rotate
+from gr00t.rl.pick.grasp_clearance import GRASP_CLEARANCE_M
 from gr00t.rl.pick.planning import grasp_approach_origin, grasp_pose_bank, inverse_bank
 from gr00t.rl.utils.b2z1_asset import ROBOT_URDF
 
@@ -158,7 +159,7 @@ def probe_fresh_station_bank(
     physical = (
         quality["pocket_fit"]
         & (quality["antipodal_margin"] >= 0)
-        & (quality["environment_clearance_m"] >= 0.002)
+        & (quality["environment_clearance_m"] >= GRASP_CLEARANCE_M)
     )
     station, candidate = torch.where(physical)
     limits = root.new_tensor(read_arm_joint_limits(ROBOT_URDF).copy())
@@ -330,7 +331,9 @@ def probe_recorded_grasp_bank(
     contact = plan["convex_contact_model"]
     physical = torch.tensor(contact["pocket_fit"], device=root.device)[0]
     physical &= torch.tensor(contact["antipodal_margin"], device=root.device)[0] >= 0
-    physical &= torch.tensor(contact["environment_clearance_m"], device=root.device)[0] >= 0.002
+    physical &= (
+        torch.tensor(contact["environment_clearance_m"], device=root.device)[0] >= GRASP_CLEARANCE_M
+    )
     valid &= physical[None, None, :, None]
     grasp_exact = valid[..., -1].any(1).sum(-1)
     if not standoff_sweep:

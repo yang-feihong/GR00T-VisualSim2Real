@@ -744,8 +744,11 @@ class GPUStagePlanningMixin:
         if not len(rows):
             return
         end = device_state["ee_pos"][rows] + self.gpu_stage_constants["release_delta"][rows]
-        end[:, 2] += fsm.release_vertical_delta[rows]
-        planned, _ = self._stage_path(
+        end[:, 2] = (
+            fsm.grasp_preclose_height_world[rows]
+            + self.gpu_stage_constants["release_delta"][rows, 2]
+        )
+        planned, valid = self._stage_path(
             fsm,
             device_state,
             rows,
@@ -755,6 +758,7 @@ class GPUStagePlanningMixin:
             device_state["ee_orn"][rows],
             steps=torch.full_like(rows, 35),
         )
+        fsm.release_open_target_world[planned] = end[valid]
         fsm.release_stable_steps[planned] = 0
         fsm.transition(planned, fsm.Stage.RELEASE_HANDLE)
         fsm.stage_steps[planned] = 1
@@ -767,7 +771,6 @@ class GPUStagePlanningMixin:
             + 0.10 * fsm.door_normal[rows]
             + self.gpu_stage_constants["retreat_delta"][rows]
         )
-        end[:, 2] += 0.02
         steps = (
             torch.ceil(torch.linalg.vector_norm(end - device_state["ee_pos"][rows], dim=-1) / 0.002)
             .long()
@@ -1007,10 +1010,11 @@ class GPUStagePlanningMixin:
         )
         static_valid = reachable.reshape(bucket, count)[: len(rows)]
         start = state["door_joint_position"][rows, fsm.hinge_idx].double()
+        goal = torch.maximum(start, fsm.through_goal_hinge[rows].double())
         angle = torch.minimum(
             start[:, None]
             + torch.deg2rad(torch.arange(91, device=fsm.device, dtype=torch.float64))[None],
-            torch.full_like(start[:, None], math.radians(89.0)),
+            goal[:, None],
         )
         angle = angle[:, None].expand(-1, count, -1)
         arc = fingertip_arc_position(
@@ -1032,7 +1036,7 @@ class GPUStagePlanningMixin:
         )
         index = torch.arange(91, device=fsm.device)[None, None]
         first_exit = torch.where(outside, index, 90).amin(-1)
-        first_goal = torch.where(angle >= math.radians(89.0) - 1.0e-8, index, 90).amin(-1)
+        first_goal = torch.where(angle >= goal[:, None, None] - 1.0e-8, index, 90).amin(-1)
         lengths = torch.minimum(first_exit, first_goal) + 2
         lengths = torch.where(candidate_valid & static_valid, lengths, torch.zeros_like(lengths))
         positions = torch.cat((targets[:, :, None], arc), dim=2).flatten(0, 1)

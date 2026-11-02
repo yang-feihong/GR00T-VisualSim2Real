@@ -20,6 +20,7 @@ from pathlib import Path
 import numpy as np
 
 from gr00t.rl.pick.assets import ASSET_ROOT, prepare_mesh_asset
+from gr00t.rl.pick.grasp_clearance import GRASP_CLEARANCE_M
 
 GSO_REVISION = "6139aa33f6163a9f1c7352dd386760f40691ce0d"
 GSO_ROOT = "https://huggingface.co/datasets/suvadityamuk/google-scanned-objects-raw"
@@ -156,6 +157,7 @@ def materialize_variant(asset, seed, slot=0, *, root=ASSET_ROOT, placement_profi
                 asset["mass_kg"],
                 asset.get("grip_aperture_bound_rad"),
                 params,
+                GRASP_CLEARANCE_M,
             ],
             sort_keys=True,
         ).encode()
@@ -331,6 +333,14 @@ def acquire(entry, root=ASSET_ROOT):
         temporary_meta.write_text(json.dumps(asset, indent=2) + "\n")
         temporary_meta.replace(path)
         return asset
+    if entry["source"] == "lightwheel":
+        from gr00t.rl.pick.lightwheel_assets import acquire_lightwheel
+
+        return acquire_lightwheel(entry, root)
+    if entry["source"] == "extwin":
+        from gr00t.rl.pick.extwin_assets import acquire_extwin
+
+        return acquire_extwin(entry, root)
     temporary = root / ".downloads" / name
     temporary.mkdir(parents=True, exist_ok=True)
     url = entry["url"]

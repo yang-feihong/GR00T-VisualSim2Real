@@ -4,6 +4,7 @@ import torch
 
 from gr00t.rl.auto_open.motion_math import _euler_xyz_quat, _quat_multiply
 from gr00t.rl.auto_open.planning_geometry import _quat_rotate
+from gr00t.rl.pick.grasp_clearance import GRASP_CLEARANCE_M
 from gr00t.rl.pick.grasp_quality import convex_grasp_quality
 from gr00t.rl.pick.planning import MAX_POCKET_SAMPLE_EVALUATIONS
 from gr00t.rl.pick.station import station_corridors_clear
@@ -132,21 +133,21 @@ def select_measured_station_batch(
                 selected_geometry = geometry.select(owner[sl])
                 p, orn = goal[sl, None], orientations[candidate[sl], None]
                 opened[sl] = collision.gripper_clearance(
-                    selected_geometry, p, orn, maximum_distance_m=0.0021
+                    selected_geometry, p, orn, maximum_distance_m=GRASP_CLEARANCE_M + 0.0001
                 )[:, 0]
                 closing[sl] = collision.gripper_closing_clearance(
                     selected_geometry,
                     p,
                     orn,
                     aperture[sl, None],
-                    maximum_distance_m=0.0021,
+                    maximum_distance_m=GRASP_CLEARANCE_M + 0.0001,
                 )[:, 0]
                 corridor[sl] = station_corridors_clear(
                     root[owner[sl]], station[sl, None], selected_geometry
                 )[:, 0]
-            feasible = (opened >= 0.002) & (closing >= 0.002) & corridor
-            open_counts.index_add_(0, owner, (opened >= 0.002).long())
-            close_counts.index_add_(0, owner, (closing >= 0.002).long())
+            feasible = (opened >= GRASP_CLEARANCE_M) & (closing >= GRASP_CLEARANCE_M) & corridor
+            open_counts.index_add_(0, owner, (opened >= GRASP_CLEARANCE_M).long())
+            close_counts.index_add_(0, owner, (closing >= GRASP_CLEARANCE_M).long())
             corridor_counts.index_add_(0, owner, corridor.long())
             safe_counts.index_add_(0, owner, feasible.long())
             distance = (

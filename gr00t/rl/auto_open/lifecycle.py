@@ -195,7 +195,6 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
     self.panel_push_world += (
         panel_midplane_projection - float(np.dot(self.panel_push_world, self.door_normal))
     ) * self.door_normal
-    door_tangent = np.array([-self.door_normal[1], self.door_normal[0]], dtype=np.float32)
     panel_contact_world = self.panel_push_world + self.door_normal * self.panel_half_thickness
     self.panel_contact_local = _quat_rotate_inverse_np(
         panel_state[3:7], panel_contact_world - panel_state[:3]
@@ -212,11 +211,8 @@ def reset_controller(self, state=None, reset_env=True, close_gripper=True):
     # measuring the actual initial closed-jaw height gap and forward extent.
     self.approach_distance = 0.85
     self.station_xy = self.grasp_center_pos[:2] + self.approach_distance * normal
-    self.panel_station_xy = self.station_xy.copy()
-    self.panel_station_xy += (
-        float(np.dot(self.panel_center_world[:2] - self.panel_station_xy, door_tangent))
-        * door_tangent
-    )
+    # This is the independent centerline anchor, not a base station distance.
+    self.panel_station_xy = self.panel_center_world[:2].copy()
     self.door_forward = -self.door_normal
     self.through_station_yaw = math.atan2(float(self.door_forward[1]), float(self.door_forward[0]))
     c = math.cos(self.through_station_yaw)

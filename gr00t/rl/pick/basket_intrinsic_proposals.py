@@ -7,6 +7,7 @@ import torch
 from gr00t.rl.auto_open.motion_math import _quat_multiply
 from gr00t.rl.auto_open.planning_geometry import _quat_rotate
 from gr00t.rl.auto_open.tensor_random import episode_uniform
+from gr00t.rl.pick.grasp_clearance import GRASP_CLEARANCE_M
 from gr00t.rl.pick.grasp_quality import convex_grasp_quality, supported_pinch_alignment
 from gr00t.rl.pick.planning import grasp_environment_clearance, object_frame_grasp_bank
 from gr00t.rl.pick.pocket import BASKET_MINIMUM_CENTER_DEPTH_M
@@ -143,7 +144,13 @@ class IntrinsicGraspProposals:
         return result
 
     def candidate_bank(
-        self, state, collision, geometry, *, minimum_clearance_m=0.006, maximum_tool_tilt_deg=30.0
+        self,
+        state,
+        collision,
+        geometry,
+        *,
+        minimum_clearance_m=GRASP_CLEARANCE_M,
+        maximum_tool_tilt_deg=30.0,
     ):
         """Transport intrinsic contacts; recompute support, cone and full obstacle checks."""
         objects = state["object_state"]

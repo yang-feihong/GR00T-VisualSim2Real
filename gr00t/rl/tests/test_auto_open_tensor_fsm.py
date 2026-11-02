@@ -174,15 +174,20 @@ def test_open_gripper_requires_no_blocking_jaw_contact(blocking):
     fsm.release_stable_steps = torch.zeros(1, dtype=torch.int32)
     fsm.stage_steps = torch.ones(1, dtype=torch.int32)
     fsm._release_blocking_handle_contacts = lambda *_: torch.tensor([[blocking, False]])
+    fsm.release_open_path = PaddedPathBank(1, 2, "cpu")
+    fsm.release_open_path.length[:] = 2
+    fsm.release_open_path.index[:] = 1
+    fsm.release_open_target_world = torch.zeros(1, 3)
     recorded = []
     fsm.record_acceptance = lambda stage, rows, conditions, **kwargs: recorded.append(conditions)
-    state = {"gripper_position": torch.tensor([[-1.0]])}
+    state = {"gripper_position": torch.tensor([[-1.0]]), "ee_pos": torch.zeros(1, 3)}
     for _ in range(9):
         assert fsm.advance_release_handle(state).numel() == 0
     assert fsm.advance_release_handle(state).tolist() == ([] if blocking else [0])
     assert all(
         set(conditions)
-        == {"gripper_open_error_rad", "fixed_jaw_contact_clear", "moving_jaw_contact_clear"}
+        == {"gripper_open_error_rad", "fixed_jaw_contact_clear", "moving_jaw_contact_clear",
+            "path_complete", "release_height_error_m"}
         for conditions in recorded
     )
     state["gripper_position"][:] = -0.5
@@ -566,6 +571,7 @@ def test_terminal_hold_dispatches_exact_zero_after_reversal_filter():
     from gr00t.rl.auto_open.base_trajectory import BasePoseTrajectory
 
     fsm = TensorDoorFSM.__new__(TensorDoorFSM)
+    fsm.pull_door = False
     fsm.through_trajectory = BasePoseTrajectory(1, "cpu")
     fsm.through_trajectory.length[:] = 1
     fsm.device = torch.device("cpu")

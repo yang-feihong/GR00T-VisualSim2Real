@@ -6,6 +6,7 @@ import torch
 
 from gr00t.rl.auto_open.planning_geometry import _quat_rotate
 from gr00t.rl.auto_open.pose_planning import best_feasible
+from gr00t.rl.pick.grasp_clearance import GRASP_CLEARANCE_M
 from gr00t.rl.pick.planning import (
     continuous_inverse_seed,
     elevated_cartesian_approach,
@@ -30,7 +31,7 @@ def score_default_grasp_paths(
     capacity=4096,
     elevated_transit=False,
     prefer_orientation=True,
-    collider_clearance_m=0.002,
+    collider_clearance_m=GRASP_CLEARANCE_M,
     require_safe_arm_path=False,
     validate_carry_preview=True,
     realized_body=None,

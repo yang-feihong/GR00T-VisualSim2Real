@@ -15,6 +15,7 @@ from gr00t.rl.auto_open.geometry import _read_collider_points
 from gr00t.rl.auto_open.planning_geometry import _quat_rotate
 from gr00t.rl.pick.asset_library import installed_assets, target_shape_eligible
 from gr00t.rl.pick.assets import ASSET_ROOT
+from gr00t.rl.pick.grasp_clearance import GRASP_CLEARANCE_M
 from gr00t.rl.pick.grasp_quality import (
     convex_grasp_quality,
     grasp_support_from_hull,
@@ -45,6 +46,57 @@ def stable_pose_bank(points, faces, *, max_poses=8):
             if len(selected) >= max_poses:
                 break
     return rotations[selected].copy(), basin[selected].tolist()
+
+
+def static_resting_pose_bank(points, faces, *, device="cuda:0", max_poses=8):
+    """Bounded GPU support-face proposals with the hull COM above the face.
+
+    These are statically stable resting faces, not dynamic basin probabilities.
+    Existing measured resting banks remain preferable when available.
+    """
+    if max_poses < 1:
+        raise ValueError("At least one stable pose must be requested")
+    vertices = torch.as_tensor(points, device=device, dtype=torch.float64)
+    triangles = vertices[torch.as_tensor(faces, device=device, dtype=torch.long)]
+    a, b, c = triangles.unbind(1)
+    volume6 = (a * torch.cross(b, c, dim=-1)).sum(-1)
+    total = volume6.sum()
+    if not bool(torch.isfinite(total)) or abs(float(total)) < 1e-12:
+        raise ValueError("A closed convex hull is required")
+    center = (volume6[:, None] * (a + b + c)).sum(0) / (4 * total)
+    v, w = b - a, c - a
+    normal = torch.cross(v, w, dim=-1)
+    area2 = normal.norm(dim=-1)
+    normal = normal / area2[:, None].clamp_min(1e-20)
+    # Orient outwards even for a globally reversed hull winding.
+    normal *= torch.where(((a - center) * normal).sum(-1) >= 0, 1.0, -1.0)[:, None]
+    projected = center - (((center - a) * normal).sum(-1))[:, None] * normal
+    relative = projected - a
+    vv, vw, ww = (v * v).sum(-1), (v * w).sum(-1), (w * w).sum(-1)
+    rv, rw = (relative * v).sum(-1), (relative * w).sum(-1)
+    determinant = vv * ww - vw.square()
+    u = (rv * ww - rw * vw) / determinant.clamp_min(1e-30)
+    t = (rw * vv - rv * vw) / determinant.clamp_min(1e-30)
+    remaining = (area2 > 1e-14) & (u >= -1e-8) & (t >= -1e-8) & (u + t <= 1 + 1e-8)
+    rotations = []
+    for _ in range(max_poses):
+        if not bool(remaining.any()):
+            break
+        index = area2.masked_fill(~remaining, -torch.inf).argmax()
+        up = -normal[index]
+        axis = torch.eye(3, device=device, dtype=vertices.dtype)[up.abs().argmin()]
+        x = torch.cross(axis, up, dim=-1)
+        x = x / x.norm()
+        rotations.append(torch.stack((x, torch.cross(up, x, dim=-1), up)))
+        remaining &= normal @ normal[index] < math.cos(math.radians(20))
+    return [
+        {
+            "rotation": rotation.cpu().tolist(),
+            "resting_basin_probability": None,
+            "resting_pose_evidence": "convex_hull_COM_projection_inside_support_triangle",
+        }
+        for rotation in rotations
+    ]
 
 
 @lru_cache(maxsize=4)
@@ -113,9 +165,14 @@ def baked_pose_support(points, faces, rotation, device):
 
 
 def audit_asset(
-    asset, device="cuda:0", *, scale_xyz=None, minimum_clearance_m=0.002, placement_profile=None
+    asset,
+    device="cuda:0",
+    *,
+    scale_xyz=None,
+    minimum_clearance_m=GRASP_CLEARANCE_M,
+    placement_profile=None,
+    pose_bank=None,
 ):
-    from gr00t.rl.pick.basket import BASKET_GRASP_CLEARANCE_M
 
     scale = np.ones(3) if scale_xyz is None else np.asarray(scale_xyz, dtype=float)
     size = (np.asarray(asset.get("intrinsic_size_m", asset["size_m"])) * scale).tolist()
@@ -133,19 +190,25 @@ def audit_asset(
     directory = Path(asset["usd_path"]).parent
     points = np.load(directory / "collision_support.npy") * scale
     faces = np.load(directory / "collision_faces.npy")
-    rotations, basin = stable_pose_bank(points, faces)
+    if pose_bank is None:
+        rotations, basin = stable_pose_bank(points, faces)
+    else:
+        rotations = [np.asarray(p["rotation"]) for p in pose_bank]
+        basin = [p["resting_basin_probability"] for p in pose_bank]
     from gr00t.rl.pick.planning import object_frame_grasp_bank
 
     tool = object_frame_grasp_bank(torch.tensor([[1.0, 0, 0, 0]], device=device), size)[0]
     if placement_profile == "basket":
         axis = _quat_rotate(tool, tool.new_tensor([1, 0, 0]))
         tool = tool[axis[:, 2] <= -math.cos(math.radians(30))]
-    counts, top_counts, basket_counts = [], [], []
+    counts, top_counts, basket_counts, diagnostics = [], [], [], []
     # Offline library preprocessing is chunked independently of scene/env control.
     for rotation in rotations:
         support = baked_pose_support(points, faces, rotation, device)
         pose = support.new_tensor([[1, 0, 0, 0]])
         count = top_count = basket_count = 0
+        gates = {key: 0 for key in ("pocket_fit", "antipodal", "level_pinch", "clearance")}
+        best_clearance = -math.inf
         for chunk in tool.split(128):
             orientation = chunk[None]
             quality = convex_grasp_quality(
@@ -159,14 +222,26 @@ def audit_asset(
                 support_normal_world=support.new_tensor([[0, 0, 1]]),
                 return_depth_candidates=True,
             )
-            feasible = quality["pocket_fit"] & (quality["antipodal_margin"] >= 0)
-            feasible &= quality["support_pinch_compatible"]
+            pocket_fit = quality["pocket_fit"]
+            antipodal = pocket_fit & (quality["antipodal_margin"] >= 0)
+            feasible = antipodal & quality["support_pinch_compatible"]
+            clearance = quality["environment_clearance_m"]
+            for key, mask in (
+                ("pocket_fit", pocket_fit),
+                ("antipodal", antipodal),
+                ("level_pinch", feasible),
+                ("clearance", feasible & (clearance >= minimum_clearance_m)),
+            ):
+                gates[key] += int(mask.sum())
+            best_clearance = max(
+                best_clearance, float(clearance.masked_fill(~feasible, -torch.inf).amax())
+            )
             accepted = (feasible & (quality["environment_clearance_m"] >= minimum_clearance_m)).any(
                 -1
             )
             basket_accepted = (
                 feasible
-                & (quality["environment_clearance_m"] >= BASKET_GRASP_CLEARANCE_M)
+                & (quality["environment_clearance_m"] >= minimum_clearance_m)
                 & (quality["center_depth_margin_m"] >= BASKET_MINIMUM_CENTER_DEPTH_M)
             ).any(-1)
             axis = _quat_rotate(chunk, chunk.new_tensor([1, 0, 0]))
@@ -177,6 +252,15 @@ def audit_asset(
         counts.append(count)
         top_counts.append(top_count)
         basket_counts.append(basket_count)
+        diagnostics.append(
+            {
+                "depth_candidate_gate_counts": gates,
+                "best_clearance_after_contact_checks_m": best_clearance
+                if math.isfinite(best_clearance)
+                else None,
+                "blocking_gate": next((key for key, value in gates.items() if not value), None),
+            }
+        )
     result.update(
         eligible_shape=True,
         poses=[
@@ -186,9 +270,10 @@ def audit_asset(
                 "supported_grasp_count": int(count),
                 "top_down_grasp_count": int(top_count),
                 "basket_top_down_grasp_count": int(basket_count),
+                "diagnostics": diagnostic,
             }
-            for rotation, probability, count, top_count, basket_count in zip(
-                rotations, basin, counts, top_counts, basket_counts
+            for rotation, probability, count, top_count, basket_count, diagnostic in zip(
+                rotations, basin, counts, top_counts, basket_counts, diagnostics
             )
         ],
         physical_grasp_verified=False,
@@ -196,7 +281,7 @@ def audit_asset(
     return result
 
 
-def shape_bank_fingerprint(asset, *, minimum_clearance_m=0.002, placement_profile=None):
+def shape_bank_fingerprint(asset, *, minimum_clearance_m=GRASP_CLEARANCE_M, placement_profile=None):
     digest = hashlib.sha256(
         b"joint-support-plane-v5-all-hull-and-face-samples-depth-bank-preload-0.5mm"
     )
@@ -236,7 +321,7 @@ def main():
     parser.add_argument("--names", nargs="+")
     parser.add_argument("--asset-json", type=Path, help="Audit an actual baked variant")
     parser.add_argument("--all-admitted-scales", action="store_true")
-    parser.add_argument("--minimum-clearance-m", type=float, default=0.002)
+    parser.add_argument("--minimum-clearance-m", type=float, default=GRASP_CLEARANCE_M)
     parser.add_argument("--placement-profile", choices=("basket",))
     parser.add_argument("--skip-published-shapes", action="store_true")
     parser.add_argument("--shard-rank", type=int, default=0)
@@ -248,15 +333,11 @@ def main():
         help="Publish stable faces; does not enable assets or certify physical success",
     )
     args = parser.parse_args()
-    if args.placement_profile == "basket":
-        from gr00t.rl.pick.basket import BASKET_GRASP_CLEARANCE_M
-
-        args.minimum_clearance_m = max(args.minimum_clearance_m, BASKET_GRASP_CLEARANCE_M)
     if not math.isfinite(args.minimum_clearance_m) or args.minimum_clearance_m < 0.002:
         parser.error("Minimum clearance must be finite and at least 0.002 m")
     if (
         args.publish_placement_bank
-        and args.minimum_clearance_m != 0.002
+        and args.minimum_clearance_m != GRASP_CLEARANCE_M
         and args.placement_profile is None
     ):
         parser.error("Nondefault clearance audits are diagnostic only; do not overwrite the bank")

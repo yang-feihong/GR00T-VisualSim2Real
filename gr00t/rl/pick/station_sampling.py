@@ -4,6 +4,7 @@ import torch
 
 from gr00t.rl.auto_open.planning_geometry import _quat_rotate
 from gr00t.rl.auto_open.tensor_random import episode_uniform
+from gr00t.rl.pick.grasp_clearance import GRASP_CLEARANCE_M
 from gr00t.rl.pick.grasp_quality import convex_grasp_quality
 from gr00t.rl.pick.support_features import minimum_projection, uniform_surface_support
 from gr00t.rl.pick.supported_asset_audit import gripper_collision_clouds
@@ -78,7 +79,7 @@ def sample_station_pockets(
         & (coarse["width_clearance_m"] >= -0.002)
         & (coarse["antipodal_margin"] >= 0.15)
     )
-    plane_penalty = 50 * (0.002 - coarse["environment_clearance_m"]).clamp(0, 0.05)
+    plane_penalty = 50 * (GRASP_CLEARANCE_M - coarse["environment_clearance_m"]).clamp(0, 0.05)
     depth_cost = plane_penalty - 0.1 * coarse["antipodal_margin"]
     depth = depth_cost.masked_fill(~feasible, torch.inf).argmin(-1)
     orientation_cost = 1 - (q * orientations[:, :1]).sum(-1).abs()
@@ -106,7 +107,7 @@ def sample_station_pockets(
         )
         if "on_floor" in state:
             floor_gap = plane_check(quaternions, floor_only=True)(center, aperture, available)
-            available &= ~state["on_floor"][:, None, None] | (floor_gap >= 0.002)
+            available &= ~state["on_floor"][:, None, None] | (floor_gap >= GRASP_CLEARANCE_M)
         result = aperture.new_full(aperture.shape, torch.nan)
         solved = torch.zeros_like(aperture[..., 0], dtype=torch.bool)
         for _ in range(aperture.shape[-1]):
@@ -120,19 +121,22 @@ def sample_station_pockets(
             p = state["object_state"][owner, :3] - _quat_rotate(orientation, c)
             selected = geometry.select(owner)
             opened = collision.gripper_clearance(
-                selected, p[:, None], orientation[:, None], maximum_distance_m=0.0021
+                selected,
+                p[:, None],
+                orientation[:, None],
+                maximum_distance_m=GRASP_CLEARANCE_M + 0.0001,
             )[:, 0]
             closing = collision.gripper_closing_clearance(
                 selected,
                 p[:, None],
                 orientation[:, None],
                 aperture[owner, candidate, depth, None],
-                maximum_distance_m=0.0021,
+                maximum_distance_m=GRASP_CLEARANCE_M + 0.0001,
             )[:, 0]
             gap = torch.minimum(opened, closing)
             result[owner, candidate, depth] = gap
             available[owner, candidate, depth] = False
-            solved[owner, candidate] = gap >= 0.002
+            solved[owner, candidate] = gap >= GRASP_CLEARANCE_M
         return result
 
     parts = []

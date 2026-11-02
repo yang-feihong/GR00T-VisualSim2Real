@@ -795,6 +795,7 @@ def _measure_panel_geometry(self):
                         np.max(np.abs((corners - center) @ self.door_normal))
                     )
                     self.panel_center_world = center
+                    self.panel_projection_corners_world = corners
                     panel_corners = corners
                     break
         door_prim = stage.GetPrimAtPath(self._door_prim_path())

@@ -11,6 +11,7 @@ from isaaclab.sensors import ContactSensorCfg
 from isaaclab.terrains import TerrainImporterCfg
 import isaaclab.sim as sim_utils
 from isaaclab.actuators import ImplicitActuatorCfg
+from gr00t.rl.utils.z1_gains import Z1_DAMPING, Z1_STIFFNESS
 
 
 _LOW_LEVEL_ROOT = Path(__file__).resolve().parents[3]
@@ -164,24 +165,8 @@ class LeggedRobotIsaacLabCfg(DirectRLEnvCfg):
                 ],
                 effort_limit_sim=80.0,
                 velocity_limit_sim=20.0,
-                stiffness={
-                    "joint1": 10000.0,
-                    "joint2": 10000.0,
-                    "joint3": 10000.0,
-                    "joint4": 10000.0,
-                    "joint5": 10000.0,
-                    "joint6": 10000.0,
-                    "jointGripper": 400.0,
-                },
-                damping={
-                    "joint1": 200.0,
-                    "joint2": 200.0,
-                    "joint3": 200.0,
-                    "joint4": 200.0,
-                    "joint5": 200.0,
-                    "joint6": 200.0,
-                    "jointGripper": 40.0,
-                },
+                stiffness=dict(Z1_STIFFNESS),
+                damping=dict(Z1_DAMPING),
             ),
         }
     )

@@ -162,10 +162,10 @@ def select_panel_arc(
     # Reserve the fingertip feedback lead before the first unsafe sample.
     stop = torch.where(
         complete,
-        torch.full_like(safe_angle, math.radians(89.0)),
+        angles[..., -1],
         safe_angle - PUSH_TIP_MAX_ANGULAR_LEAD_RAD,
     )
-    minimum_progress = (math.radians(89.0) - start).clamp(0.0, minimum_progress_rad)
+    minimum_progress = (angles[..., -1] - start).clamp(0.0, minimum_progress_rad)
     useful = candidate_valid & torch.where(
         complete,
         safe_angle - start >= minimum_progress - 1.0e-6,

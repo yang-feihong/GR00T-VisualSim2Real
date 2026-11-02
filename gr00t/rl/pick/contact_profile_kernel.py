@@ -4,6 +4,7 @@ import torch
 import warp as wp
 
 BLOCK_DIM = wp.constant(128)
+MAX_CONTACT_POINTS = 8192
 
 
 @wp.func
@@ -60,6 +61,11 @@ def moving_profile_minimum(local, centers, angles, profile):
         raise ValueError("Fused contact profiles require CUDA float32 tensors")
     if local.ndim != 4 or centers.ndim != 4 or angles.ndim not in (3, 4):
         raise ValueError("Expected local[B,K,N,3], centers[B,K,D,3], angles[B,K,D,(A)]")
+    if local.shape[-2] > MAX_CONTACT_POINTS:
+        result = angles.new_full(angles.shape, torch.inf)
+        for chunk in local.split(MAX_CONTACT_POINTS, dim=-2):
+            result = torch.minimum(result, moving_profile_minimum(chunk, centers, angles, profile))
+        return result
     wp.init()
     angle_count = 1 if angles.ndim == 3 else angles.shape[-1]
     result = angles.new_full(angles.shape, torch.inf)
@@ -149,6 +155,18 @@ def first_profile_contact(local, centers, open_angles, profile):
         raise ValueError("Fused closing contact requires CUDA float32 tensors")
     if local.ndim != 4 or centers.ndim != 4 or open_angles.shape != centers.shape[:-1]:
         raise ValueError("Expected local[B,K,N,3], centers[B,K,D,3], angles[B,K,D]")
+    if local.shape[-2] > MAX_CONTACT_POINTS:
+        sweep = torch.linspace(0, 1, 17, device=local.device, dtype=local.dtype)
+        gaps = moving_profile_minimum(local, centers, open_angles[..., None] * sweep, profile)
+        last = torch.where(gaps < 0, torch.arange(17, device=local.device), 0).amax(-1)
+        lower = open_angles * sweep[last]
+        upper = open_angles * sweep[(last + 1).clamp_max(16)]
+        for _ in range(16):
+            angle = (lower + upper) / 2
+            gap = moving_profile_minimum(local, centers, angle, profile)
+            lower = torch.where(gap < 0, angle, lower)
+            upper = torch.where(gap >= 0, angle, upper)
+        return (lower + upper) / 2
     wp.init()
     result = torch.empty_like(open_angles)
     if not result.numel():
@@ -217,6 +235,8 @@ def _patch_statistics(
     moving: wp.array3d(dtype=float),
     depths: int,
     candidates: int,
+    external_gaps: wp.array2d(dtype=float),
+    use_external_gaps: bool,
     output: wp.array3d(dtype=wp.float64),
     gaps: wp.array2d(dtype=float),
 ):
@@ -234,6 +254,9 @@ def _patch_statistics(
             mg = wp.min(mg, _point_gap(point, angle, moving))
     fmin = wp.tile_min(wp.tile(fg))[0]
     mmin = wp.tile_min(wp.tile(mg))[0]
+    if use_external_gaps:
+        fmin = external_gaps[row, 0]
+        mmin = external_gaps[row, 1]
     if lane == 0:
         gaps[row, 0] = fmin
         gaps[row, 1] = mmin
@@ -281,6 +304,15 @@ def _patch_statistics(
 
 
 def fixed_profile_centers(local, centers, profile):
+    if local.shape[-2] > MAX_CONTACT_POINTS:
+        required = centers.new_full(centers.shape[:-1], -torch.inf)
+        for chunk in local.split(MAX_CONTACT_POINTS, dim=-2):
+            partial, valid = fixed_profile_centers(chunk, centers, profile)
+            required = torch.maximum(required, partial[..., 2].masked_fill(~valid, -torch.inf))
+        valid = torch.isfinite(required)
+        result = centers.clone()
+        result[..., 2] = torch.where(valid, required, centers[..., 2])
+        return result, valid
     wp.init()
     result = torch.empty_like(centers)
     valid = torch.empty(centers.shape[:-1], device=local.device, dtype=torch.bool)
@@ -301,15 +333,17 @@ def fixed_profile_centers(local, centers, profile):
     return result, valid
 
 
-def profile_contact_statistics(local, centers, angles, fixed, moving, support_mask=None):
+def _profile_statistics_values(
+    local, centers, angles, fixed, moving, support_mask, external_gaps=None
+):
     wp.init()
-    shape = centers.shape[:-1]
     values = torch.empty((angles.numel(), 2, 7), device=local.device, dtype=torch.float64)
     gaps = angles.new_empty(angles.numel(), 2)
     if support_mask is None:
         support_mask = torch.ones(
             (local.shape[0], local.shape[2]), device=local.device, dtype=torch.bool
         )
+    supplied_gaps = gaps if external_gaps is None else external_gaps.reshape(-1, 2).contiguous()
     wp.launch_tiled(
         _patch_statistics,
         dim=(angles.numel(),),
@@ -322,12 +356,43 @@ def profile_contact_statistics(local, centers, angles, fixed, moving, support_ma
             wp.from_torch(moving[0].contiguous()),
             centers.shape[-2],
             local.shape[1],
+            wp.from_torch(supplied_gaps),
+            external_gaps is not None,
             wp.from_torch(values),
             wp.from_torch(gaps),
         ],
         stream=wp.stream_from_torch(torch.cuda.current_stream(local.device)),
         block_dim=BLOCK_DIM,
     )
+    return values, gaps
+
+
+def profile_contact_statistics(local, centers, angles, fixed, moving, support_mask=None):
+    shape = centers.shape[:-1]
+    if local.shape[-2] > MAX_CONTACT_POINTS:
+        # Global patch minima must be shared by all chunks; averaging contacts
+        # from independently thresholded chunks would change the grasp geometry.
+        if support_mask is None:
+            support_mask = torch.ones(
+                (local.shape[0], local.shape[-2]), device=local.device, dtype=torch.bool
+            )
+        masked_local = local.masked_fill(~support_mask[:, None, :, None], 1e5)
+        fcenters, valid = fixed_profile_centers(masked_local, centers, fixed)
+        fg = (-fcenters[..., 2]).masked_fill(~valid, torch.inf)
+        mg = moving_profile_minimum(masked_local, centers, angles, moving)
+        gaps = torch.stack((fg, mg), -1)
+        values = torch.zeros((angles.numel(), 2, 7), device=local.device, dtype=torch.float64)
+        for start in range(0, local.shape[-2], MAX_CONTACT_POINTS):
+            chunk = local[..., start : start + MAX_CONTACT_POINTS, :]
+            mask = support_mask[:, start : start + MAX_CONTACT_POINTS]
+            partial, _ = _profile_statistics_values(
+                chunk, centers, angles, fixed, moving, mask, gaps
+            )
+            values += partial
+    else:
+        values, gaps = _profile_statistics_values(
+            local, centers, angles, fixed, moving, support_mask
+        )
     contacts = (values[..., :3] / values[..., 6:7].clamp_min(1)).float()
     normals = values[..., 3:6]
     normals = (normals / normals.norm(dim=-1, keepdim=True).clamp_min(1e-8)).float()

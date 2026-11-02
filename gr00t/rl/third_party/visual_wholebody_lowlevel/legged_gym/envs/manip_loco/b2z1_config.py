@@ -2,10 +2,12 @@ from isaaclab.utils import configclass
 from legged_gym.envs.base.legged_robot_config import LeggedRobotIsaacLabCfg, ControlCfg
 import numpy as np
 from gr00t.rl.utils.b2z1_asset import read_arm_mount
+from gr00t.rl.utils.z1_gains import Z1_DAMPING, Z1_STIFFNESS
 
 
 @configclass
 class B2Z1IsaacLabCfg(LeggedRobotIsaacLabCfg):
+    arm_gravity_compensation: bool = True
     task_name = "b2z1"
     action_space = 18
     observation_space = 744
@@ -94,16 +96,14 @@ class B2Z1IsaacLabCfg(LeggedRobotIsaacLabCfg):
             "FR_hip_joint": B2_stiffness, "FR_thigh_joint": B2_stiffness, "FR_calf_joint": B2_stiffness,
             "RL_hip_joint": B2_stiffness, "RL_thigh_joint": B2_stiffness, "RL_calf_joint": B2_stiffness,
             "RR_hip_joint": B2_stiffness, "RR_thigh_joint": B2_stiffness, "RR_calf_joint": B2_stiffness,
-            "joint1": 5.0, "joint2": 5.0, "joint3": 5.0, "joint4": 5.0, "joint5": 5.0, "joint6": 5.0,
-            "jointGripper": 5.0,
+            **Z1_STIFFNESS,
         },
         damping={
             "FL_hip_joint": B2_damping, "FL_thigh_joint": B2_damping, "FL_calf_joint": B2_damping,
             "FR_hip_joint": B2_damping, "FR_thigh_joint": B2_damping, "FR_calf_joint": B2_damping,
             "RL_hip_joint": B2_damping, "RL_thigh_joint": B2_damping, "RL_calf_joint": B2_damping,
             "RR_hip_joint": B2_damping, "RR_thigh_joint": B2_damping, "RR_calf_joint": B2_damping,
-            "joint1": 0.5, "joint2": 0.5, "joint3": 0.5, "joint4": 0.5, "joint5": 0.5, "joint6": 0.5,
-            "jointGripper": 0.5,
+            **Z1_DAMPING,
         },
     )
 
@@ -177,8 +177,8 @@ class B2Z1IsaacLabCfg(LeggedRobotIsaacLabCfg):
         yaw_adaptive_time_min_scale = 1.0
         yaw_adaptive_time_max_scale = 5.0
         ik_damping = 0.05
-        # Higher orientation convergence for scripted physical grasping.
-        teleop_ik_orientation_gain = 4.0
+        # Quaternion vector error is sin(angle / 2); 2 gives a unit small-angle step.
+        teleop_ik_orientation_gain = 2.0
         traj_timesteps_default = 1.0
         traj_total_timesteps_default = 1.0e9
         command_mode = "sphere"

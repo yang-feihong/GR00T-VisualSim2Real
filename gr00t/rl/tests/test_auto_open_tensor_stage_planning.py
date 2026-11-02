@@ -235,7 +235,8 @@ def make_fsm(device):
         stage=torch.zeros(3, device=device, dtype=torch.int64),
         stage_steps=torch.zeros(3, device=device, dtype=torch.int64),
         release_stable_steps=torch.ones(3, device=device),
-        release_vertical_delta=torch.tensor([0.01, 0.02, 0.03], device=device),
+        grasp_preclose_height_world=torch.tensor([0.81, 0.92, 1.03], device=device),
+        release_open_target_world=torch.zeros((3, 3), device=device),
         door_normal=torch.tensor([[1.0, 0, 0]], device=device).expand(3, -1),
         release_retreat_target_world=torch.zeros((3, 3), device=device),
     )
@@ -285,13 +286,14 @@ def test_release_and_retreat_install_tensor_banks_without_legacy_installers(devi
     planner.plan_release_open(fsm, state, rows)
     assert fsm.release_open_path.length.tolist() == [36, 0, 36]
     torch.testing.assert_close(
-        fsm.release_open_path.positions[rows, 35, 2], fsm.release_vertical_delta[rows] + 0.001
+        fsm.release_open_path.positions[rows, 35, 2], fsm.grasp_preclose_height_world[rows] + 0.001
     )
+    torch.testing.assert_close(fsm.release_open_target_world[rows, 2], fsm.grasp_preclose_height_world[rows])
     assert fsm.stage.tolist() == [1, 0, 1]
     planner.plan_retreat(fsm, state, rows)
     torch.testing.assert_close(
         fsm.release_retreat_target_world[rows],
-        torch.tensor([[0.1, 0, 0.02]], device=device).expand(2, -1),
+        torch.tensor([[0.1, 0, 0.0]], device=device).expand(2, -1),
     )
     assert fsm.stage.tolist() == [2, 0, 2]
     assert fsm.release_retreat_path.length[rows].min() >= 51
@@ -305,6 +307,30 @@ def test_path_capacity_failure_does_not_truncate(device):
     planner.plan_release_open(fsm, state, torch.tensor([1], device=device))
     assert fsm.release_open_path.length.sum() == 0
     assert any(code == 44 and rows.tolist() == [1] for rows, code in fsm.failed)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_release_restores_absolute_preclose_height_despite_reset_drift(device):
+    planner = Planner(device)
+    fsm, state = make_fsm(device)
+    state["ee_pos"][:, 2] = torch.tensor([0.60, 1.50, 0.20], device=device)
+    planner.gpu_stage_constants["release_delta"][:, 2] = torch.tensor(
+        [0.0, 0.002, -0.001], device=device
+    )
+    planner.plan_release_open(fsm, state, torch.arange(3, device=device))
+    expected = fsm.grasp_preclose_height_world + planner.gpu_stage_constants["release_delta"][:, 2]
+    torch.testing.assert_close(fsm.release_open_target_world[:, 2], expected)
+    torch.testing.assert_close(fsm.release_open_path.positions[:, 35, 2], expected + 0.001)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_release_rejects_missing_preclose_height_instead_of_guessing(device):
+    planner = Planner(device)
+    fsm, state = make_fsm(device)
+    fsm.grasp_preclose_height_world[1] = torch.nan
+    planner.plan_release_open(fsm, state, torch.tensor([1], device=device))
+    assert fsm.release_open_path.length[1] == 0
+    assert fsm.failed[0][1] == 44
 
 
 def test_runtime_has_no_host_materialization_or_controller_access():

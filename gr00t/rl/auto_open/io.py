@@ -161,6 +161,7 @@ def standard_simulation_provenance(args, runner, base_seed):
         "seed_start": int(base_seed),
         "randomization": "DoorSpawner metadata recorded per episode",
         "control_backend": "B2Z1 low-level policy plus AutoOpen FSM",
+        "arm_dynamics": getattr(runner.env, "arm_dynamics", None),
         "rendering": (
             "disabled for audit-only collection"
             if camera_path is None

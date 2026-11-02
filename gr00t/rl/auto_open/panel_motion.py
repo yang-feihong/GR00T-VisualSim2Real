@@ -42,13 +42,17 @@ def fingertip_arc_position(surface, tip_offset, hinge, delta):
 
 
 def hinge_speed_target(
-    hinge, velocity, integral, *, dt, target_speed, kp, ki, integral_limit, max_lead, goal, start
+    hinge, velocity, integral, *, dt, target_speed, kp, ki, integral_limit, max_lead, start,
+    goal=None,
 ):
     """Identical PI/lead calculation for either side of a panel."""
     error = target_speed - velocity
     integral = (integral + error * dt).clamp(-integral_limit, integral_limit)
     lead = (kp * error + ki * integral).clamp(-max_lead, max_lead)
-    target = torch.maximum(torch.minimum(hinge + lead, goal), start - math.radians(2.0))
+    target = hinge + lead
+    if goal is not None:
+        target = torch.minimum(target, goal)
+    target = torch.maximum(target, start - math.radians(2.0))
     return target, integral
 
 
@@ -63,7 +67,6 @@ class PullPanelConfig:
     height_nominal_m: float = 1.0
     height_offsets_m: tuple[float, ...] = (-0.20, -0.15, -0.10, -0.05, 0.0, 0.05, 0.10, 0.15, 0.20)
     station_angle_noise_rad: float = math.radians(5.0)
-    opening_angle_rad: float = math.radians(89.0)
     contact_standoff_m: float = 0.002
     position_tolerance_m: float = 0.004
     hardware_clearance_m: float = 0.01

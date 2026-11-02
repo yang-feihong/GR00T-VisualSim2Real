@@ -201,6 +201,11 @@ def _build_door(
     from pxr import Gf, PhysxSchema, Sdf, UsdGeom, UsdPhysics
 
     from isaaclab.sim.utils import bind_visual_material
+    from gr00t.rl.isaac_utils.playground.env_rand.latch_geometry import (
+        LATCH_MODEL,
+        build_latch_bolt,
+        build_strike_pocket,
+    )
 
     # --- Sample randomized parameters (same distributions as spawn_door) ---
     door_width = np.random.uniform(cfg.door_width[0], cfg.door_width[1])
@@ -485,8 +490,8 @@ def _build_door(
 
     # --- Optional latch ---
     if cfg.build_latch:
-        latch_x = -0.02 + 0.063 * door_open_io
-        latch_edge_inset = 0.0028
+        latch_x = 0.0
+        latch_edge_inset = 0.0
         latch_z = door_handle_height
         latch_link_prim_path = os.path.join(prim_path, "latch_link")
         _create_prim(latch_link_prim_path, "Xform")
@@ -500,20 +505,16 @@ def _build_door(
         _add_rigid_body(stage, latch_link_prim_path)
 
         latch_geom_prim_path = os.path.join(latch_link_prim_path, "latch_geom")
-        _create_prim(latch_geom_prim_path, "Cone")
-        _set_prim_transform(
+        build_latch_bolt(stage, latch_geom_prim_path, door_open_lr, door_open_io)
+        build_strike_pocket(
             stage,
-            latch_geom_prim_path,
-            (0, 0, 0),
-            (-90 * door_open_lr, 0, 26.56 * door_open_lr * door_open_io),
-            (1.0, 1.0, 1.0),
+            left_frame_prim_path if door_open_lr == 1 else right_frame_prim_path,
+            half_door_width,
+            half_wall_length,
+            half_wall_height,
+            door_open_lr,
+            door_handle_height,
         )
-        cone_geom = UsdGeom.Cone.Define(stage, latch_geom_prim_path)
-        cone_geom.GetRadiusAttr().Set(0.025)
-        cone_geom.GetHeightAttr().Set(0.05)
-        cone_geom.GetPurposeAttr().Set("guide")
-        _add_mass(stage, latch_geom_prim_path, mass=0.1)
-        _add_collider(stage, latch_geom_prim_path)
 
         latch_joint_prim_path = os.path.join(panel_prim_path, "latch_joint")
         latch_joint = UsdPhysics.PrismaticJoint.Define(stage, latch_joint_prim_path)
@@ -656,6 +657,7 @@ def _build_door(
         "hingeDriveDamping": float(hinge_drive.GetDampingAttr().Get()),
         "hingeDriveStiffness": float(hinge_drive.GetStiffnessAttr().Get()),
         "handleDriveMaxForce": float(handle_drive.GetMaxForceAttr().Get()),
+        "latchModel": LATCH_MODEL if cfg.build_latch else "none",
     }
     if cfg.add_walls:
         metadata.update({

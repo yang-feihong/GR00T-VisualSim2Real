@@ -1,0 +1,118 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>推拉门 Debug 结果</title><style>body{font-family:system-ui,sans-serif;line-height:1.6;max-width:1080px;margin:24px auto;padding:0 16px;color:#222}video{display:block;max-width:100%;height:auto;margin:12px 0 28px}table{border-collapse:collapse;display:block;overflow:auto}th,td{border:1px solid #bbb;padding:6px 10px;text-align:left}code{overflow-wrap:anywhere}h3{margin-top:28px}</style></head><body><main><h1>推拉门 Debug 结果</h1>
+<h2>本轮结论</h2>
+<p>标准推门、拉门seed1700–1703均使用正式debug入口，四卡六视角，trunk滤波开启，<strong>流程8/8完成，严格8/8通过，无拒收项</strong>。下方八个视频已经全部替换为本轮最终携臂版本，没有追加旧视频。</p>
+<p><strong>整批验收已完成：</strong>最终推门严格871/1000（87.1%）、2166秒（36分06秒），全部1000条逐episode验收报告与修复前完全一致；拉门严格799/1000（79.9%）、3021秒（50分21秒）。拉门比起始参考81.8%低1.9个百分点，按用户允许约80%的可比范围收口，不把79.9%写成80.0%。<a href="auto_open_gpu_batch_status_zh.md">总文档</a>已更新，提交和远程换版状态见<a href="door_baseline_validation_progress_zh.md">台账</a>。</p>
+<table>
+<thead>
+<tr>
+<th>模式</th>
+<th>批次</th>
+<th style="text-align: right;">流程完成</th>
+<th style="text-align: right;">严格通过</th>
+<th style="text-align: right;">采集耗时，不含后续视频拼接</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>推门</td>
+<td>20261103T022754</td>
+<td style="text-align: right;">4/4</td>
+<td style="text-align: right;">4/4</td>
+<td style="text-align: right;">1408秒，23分28秒</td>
+</tr>
+<tr>
+<td>拉门</td>
+<td>20261103T022744</td>
+<td style="text-align: right;">4/4</td>
+<td style="text-align: right;">4/4</td>
+<td style="text-align: right;">1859秒，30分59秒</td>
+</tr>
+</tbody>
+</table>
+<p>八条记录均无异常接触或穿透违规。推门1703本轮不再卡在二次前移，最终门角87.724°且已完整穿门。拉门1702也严格通过，不再因释放末尾连续延续的后部可分离把手接触被拒收；实际安全分类及穿透上限仍保留。</p>
+<p>上表多个debug批次并发，不作为独占四卡canonical的性能基准。两个1000seed已按顺序、各自独占四卡执行，无图像及补图。</p>
+<h2>自主修复边界</h2>
+<p>起点版本拉门穿门时，底盘尚在侧移/转向就把机械臂展开为middle，导致腕部/前臂扫到门框。投影10cm条件按用户定义约束的是假想居中、垂直门框的狗身，不能以修改这个条件或豁免撞框来掩盖问题。</p>
+<p>仅拉门THROUGH增加紧凑携臂：保留入口实际q1，q2–q6目标为<code>[1.45,-0.8,1.1,0,0] rad</code>，先折臂，再从实际机身位姿计算原穿门轨迹；机尾清空门框1m后单向恢复middle。使用已有JOINT接口和GPU张量，不增加在线碰撞搜索，不改底盘路线、10cm放行条件、接触或终末验收。</p>
+<p>该修改先在临时区验证：同一典型1704–1707，原版严格0/4，保持原收臂姿态3/4，紧凑携臂4/4；标准推拉严格8/8后才迁回。454个运行文件与验证源码逐字节一致。推门四条全流程、拉门四条进入THROUGH前的实际状态和控制输出，均与起点记录一致（逐元素1e-6容差）；不是把早期阶段也一起改了。证据在<code>artifacts/door_baseline_validation/runtime_migration_equivalence.json</code>及<code>final_debug_media.json</code>。</p>
+<p>大批次并非穿门零碰撞：拉门穿门首因由360降到23，其中机械臂碰门框19、腿碰门板4。19条中13条在底盘零指令折臂时发生、6条在侧移/转向时发生；原离线统一比例插值没有精确模拟JOINT接口的逐关节独立限速，检查存在缺口。替代q2姿态只有离线结果，未进入当前基线。所有这些碰撞仍严格拒收。详见总文档的剩余问题，不能用八条debug通过掩盖它们。</p>
+<h2>进入穿门的实测</h2>
+<p>固定89°已由门框平面投影间隔≥10cm替代。投影包含门板厚度；机器狗按假想对准门框中心、垂直门框的姿态，使用初始化狗身碰撞包络（含机身、背筐、腿部，不含机械臂）。在线判定、规划预估及数据验收使用共用GPU几何。</p>
+<p>下表读取原始逐帧Parquet。间隔取首个THROUGH行的上一行post-state，门角取首个THROUGH行的pre-state，二者是同一个判定时刻，不拿最终门角代替入口条件。</p>
+<table>
+<thead>
+<tr>
+<th>Seed</th>
+<th style="text-align: right;">推门入口门角</th>
+<th style="text-align: right;">推门投影间隔</th>
+<th style="text-align: right;">拉门入口门角</th>
+<th style="text-align: right;">拉门投影间隔</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>1700</td>
+<td style="text-align: right;">78.550°</td>
+<td style="text-align: right;">10.344cm</td>
+<td style="text-align: right;">150.000°</td>
+<td style="text-align: right;">29.991cm</td>
+</tr>
+<tr>
+<td>1701</td>
+<td style="text-align: right;">81.834°</td>
+<td style="text-align: right;">10.624cm</td>
+<td style="text-align: right;">145.351°</td>
+<td style="text-align: right;">21.568cm</td>
+</tr>
+<tr>
+<td>1702</td>
+<td style="text-align: right;">79.686°</td>
+<td style="text-align: right;">10.266cm</td>
+<td style="text-align: right;">116.192°</td>
+<td style="text-align: right;">24.912cm</td>
+</tr>
+<tr>
+<td>1703</td>
+<td style="text-align: right;">79.642°</td>
+<td style="text-align: right;">10.315cm</td>
+<td style="text-align: right;">139.538°</td>
+<td style="text-align: right;">26.167cm</td>
+</tr>
+</tbody>
+</table>
+<p>拉门进入THROUGH前仍需完成收臂，门会在收臂期间继续转动，所以穿门入口角度不等于触发收臂的角度，也不是仍按89°等待。门角和投影间隔均通过原始记录核实，未修改旧数据或放宽其他验收。</p>
+<p>完整开门离线回归476项通过；动力学、锁舌及资产补充62通过、1跳过。迁回工作区后73项针对性回归再次通过。物理闭环结果以上述新两批为准，不以单测替代闭环。</p>
+<h2>六视角视频</h2>
+<p>本报告只保留本轮八个已完成视频。分辨率1440×720、50fps；推门帧数2194/2056/2319/2205，拉门3575/3419/3570/3512，与控制记录一致。逐视频抽检首/中/后段，画面非空且随时间变化。视频编码未阻塞canonical实验。</p>
+<h3>推门1700</h3>
+<p>全流程完成，严格通过。</p>
+<video controls preload="metadata" width="960" src="../datasets/auto_open/debug/auto_open_debug_push_v1_seeds1700-1703_episodes4_six_camera_20261103T022754/six_camera_mosaics/seed1700_six_camera_mosaic.mp4"></video>
+
+<h3>推门1701</h3>
+<p>全流程完成，严格通过。</p>
+<video controls preload="metadata" width="960" src="../datasets/auto_open/debug/auto_open_debug_push_v1_seeds1700-1703_episodes4_six_camera_20261103T022754/six_camera_mosaics/seed1701_six_camera_mosaic.mp4"></video>
+
+<h3>推门1702</h3>
+<p>全流程完成，严格通过。</p>
+<video controls preload="metadata" width="960" src="../datasets/auto_open/debug/auto_open_debug_push_v1_seeds1700-1703_episodes4_six_camera_20261103T022754/six_camera_mosaics/seed1702_six_camera_mosaic.mp4"></video>
+
+<h3>推门1703</h3>
+<p>全流程完成，严格通过；最终门角87.724°，无需达到旧89°。</p>
+<video controls preload="metadata" width="960" src="../datasets/auto_open/debug/auto_open_debug_push_v1_seeds1700-1703_episodes4_six_camera_20261103T022754/six_camera_mosaics/seed1703_six_camera_mosaic.mp4"></video>
+
+<h3>拉门1700</h3>
+<p>全流程完成，严格通过。</p>
+<video controls preload="metadata" width="960" src="../datasets/auto_open/debug/auto_open_debug_pull_v1_seeds1700-1703_episodes4_six_camera_20261103T022744/six_camera_mosaics/seed1700_six_camera_mosaic.mp4"></video>
+
+<h3>拉门1701</h3>
+<p>全流程完成，严格通过。</p>
+<video controls preload="metadata" width="960" src="../datasets/auto_open/debug/auto_open_debug_pull_v1_seeds1700-1703_episodes4_six_camera_20261103T022744/six_camera_mosaics/seed1701_six_camera_mosaic.mp4"></video>
+
+<h3>拉门1702</h3>
+<p>全流程完成，严格通过。</p>
+<video controls preload="metadata" width="960" src="../datasets/auto_open/debug/auto_open_debug_pull_v1_seeds1700-1703_episodes4_six_camera_20261103T022744/six_camera_mosaics/seed1702_six_camera_mosaic.mp4"></video>
+
+<h3>拉门1703</h3>
+<p>全流程完成，严格通过。</p>
+<video controls preload="metadata" width="960" src="../datasets/auto_open/debug/auto_open_debug_pull_v1_seeds1700-1703_episodes4_six_camera_20261103T022744/six_camera_mosaics/seed1703_six_camera_mosaic.mp4"></video>
+</main></body></html>

@@ -1,149 +1,109 @@
 # AutoOpen 当前版本说明
 
-本文维护共用入口的当前运行方式、核心实现、最近有效整批结果和已知问题，不维护历史修改记录。
+本文只维护当前推门/拉门的统一入口、控制规则、最近完整基线和已知缺口。实验过程与对照记录见[验收台账](door_baseline_validation_progress_zh.md)，不在本文堆叠版本修改记录。
 
-提交版本的`TRUNK_CONTROL_FILTER_ENABLED`默认False，保留无滤波的开门控制语义。本地工作区按要求单独保持True，作为未提交覆盖，不应混同于提交默认配置。当前代码仅关闭滤波的推/拉1700–1703反向对照已完成，分别严格4/4、3/4，全部控制/运动记录及拒收项恢复原提交；证据与视频见[受控审核](door_refactor_controlled_audit_zh.md)。
+## 当前基线
 
-## 抓取任务
+2026-11-03，正式canonical入口，四卡各250个环境，全部1000个请求seed计入分母；无图像、无视频、无补图，保留完整物理与严格数据验收。
 
-外部与背筐抓取共用本入口的debug/canonical/official模式、批量运行及标准阶段/控制架构，分别由`AUTO_OPEN_TASK=pick_external`和`pick_basket`选择，不再有独立采集入口或单环境串行队列。
+| 模式 | Seed闭区间 | 严格通过 | 严格拒收 | FSM流程完成 | 入口总耗时 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 推门 | 1700–2699 | 871/1000，87.1% | 129 | 969/1000 | 2166秒，36分06秒 |
+| 拉门 | 1700–2699 | 799/1000，79.9% | 201 | 945/1000 | 3021秒，50分21秒 |
 
-| 任务 | 最新完整canonical | 严格通过率 | 入口耗时 |
-| --- | --- | --- | --- |
-| 外部抓取 | 四卡，各100环境，seed0–399 | 212/400，53.0% | 1085秒，18分05秒 |
-| 背筐抓取 | 四卡，各100环境，seed0–399 | 313/400，78.25% | 1197秒，19分57秒 |
+成功率指严格数据通过率，不是门打开或流程到达SUCCESS的比例。异常接触、穿透、指令质量或其他验收失败均拒收，不补采后改变分母。
 
-均含初始化失败、无相机、完整5000步预算。代码保留最高已验证成功率版本；失败阶段、主要原因、典型debug视频及推拉门行为/GPU/废代码审核详见[抓取最终报告](pick_final_acceptance_zh.md)，进度记录见[抓取台账](vlnverse_pick_workflow_zh.md)。下方推拉门1000条为最近有效整批记录，新增抓取框架之后只补做了小规模debug及行为等价审查，没有冒充新跑1000条。
+与本轮起始参考81.3%/81.8%、2707/2980秒相比：推门提高5.8个百分点并减少541秒；拉门降低1.9个百分点、增加41秒。按用户允许约80%的可比口径收口；拉门准确数值是79.9%，不是80.0%。没有显著耗时回退。
 
-## 验收口径与结果
+配置边界：本轮debug、上述canonical及配套远程采集使用`TRUNK_CONTROL_FILTER_ENABLED=True`。依照此前要求，Git提交中的该开关默认仍为False，本地工作区保持True；远程使用声明且校验哈希的True配置覆盖。关闭滤波的默认运行不能冒充本文基线。启动前应确认实际开关。
 
-当前含授权trunk滤波的工作区尚未重跑门任务1000seed。最新受控debug为推/拉各1700–1703：原提交严格4/4、3/4；保留授权改动的基线和当前工作区均0/4、3/4，后两者8例25490帧全部原始记录逐位相同。原提交到授权版本的变化已定位到滤波，不能误报为抓取重构回归。完整首分叉、失败明细及内嵌视频见[受控审核](door_refactor_controlled_audit_zh.md)。
+标准debug推门/拉门各1700–1703均严格4/4，共8/8；全部六视角视频已替换到[Debug报告](lab30_door_debug_results_zh.md)及[HTML视频页](lab30_door_debug_results_zh.html)。典型穿门失败1704–1707也严格4/4。小规模不能替代上述两个1000seed。
 
-下表是最近有效1000条整批基线，不是当前含滤波工作区的新通过率，不得用它掩盖当前debug暴露的退步。
+## 严格失败
 
-成功率指严格数据验收通过率，不是开门完成率。异常接触、穿透、控制指令异常或其他验收失败，即使流程到达 SUCCESS，也不计成功。以下均为 canonical 无相机测试，不包含补图耗时；图像不参加这些批次的验收，其他验收保持完整。
+下表按每条数据的首个拒收原因互斥分类，每列合计等于严格拒收数。后续问题不重复计数。
 
-| 模式 | Seed 闭区间 | 严格通过 | 严格失败 | 入口墙钟耗时 |
-|---|---|---:|---:|---:|
-| 推门 | 1700–2699 | 813/1000，81.3% | 187 | 2707 s，45分07秒 |
-| 拉门 | 1700–2699 | 818/1000，81.8% | 182 | 2980 s，49分40秒 |
-| 拉门，独立验证区间 | 4700–5699 | 841/1000，84.1% | 159 | 2975 s，49分35秒 |
+| 首要拒收原因 | 推门 | 拉门 |
+| --- | ---: | ---: |
+| 异常环境接触 | 102 | 130 |
+| 推板门速连续3帧超过30度/秒 | 0 | 30 |
+| 机械臂目标短时往返 | 0 | 15 |
+| GRASP_HANDLE握把超时 | 10 | 9 |
+| APPROACH_HANDLE到位/稳定超时 | 5 | 7 |
+| MOVE_TO_PANEL_STANDOFF逆映射规划失败 | 5 | 1 |
+| 接触穿透超限 | 0 | 4 |
+| 初始开缝q5目标不连续 | 2 | 2 |
+| 底盘指令短时往返 | 2 | 0 |
+| 预抓取路径规划失败 | 2 | 1 |
+| 预抓取无可达pitch | 0 | 1 |
+| OPEN_DOOR_WITH_HANDLE初始开缝超时 | 0 | 1 |
+| INSERT_AROUND_HANDLE插入把手超时 | 1 | 0 |
+| 合计 | 129 | 201 |
 
-每批均为四卡、每卡单进程250个环境，1000个唯一 seed、1000份 metadata 和 shard 验收报告，无采集异常。
+异常接触进一步按首次异常事件阶段拆分，每条数据计一次，不是接触帧数。
 
-上述推门和拉门1700–2699曾在门任务标准接口统一时同一源码快照下完整复验；各自通过seed集合和1000条逐episode验收报告与那次重构前完全一致，耗时分别减少6秒和36秒，结构及功能测试485项通过。这不是本轮抓取框架重构后的新1000条实验。独立4700–5699是该拉门规则的补充验证结果，也不冒充当前含滤波工作区的在线复验。
+| 首次异常阶段 | 推门 | 拉门 |
+| --- | ---: | ---: |
+| APPROACH_HANDLE：靠近把手 | 70 | 70 |
+| WITHDRAW_FROM_HANDLE：松手后回撤 | 9 | 25 |
+| MOVE_TO_PANEL_STANDOFF：前往推板目标 | 10 | 3 |
+| MOVE_TO_PANEL_STATION：首次推板站位 | 7 | 0 |
+| PASS_THROUGH_DOORWAY：穿门 | 3 | 23 |
+| MOVE_TO_PREGRASP：预抓取就位 | 2 | 3 |
+| PUSH_PANEL_OPEN：推门板 | 1 | 5 |
+| FOLLOW_WALL_TO_PANEL：贴门板移动 | 0 | 1 |
+| 合计 | 102 | 130 |
 
-## 严格失败分布
+## 主要缺口
 
-按每条数据的首个拒收原因互斥分类；每列合计等于该批严格失败数。同一条数据的后续问题不会在本表重复计数。
+- 早期接触是剩余主要损失：两种模式各70条APPROACH异常，其中68条夹爪/腕部碰把手、2条碰门框；不是推板阶段撞门。现行规则只按初始夹爪高度区间和前伸量增大靠近距离，不能保证行走动态全程净空。本轮没有继续修改该规则。
+- 回撤异常推门9条、拉门25条，首事件均为腕部碰把手。释放高度恢复与开爪验收通过，不等于整条后撤扫掠绝对无接触；没有放宽接触豁免或将它们算成功。
+- 拉门穿门首要异常23条：机械臂碰门框19条，腿碰门板4条。19条中13条发生在底盘零指令的折臂过程，6条发生在实际侧移/转向；逐关节独立限速不等于关节协调直线插值，终点紧凑不能证明途中也紧凑。相关实际状态分析在`artifacts/door_baseline_validation/pull_remaining_frame_analysis.json`。仍严格拒收，不宣称穿门碰撞全部解决。
+- 拉门推板超速仍有30条作为首因、33条实际运行失败：门速连续3帧超过30度/秒。尖端4度超前是位置目标上限，不是门速硬约束；反馈减小超前也不等于立即制动门板惯性。本轮未修改这项控制或阈值。
+- 机械臂目标短时往返15条继续按指令质量拒收，未放松窗口或阈值；未在本轮完成独立因果归因。
+- 推板规划没有找到满足联合检查的候选，不等于完整六自由度空间绝对无解。推门实际规划失败11条、首因5条；拉门实际2条、首因1条。不能把首因表与运行失败相加。
 
-| 首要拒收原因 | 推门1700–2699 | 拉门1700–2699 | 拉门4700–5699 |
-|---|---:|---:|---:|
-| 异常环境接触 | 78 | 102 | 109 |
-| ADVANCE_TO_NEXT_PUSH_STATION 底盘前进验收超时 | 42 | 0 | 0 |
-| GRASP_HANDLE 握把验收超时 | 36 | 42 | 25 |
-| STOW_ARM_AFTER_PULL 收臂验收超时 | 0 | 12 | 9 |
-| MOVE_TO_PANEL_STANDOFF 规划失败 | 7 | 0 | 0 |
-| OPEN_DOOR_WITH_HANDLE 初始推/拉开缝超时 | 7 | 9 | 7 |
-| 压把手期间底盘移动 | 6 | 3 | 1 |
-| MOVE_TO_PANEL_STATION 底盘对位超时 | 3 | 0 | 0 |
-| 机械臂目标短时往返 | 3 | 11 | 1 |
-| MOVE_TO_PREGRASP 路径规划失败 | 2 | 0 | 5 |
-| 接触穿透超限 | 2 | 1 | 2 |
-| 底盘指令短时往返 | 1 | 2 | 0 |
-| **合计** | **187** | **182** | **159** |
-
-推门78条异常接触的首次事件阶段：APPROACH_HANDLE 58、PASS_THROUGH_DOORWAY 14、FAILURE 5、ADVANCE_TO_NEXT_PUSH_STATION 1。MOVE_TO_PANEL_STANDOFF 阶段异常接触为0。FAILURE表示接触首次记录于失败切换阶段，不应误称为正常工作阶段的碰撞。
-
-异常环境接触进一步按首次异常事件的 FSM 阶段拆分如下。仅统计上表以异常环境接触为首要拒收原因的样本，每条计一次，不是接触帧数或全批所有接触事件数。
-
-| 首次异常接触阶段 | 推门1700–2699 | 拉门1700–2699 | 拉门4700–5699 |
-|---|---:|---:|---:|
-| APPROACH_HANDLE：接近门前站位 | 58 | 58 | 56 |
-| MOVE_TO_PREGRASP：预抓取就位 | 0 | 1 | 2 |
-| WITHDRAW_FROM_HANDLE：松开把手后回撤 | 0 | 30 | 39 |
-| STOW_ARM_AFTER_PULL：拨门/推板后收臂 | 0 | 1 | 1 |
-| MOVE_TO_PANEL_STANDOFF：前往推板目标 | 0 | 10 | 8 |
-| PUSH_PANEL_OPEN：推门板 | 0 | 0 | 3 |
-| ADVANCE_TO_NEXT_PUSH_STATION：推门循环底盘前进 | 1 | 0 | 0 |
-| PASS_THROUGH_DOORWAY：穿门 | 14 | 2 | 0 |
-| FAILURE：失败切换阶段 | 5 | 0 | 0 |
-| **合计** | **78** | **102** | **109** |
-
-## 运行阶段失败
-
-本表只统计 FSM 运行失败，与上表严格数据首因不同，不能相加。某条运行失败的数据可能先因异常接触被拒收；流程完成的数据也可能严格拒收。
-
-| 运行失败原因 | 推门1700–2699 | 拉门1700–2699 | 拉门4700–5699 |
-|---|---:|---:|---:|
-| ADVANCE_TO_NEXT_PUSH_STATION 超时 | 44 | 0 | 0 |
-| GRASP_HANDLE 超时 | 36 | 42 | 25 |
-| MOVE_TO_PANEL_STANDOFF 规划失败 | 7 | 0 | 0 |
-| MOVE_TO_PANEL_STANDOFF 实际到位超时 | 0 | 6 | 5 |
-| STOW_ARM_AFTER_PULL 超时 | 0 | 23 | 11 |
-| OPEN_DOOR_WITH_HANDLE 初始开缝超时 | 7 | 9 | 7 |
-| PUSH_PANEL_OPEN 夹爪接触力超过600 N | 5 | 0 | 0 |
-| MOVE_TO_PANEL_STATION 超时 | 3 | 0 | 0 |
-| MOVE_TO_PREGRASP 路径规划失败 | 2 | 0 | 5 |
-| **合计** | **104** | **80** | **53** |
-
-MOVE_TO_PREGRASP 路径在入口预计算，失败日志中的阶段名为 APPROACH_HANDLE；这里按实际失败任务归类。拉门两批均无 MOVE_TO_PANEL_STANDOFF 规划失败及推门板超速，但仍有实际到位超时，不能把规划成功等同执行成功。
+本次自主修复只作用拉门THROUGH：穿门前折臂并保持紧凑，机尾清空后恢复middle。最初同版拉门46.5%中的穿门首要异常由360降至23；净新增334条严格通过（336条新通过，2条原通过转为腿碰板拒收）。没有新增FSM运行超时，流程完成数仍945/1000。推门修复前后的1000条逐episode验收报告完全一致，不只是通过率相同。备用更小q2姿态仅离线验证，没有混入本基线。
 
 ## 统一入口
 
-分支为 `auto-open`，唯一运行入口为 `gr00t/rl/scripts/run_auto_open.sh`。推门、拉门由 `DOOR_MOTION=push|pull` 选择，与采集模式相互独立。
+分支`auto-open`，唯一入口`gr00t/rl/scripts/run_auto_open.sh`；`DOOR_MOTION=push|pull`选择任务方向，与采集模式独立。
 
 | AUTO_OPEN_MODE | 行为 |
-|---|---|
-| official，默认 | 无相机完整采集 → 严格筛选 → 通过轨迹补双相机 → 严格复验 → 正式发布 |
-| canonical | 无相机完整采集及严格验收，不进入后续图像链路 |
+| --- | --- |
+| official，默认 | 无相机完整采集、严格筛选，通过轨迹补双鱼眼，再严格复验并正式发布 |
+| canonical | 无相机完整采集及严格验收，不进入图像链路 |
 | debug | 六相机完整采集及严格验收，默认输出六视角拼接视频，不正式发布 |
-
-四卡1000 seed无相机测试：
 
 ```bash
 AUTO_OPEN_MODE=canonical DOOR_MOTION=push GPU_IDS=0,1,2,3 \
 SEED_START=1700 SEED_END=2699 bash gr00t/rl/scripts/run_auto_open.sh
 ```
 
-拉门将 `DOOR_MOTION` 改为 `pull`。四 seed 视频诊断使用同一入口，将模式改为 `debug`、区间改为1700–1703。
+拉门改`DOOR_MOTION=pull`；四seed debug改`AUTO_OPEN_MODE=debug SEED_END=1703`。每卡一个Isaac Sim进程、进程内多个独立环境；推门预算4000步，拉门16000步，另有各阶段预算。控制50Hz、物理200Hz。
 
-- 每张 GPU 一个 Isaac Sim 进程，进程内多环境；不固定物理批量为250。
-- 推门默认最多4000控制步，拉门16000步，各阶段另有独立预算。
-- 控制50 Hz，物理200 Hz。阶段进度在运行日志中输出。
-- canonical、debug、正式数据分别位于 `datasets/auto_open/canonical/`、`debug/`、`releases/`。
-- 正式名称为 `auto_open_v1_seeds<start>-<end>_episodes<accepted>_dual_camera_<YYYYMMDD>`；各次采集并列保存，不维护 latest 指针。
-- 正式补图逐帧恢复 canonical 记录的机器人、关节和门状态，不重跑策略、FSM 或物理控制。
+结果位于`datasets/auto_open/{debug,canonical,releases,work}`。正式批次名包含seed区间、实际发布数、相机类型和时间，不维护latest指针。official补图逐帧恢复已记录的机器人/关节/门状态，不重新运行策略或FSM。
 
-## 标准接口
+## 标准编排
 
-所有阶段使用同一套基础工具编排，详见 [标准编排接口](auto_open_standard_interfaces_zh.md)。
+详见[标准接口](auto_open_standard_interfaces_zh.md)。目标来源为直接目标或GPU候选/路径规划；机身执行目标位姿或预计算位姿轨迹，统一进入`base_target`；机械臂使用`arm_pose_target`、`arm_trajectory`、`arm_joint_target`，夹爪使用`gripper_target`。
 
-- 目标来源：直接目标，或GPU批量候选/路径规划；候选选择与逆映射共用标准工具。
-- 机身执行：目标位姿，或预计算位姿轨迹；均进入同一个 `base_target` 跟踪器。
-- 机械臂执行：`arm_pose_target`、`arm_trajectory`、`arm_joint_target`；夹爪使用独立 `gripper_target`。
-- 通用验收：共享机身稳定、机械臂位姿历史稳定、连续帧窗口及逐条件诊断，阶段只组合任务要求与稳定结果。
-- `stage_interfaces.py`声明全部阶段的标准模式；结构测试禁止阶段直接写低层命令。`execution.py`是唯一命令写入层，`TensorCommandBuffers.flush`是唯一环境写入出口。
-- 门速反馈或门角门控只决定目标/轨迹进度，不另设控制模式。控制、规划保持GPU张量，不新增CPU数值求解或逐环境控制路径。
+`stage_interfaces.py`声明阶段模式，`execution.py`是命令写入层，`TensorCommandBuffers.flush`是环境写入出口。通用机身/机械臂稳定窗口共用，阶段组合任务条件，不另建逐环境控制协议。
 
-## 控制流程
-
-推、拉门共享前半段：
+推、拉门共享把手段：
 
 ```text
-APPROACH_HANDLE → MOVE_TO_PREGRASP → OPEN_GRIPPER → INSERT_AROUND_HANDLE → GRASP_HANDLE
-→ PRESS_HANDLE → OPEN_DOOR_WITH_HANDLE → RESET_HANDLE
+APPROACH_HANDLE → MOVE_TO_PREGRASP → OPEN_GRIPPER → INSERT_AROUND_HANDLE
+→ GRASP_HANDLE → PRESS_HANDLE → OPEN_DOOR_WITH_HANDLE → RESET_HANDLE
 → RELEASE_HANDLE → WITHDRAW_FROM_HANDLE → STOW_ARM_AND_CLOSE_GRIPPER
 ```
-
-三个旋转依次绕把手轴、门轴、把手轴；第二段按任务方向前推或后拉。
 
 推门后半段：
 
 ```text
 MOVE_TO_PANEL_STATION → MOVE_TO_PANEL_STANDOFF → PUSH_PANEL_OPEN
-门角不足且超出舒适区：STOW_ARM_AFTER_PUSH → ADVANCE_TO_NEXT_PUSH_STATION → MOVE_TO_PANEL_STANDOFF
-门角足够：收臂 → PASS_THROUGH_DOORWAY → SUCCESS
+角度/投影不足且超出舒适区：STOW_ARM_AFTER_PUSH → ADVANCE_TO_NEXT_PUSH_STATION → MOVE_TO_PANEL_STANDOFF
+投影满足：收臂 → PASS_THROUGH_DOORWAY → SUCCESS
 ```
 
 拉门后半段：
@@ -151,54 +111,54 @@ MOVE_TO_PANEL_STATION → MOVE_TO_PANEL_STANDOFF → PUSH_PANEL_OPEN
 ```text
 MOVE_TO_GAP_STATION → INSERT_INTO_DOOR_GAP → PRY_DOOR_OPEN
 → STOW_ARM_AFTER_PULL → FOLLOW_WALL_TO_PANEL → MOVE_TO_PANEL_STANDOFF → PUSH_PANEL_OPEN
-门角不足：STOW_ARM_AFTER_PULL → FOLLOW_WALL_TO_PANEL → MOVE_TO_PANEL_STANDOFF
-门角足够：收臂 → PASS_THROUGH_DOORWAY → SUCCESS
+投影不足：STOW_ARM_AFTER_PULL → FOLLOW_WALL_TO_PANEL → MOVE_TO_PANEL_STANDOFF
+投影满足：收臂 → PASS_THROUGH_DOORWAY → SUCCESS
 ```
 
-首次拨门要求至少30度；之后复用推板，不重复首次拨门。开门角阈值89度，但达到角度不等于数据成功。PASS_THROUGH_DOORWAY 在本阶段内先对准门框再穿门，不另设拉门对准门框阶段。
+首次拨门至少30度；后续复用推板，不重复首次拨门。PASS_THROUGH_DOORWAY内部连续对准门框并前进，不另设拉门对准门框阶段。
 
-### 底盘与轨迹
+## 主要控制参数
 
-- APPROACH_HANDLE 名义距离0.85 m；夹爪和把手高度区间接近时，按初始实际尖端前伸加2 cm增大距离，只增不减。
-- 统一底盘位置内/外阈值2/10 cm，yaw内/外阈值0.05/0.15 rad，稳定窗口25帧；各阶段保留任务附加条件。
-- 速度命令上限0.4 m/s、0.6 rad/s；非零平移至少0.15 m/s，非零转动至少0.2 rad/s。
-- 底盘预计算轨迹默认线速度上限0.25 m/s、角速度上限0.40 rad/s。逐帧取点，结束后保持终点；不按实际跟踪误差暂停，不在路段交界额外等待。
-- 首次横移的后退20 cm与前往站位属于同一预计算轨迹。当前站位局部采样区域为 x=0.535–0.555 m、y=0.630–0.650 m、yaw=-132至-126度，按门方向镜像映射；32个候选，最多四轮选站。插入目标要求在0.6 m内。
-- FOLLOW_WALL_TO_PANEL 的靠墙前肩先沿墙移动，随后保持到门轴半径；门轴在左/右时半径分别0.40/0.60 m。朝向按 arcsin 几何规则计算，机身宽度额外加20 cm。轨迹预计算不依赖门角，发布点仅在其夹角小于实际门角时前进，索引不后退。
-- PASS_THROUGH_DOORWAY 的终态要求尾部越过门框1 m，同时满足底盘、机械臂、夹爪和门的稳定条件。
+- APPROACH名义站位：到把手抓取中心的门法向距离0.85m；若初始夹爪与把手高度区间间隔小于2cm，按实际夹爪前伸加2cm只增不减。
+- 底盘位置内/外阈值2/10cm，yaw内/外阈值0.05/0.15rad，稳定窗口25帧；各阶段保留任务附加条件。
+- 底盘速度命令上限0.4m/s、0.6rad/s；非零平移至少0.15m/s，非零转动至少0.2rad/s。预计算轨迹上限0.25m/s、0.40rad/s，逐帧取点，末尾保持终点；不按跟踪误差暂停，也不在路段交界额外等待验收。
+- 首次横移：先后退20cm，再前往站位，属于一条预计算轨迹。当前局部采样x=0.535–0.555m、y=0.630–0.650m、yaw=-132至-126度，随门方向镜像；32候选，最多四轮选站。插入目标需在0.6m内。
+- 推门首次站位是一条先侧移对准板面中心、再前进的轨迹，只在末端验收；以首次推点搜索范围中心为参考。后续前移沿固定射线，以旧推点进入参考中心40cm水平半径为停止条件；无交集取射线最近点。前移目标的trunk原点不越过门框，停稳后重新选推点，不把40cm当作所有新推点的硬范围。
+- FOLLOW_WALL_TO_PANEL：靠墙前肩先沿墙走，随后保持到门轴半径；左/右门轴半径0.40/0.60m。yaw按arcsin规则、机身宽度加20cm计算。预计算路径不依赖门角，发布点只在其夹角小于实际门角时前进，索引不后退；到位验收仍要求门板停止旋转。
+- 进入THROUGH：门板含厚度的门框平面投影，与假想居中且垂直门框的狗身碰撞包络间隔至少10cm。狗身含机身/背筐/腿，不含机械臂；在线与数采共用GPU几何，不再固定89度。
+- 拉门THROUGH携臂：保留入口实际q1，q2–q6目标为`[1.45,-0.8,1.1,0,0] rad`，使用现有JOINT接口；实际关节进入0.08rad范围后，从实际机身位姿计算原穿门轨迹。机尾清空1m后单向恢复middle，避免在尾部迟滞边界反复切换目标。
+- THROUGH终态：机尾越框1m，恢复middle并满足机械臂、夹爪、机身和门的稳定条件及原50帧数据保持要求。
+- RELEASE_HANDLE恢复闭爪前记录的实际世界系EE高度，允许误差6mm；WITHDRAW_FROM_HANDLE仅沿原门板法向退10cm，不额外抬高2cm。
 
-### 机械臂与选点
+## 机械臂规划
 
-- 低层 whole-body controller 接收 height-invariant EE 命令，不是上层直接下发关节角。不能把底盘高度变化简单等同世界系目标随之移动。
-- 轨迹在阶段入口调用统一GPU无重力稳态逆映射，路径点批量计算；执行时发布缓存的EE轨迹，不逐帧重新 inverse。
-- MOVE_TO_PREGRASP 使用预计算避把手轨迹；pitch候选及轨迹可行性在入口批量验证。
-- MOVE_TO_PANEL_STANDOFF 共用连续区域生成规则：将门板接触线与当前0.70 m平面工作空间相交，保留板边、距门轴至少20 cm和把手避让要求；每个yaw取10个径向位置。yaw共7个，范围±30度。终点夹爪几何距门板3 cm。
-- 拉门使用0.80–1.20 m、5 cm步长的9个高度，共630候选；保留至少5度有效推弧要求及现行选择次序。
-- 推门使用0.80–1.30 m、5 cm步长的11个高度，共770候选；优先可用推弧，不以至少5度拒绝全部短弧；验证连续到位路径及站立高度裕量，必要时使用通用先旋转第一关节再展开的安全过渡备选。全部仍转换成EE轨迹并检查逆映射精度、关节裕量、整臂门板净空及速度。
-- PUSH_PANEL_OPEN 的超前量定义在夹爪指定尖端，动态上限4度，门速反馈减小超前量；EE位置每周期最多变化3 mm。首次拉门拨门保持夹爪世界系方向固定，不随门板转向。
+低层wholebody接收height-invariant EE指令，不是所有阶段都直接下发关节角；预设关节模式使用独立标准JOINT接口。轨迹入口批量逆映射，执行发布缓存参考，低层跟踪。
 
-## 运行与数据边界
+MOVE_TO_PREGRASP使用预计算避把手路径并批量验证pitch与路径。MOVE_TO_PANEL_STANDOFF推拉共用连续区域生成：门板接触线与0.70m平面工作空间相交，保留板边、距门轴至少20cm、把手避让及关节/精度/整臂净空检查。每yaw取10个径向位置，7个yaw覆盖±30度；拉门9个高度0.80–1.20m，共630候选；推门11个高度0.80–1.30m，共770候选。
 
-控制、策略、物理、候选和轨迹规划使用GPU张量。严格接触审计、数据打包、Parquet/JSON落盘以及视频处理包含CPU工作，因此不称整套采集为纯GPU耗时。
+拉门保留至少5度可用推弧要求。推门优先可用推弧，不以至少5度拒绝全部短弧；验证连续到位路径和站高裕量，必要时使用先旋转第一关节再展开的过渡备选。首次拉门半径外对准使用单点控制，固定方向前伸使用连续轨迹。
 
-单环境、多环境及相机模式共用 TensorDoorFSM。场景随机化和控制数学不依赖rank或环境槽位；但共享GPU PhysX场景跨批量接触求解不能保证逐bit一致。正式补图恢复已记录状态，不依赖重新仿真的跨批量一致性。
+PUSH_PANEL_OPEN超前量定义在指定夹爪尖端，动态上限4度，门速反馈减小超前；EE每周期最多变化3mm。不再把当前门角加超前量截到规划弧段终点。首次拨门时夹爪世界系方向固定，不随门板旋转。
 
-## 当前主要问题
+## GPU与数据边界
 
-- 推门：异常接触78条、BASE_ADVANCE超时42条、握把超时36条是严格失败主体。CONTACT_PANEL仍有7条规划失败，表示当前候选和严格检查未找到可用路径，不代表完整六自由度空间无解。该阶段实际到位超时及异常接触均为0。
-- 拉门：异常接触为主要损失，其次握把与收臂。CONTACT_PANEL候选规划在两批均通过，但实际到位仍有6/5条超时；候选终点合格不能证明整个执行过程合格。
-- 以上是当前结果边界，不以流程完成、离线可行或测试通过替代严格数据验收，也不宣称所有阶段已无回归或无碰撞。
+策略、物理、候选、逆映射、轨迹及FSM核心数学使用GPU批量计算，不新增逐环境CPU数值求解。USD装配、静态元数据、接触审计、数据打包、Parquet/JSON落盘和视频编码包含必要CPU工作，因此不称整个数采耗时为纯GPU。
 
-## 结果证据
+本次携臂修复不增加在线碰撞搜索；离线代理单次门框查询6444对以内。初始化/规划的既有复杂度与携臂无关。相同观测的控制数学保持一致，但GPU PhysX跨批量物理轨迹不保证逐bit一致。official恢复已记录状态，不依赖重跑物理一致。
 
-以下路径均相对仓库根目录。
+完整开门回归476通过，动力学/锁舌/资产补充62通过、1跳过；迁回后73项针对性回归再次通过。主工作区454个运行文件与已验证临时区字节一致，证据在`artifacts/door_baseline_validation/runtime_migration_equivalence.json`。
 
-| 批次 | canonical结果目录 | 汇总证据 |
-|---|---|---|
-| 推门1700–2699 | `datasets/auto_open/canonical/auto_open_v1_seeds1700-2699_canonical_no_camera_20261026T185129` | `acceptance_report.json`、`standard_interfaces_comparison.json`、`workflow_source.json` |
-| 拉门1700–2699 | `datasets/auto_open/canonical/auto_open_v1_seeds1700-2699_canonical_no_camera_20261026T193656` | `acceptance_report.json`、`standard_interfaces_comparison.json`、`workflow_source.json` |
-| 拉门4700–5699 | `datasets/auto_open/canonical/auto_open_v1_seeds4700-5699_canonical_no_camera_20261025T224057` | `acceptance_report.json`、`panel_region_summary.json`、`workflow_source.json` |
+## 证据
 
-推门、拉门同快照回归的源码指纹：`667f2a82db0a3c90a96873eb0c001bfc6881216f2c9e66a53c59f32edc6abf67`。独立拉门区间指纹：`9822a3e747230854bb1b438bef1b2e7fff56b953468ebc4361d8873e46482842`。具体采集快照以各目录的 `workflow_source.json` 为准。
+| 模式 | 当前canonical目录 |
+| --- | --- |
+| 推门 | `datasets/auto_open/canonical/auto_open_v1_seeds1700-2699_canonical_no_camera_20261103T030040` |
+| 拉门 | `datasets/auto_open/canonical/auto_open_v1_seeds1700-2699_canonical_no_camera_20261103T033827` |
 
-验证边界：以上大批次覆盖标准接口重构快照；工作区另外清理了未使用的CPU求解器、旧控制路径并统一格式，这部分以代码测试及静态检查验证，尚未重新运行1000 seed。静态URDF关节上下限及margin与旧模型逐位一致；不能把采集快照指纹视为清理后工作区的指纹。
+各目录含`acceptance_report.json`、`manifest.json`、`workflow_source.json`及全部1000份metadata/shard验收。汇总为`artifacts/door_baseline_validation/final_canonical_summary.json`，推门整批等价核对为`push_canonical_equivalence.json`，拉门增益/退步集合为`pull_canonical_delta.json`。旧入口指纹含绝对源码路径，跨工作区比较另用文件内容校验，不改写原实验来源。
+
+## 抓取与远程采集
+
+外部/背筐抓取复用同一入口、StageSpec编排、控制接口和数据链路，分别选择`AUTO_OPEN_TASK=pick_external|pick_basket`。阶段、场景随机化、成功率/耗时总表和失败分布见[抓取主线说明](pick_gpu_batch_status_zh.md)。最近有效抓取基线为212/400（53.0%）、1085秒，以及313/400（78.25%）、1197秒；共享动力学与资产变更后尚未复测，不冒充本轮新结果。
+
+配套远程采集规划：wholebody3推门从110000起、wholebody4拉门从210000起；每批两卡各100seed，official模式连续执行新seed。使用冻结源码和受控滤波配置覆盖，不跟随本地未提交改动；具体部署状态、版本和健康检查维护在[台账](door_baseline_validation_progress_zh.md)。

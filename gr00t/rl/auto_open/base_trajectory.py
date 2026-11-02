@@ -19,18 +19,26 @@ def wrapped_angle(angle):
     return torch.atan2(angle.sin(), angle.cos())
 
 
-def frame_traversal_waypoints(start, frame_xy, forward, finish, robot_radius, margin_m=0.05):
-    """Align outside the frame, then cross it; no separate FSM stage."""
-    depth = ((frame_xy - start[:, :2]) * forward).sum(-1)
-    depth = torch.maximum(depth, robot_radius + margin_m)
-    retreat_xy = (
-        start[:, :2] + (((frame_xy - start[:, :2]) * forward).sum(-1) - depth)[:, None] * forward
+def panel_station_waypoints(start, line_origin, forward, finish_xy, finish_yaw):
+    """One continuous lateral-then-forward route, with no intermediate acceptance."""
+    longitudinal = ((start[:, :2] - line_origin) * forward).sum(-1)
+    aligned = line_origin + longitudinal[:, None] * forward
+    return torch.stack(
+        (torch.cat((aligned, finish_yaw[:, None]), -1),
+         torch.cat((finish_xy, finish_yaw[:, None]), -1)),
+        dim=1,
     )
+
+
+def frame_traversal_waypoints(start, frame_xy, forward, finish):
+    """Align at the actual entry depth, then cross without a backward segment."""
+    depth = ((frame_xy - start[:, :2]) * forward).sum(-1)
     alignment_xy = frame_xy - depth[:, None] * forward
     heading = torch.atan2(forward[:, 1], forward[:, 0])
+    progress = ((finish[:, :2] - alignment_xy) * forward).sum(-1).clamp_min(0.0)
+    finish = torch.cat((alignment_xy + progress[:, None] * forward, finish[:, 2:3]), -1)
     return torch.stack(
         (
-            torch.cat((retreat_xy, start[:, 2:3]), -1),
             torch.cat((alignment_xy, heading[:, None]), -1),
             finish,
         ),
@@ -98,3 +106,17 @@ class BasePoseTrajectory:
         velocity = torch.where(advance[:, None], velocity, 0.0)
         self.index[rows] = torch.minimum(index + advance.to(torch.int64), self.length[rows] - 1)
         return pose, velocity, complete
+
+    def sample_forward_target(self, rows, target_xy, forward, prefix_steps):
+        """Follow a fixed route, limiting its forward ray to a mutable endpoint."""
+        index = self.index[rows].clone()
+        pose, velocity, _ = self.sample(rows)
+        prefix_done = index >= prefix_steps
+        excess = ((pose[:, :2] - target_xy) * forward).sum(-1)
+        limited = prefix_done & (excess >= 0)
+        pose = pose.clone()
+        pose[:, :2] -= excess.clamp_min(0)[:, None] * forward * prefix_done[:, None]
+        velocity = torch.where(limited[:, None], 0.0, velocity)
+        # Only the geometric endpoint can stop reference progression, not tracking error.
+        self.index[rows] = torch.where(limited, index, self.index[rows])
+        return pose, velocity, prefix_done, limited

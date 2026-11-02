@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 import numpy as np
+from gr00t.rl.auto_open.doorway_clearance import THROUGH_PROJECTION_CLEARANCE_M
 
 from .auto_open_standard import (
     ACTION_NAMES,
@@ -198,6 +199,7 @@ _AUDIT_FIXED_LISTS = {
     "post_handle_finger_contact_forces_world": 6,
     "post_handle_finger_contact_points_world": 6,
     "post_finger_contact_forces_world": 6,
+    "release_separating_handle_contacts": 2,
     "b2_joint_position": 12,
     "b2_joint_velocity": 12,
     "foot_position_world": 12,
@@ -616,8 +618,67 @@ def _short_round_trips(
     return events
 
 
+def _panel_release_contact_frames(episode, stages):
+    """Only inherit an existing push contact until its first separation while stowing."""
+    contact_frames = set()
+    for row in episode.raw_contacts:
+        leaves = {str(row.get(name, "")).rsplit("/", 1)[-1]
+                  for name in ("body_a_path", "body_b_path")}
+        if ("door_panel" in leaves and leaves & {"link06", "gripperMover"}
+                and any(float(row.get(name, 0.0)) != 0.0 for name in
+                        ("max_contact_force", "max_normal_impulse", "max_penetration_depth"))):
+            contact_frames.add(int(row.get("frame_index", -1)))
+    reset = np.asarray(episode.raw_audit.get("arm_reset_dispatched", []), dtype=bool)
+    allowed = set()
+    for frame in range(1, len(stages)):
+        if stages[frame] != "PASS_THROUGH_DOORWAY" or stages[frame - 1] != "PUSH_PANEL_OPEN":
+            continue
+        if frame - 1 not in contact_frames:
+            continue
+        while (frame < len(stages) and stages[frame] == "PASS_THROUGH_DOORWAY"
+               and frame in contact_frames and frame < len(reset) and reset[frame]):
+            allowed.add(frame)
+            frame += 1
+    return allowed
+
+
+def _handle_release_contact_pairs(episode, stages):
+    """Inherit only continuously present, GPU-classified separating rear contacts."""
+    separating = np.asarray(episode.raw_audit.get("release_separating_handle_contacts", []), dtype=bool)
+    if separating.shape != (len(stages), 2):
+        return set()
+    contacts = set()
+    for row in episode.raw_contacts:
+        leaves = {str(row.get(name, "")).rsplit("/", 1)[-1]
+                  for name in ("body_a_path", "body_b_path")}
+        if "door_handle" not in leaves:
+            continue
+        if not any(float(row.get(name, 0.0)) != 0.0 for name in
+                   ("max_contact_force", "max_normal_impulse", "max_penetration_depth")):
+            continue
+        for body in leaves & {"link06", "gripperMover"}:
+            contacts.add((int(row.get("frame_index", -1)), body))
+    allowed = set()
+    for frame in range(1, len(stages)):
+        if stages[frame - 1] != "RELEASE_HANDLE" or stages[frame] != "WITHDRAW_FROM_HANDLE":
+            continue
+        for finger, body in enumerate(("link06", "gripperMover")):
+            if (frame - 1, body) not in contacts or not separating[frame - 1, finger]:
+                continue
+            current = frame
+            while (current < len(stages) and stages[current] == "WITHDRAW_FROM_HANDLE"
+                   and (current, body) in contacts and separating[current, finger]):
+                allowed.add((current, body))
+                current += 1
+    return allowed
+
+
 def _contact_acceptance_summary(episode, stages):
     abnormal = []
+    release_frames = _panel_release_contact_frames(episode, stages)
+    release_contacts = []
+    handle_release_pairs = _handle_release_contact_pairs(episode, stages)
+    handle_release_contacts = []
     penetration_violations = []
     class_maxima = {
         name: {"rows": 0, "max_penetration_m": 0.0} for name in CONTACT_PENETRATION_LIMITS_M
@@ -653,8 +714,13 @@ def _contact_acceptance_summary(episode, stages):
                     }
                 )
         elif "door_handle" in leaves and leaves & {"link06", "gripperMover"}:
-            if stage in HANDLE_CONTACT_STAGES:
+            inherited_rear = any((frame, body) in handle_release_pairs
+                                 for body in leaves & {"link06", "gripperMover"})
+            if stage in HANDLE_CONTACT_STAGES or inherited_rear:
                 contact_class = "gripper_handle"
+                if inherited_rear:
+                    handle_release_contacts.append({"frame": frame, "pair": [leaf_a, leaf_b],
+                                                    "force_n": force, "impulse_ns": impulse})
             else:
                 abnormal.append(
                     {
@@ -667,8 +733,11 @@ def _contact_acceptance_summary(episode, stages):
                     }
                 )
         elif "door_panel" in leaves and leaves & {"link06", "gripperMover"}:
-            if stage in PANEL_CONTACT_STAGES:
+            if stage in PANEL_CONTACT_STAGES or frame in release_frames:
                 contact_class = "gripper_panel"
+                if frame in release_frames:
+                    release_contacts.append({"frame": frame, "pair": [leaf_a, leaf_b],
+                                             "force_n": force, "impulse_ns": impulse})
             else:
                 abnormal.append(
                     {
@@ -715,6 +784,8 @@ def _contact_acceptance_summary(episode, stages):
         "penetration_violations": penetration_violations,
         "class_maxima": class_maxima,
         "penetration_limits_m": dict(CONTACT_PENETRATION_LIMITS_M),
+        "push_to_through_release_contacts": release_contacts,
+        "handle_release_separating_contacts": handle_release_contacts,
     }
 
 
@@ -740,6 +811,7 @@ def _physical_acceptance_reasons(episode, boundary):
         "arm_joint_target_dispatched",
         "autoopen_stage",
         "robot_clear_of_door",
+        "doorway_projection_gap_m",
     )
     missing = [name for name in required if name not in audit]
     if missing:
@@ -763,6 +835,16 @@ def _physical_acceptance_reasons(episode, boundary):
 
     action = np.asarray(episode.action, dtype=np.float32)
     stages = np.asarray(audit["autoopen_stage"], dtype=str)
+    gaps = np.asarray(audit["doorway_projection_gap_m"], dtype=np.float64)
+    through = stages == "PASS_THROUGH_DOORWAY"
+    entries = np.flatnonzero(through & ~np.r_[False, through[:-1]])
+    if gaps.shape != (frames,):
+        reasons.append("invalid_doorway_projection_gap_shape")
+        entries = []
+    for entry in entries:
+        frame = max(int(entry) - 1, 0)
+        if not np.isfinite(gaps[frame]) or gaps[frame] < THROUGH_PROJECTION_CLEARANCE_M:
+            reasons.append(f"through_projection_clearance_below_0.10m:frame={frame},gap={gaps[frame]:.6f}")
     arm_targets = np.asarray(audit["arm_joint_target_dispatched"], dtype=np.float64)
     gripper_dispatched = np.asarray(audit["gripper_target_dispatched"], dtype=np.float64)
     stage2_entries = (
@@ -1126,6 +1208,8 @@ def _episode_acceptance_metrics(episode, boundary, reasons):
             "penetration_limits_m": contact_summary["penetration_limits_m"],
             "abnormal_contact_count": len(contact_summary["abnormal"]),
             "abnormal_contacts": contact_summary["abnormal"],
+            "push_to_through_release_contacts": contact_summary["push_to_through_release_contacts"],
+            "handle_release_separating_contacts": contact_summary["handle_release_separating_contacts"],
             "penetration_violation_count": len(contact_summary["penetration_violations"]),
             "penetration_violations": contact_summary["penetration_violations"],
         },
