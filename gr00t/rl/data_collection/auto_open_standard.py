@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Mapping, Sequence
+from typing import Mapping
 
 import numpy as np
 
@@ -298,7 +298,7 @@ SIX_CAMERA_NAMES = (
 )
 
 
-def camera_streams_for_mode(camera_mode: str):
+def camera_streams_for_mode(camera_mode: str, *, task_kind="door"):
     """Return source names, dataset keys, shapes, and pixel transforms."""
     mode = str(camera_mode)
     if mode == "none":
@@ -329,6 +329,10 @@ def camera_streams_for_mode(camera_mode: str):
             },
         }
     if mode == "six":
+        names = SIX_CAMERA_NAMES if task_kind == "door" else (
+            "base_0_rgb", "left_wrist_0_rgb", "robot_top_diagnostic",
+            "object_side_diagnostic", "object_top_diagnostic", "robot_rear_diagnostic",
+        )
         return {
             name: {
                 "key": f"observation.images.{name}",
@@ -341,13 +345,13 @@ def camera_streams_for_mode(camera_mode: str):
                     (0.0, 0.0, 1.0),
                 ),
             }
-            for name in SIX_CAMERA_NAMES
+            for name in names
         }
     raise ValueError(f"unsupported camera mode: {camera_mode!r}")
 
 
-def transform_collection_images(images: Mapping[str, np.ndarray], camera_mode: str):
-    streams = camera_streams_for_mode(camera_mode)
+def transform_collection_images(images: Mapping[str, np.ndarray], camera_mode: str, *, task_kind="door"):
+    streams = camera_streams_for_mode(camera_mode, task_kind=task_kind)
     if set(images) != set(streams):
         raise ValueError(
             f"camera mode {camera_mode!r} expected {sorted(streams)}, "

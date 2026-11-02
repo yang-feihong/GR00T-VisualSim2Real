@@ -481,11 +481,29 @@ class SimRgbCameraManager:
         if not self.enabled:
             return {}
         env_ids = [int(env_id) for env_id in env_ids]
+        if not env_ids:
+            return {}
+        selected = set(rig_names) if rig_names is not None else None
+        pool_sizes = {
+            int(rig.get("sidecar_pool_size", self.env.num_envs))
+            for name, rig in self.env._rgb_camera_rigs.items()
+            if selected is None or name in selected
+        }
+        if len(pool_sizes) != 1 or min(pool_sizes) < 1:
+            raise RuntimeError(f"RGB camera batch requires one positive pool size: {pool_sizes}")
+        pool_size = next(iter(pool_sizes))
+        groups = {}
         for env_id in env_ids:
-            self._configure_episode_camera(env_id)
-        return self.env.render_stereo_rgb_camera_rigs_batch(
-            env_ids=env_ids, rig_names=rig_names
-        )
+            groups.setdefault(env_id // pool_size, []).append(env_id)
+        images = {}
+        # Reused slots must be rendered and read before another row reconfigures them.
+        for group in groups.values():
+            for env_id in group:
+                self._configure_episode_camera(env_id)
+            images.update(self.env.render_stereo_rgb_camera_rigs_batch(
+                env_ids=group, rig_names=rig_names
+            ))
+        return images
 
     def due_rigs(self, now_wall):
         return [

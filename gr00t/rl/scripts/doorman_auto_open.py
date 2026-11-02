@@ -13,10 +13,8 @@ import os
 import signal
 import sys
 import traceback
-from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
-from typing import Optional, Tuple
 
 if __name__ == "__main__" and os.environ.get("AUTO_OPEN_FIXED_ENTRY") not in {
     "run_auto_open.sh",
@@ -48,6 +46,7 @@ from gr00t.rl.auto_open.cli import (  # noqa: E402
     _parser,
 )
 from gr00t.rl.auto_open.geometry import _resolved_door_prim_path  # noqa: E402
+from gr00t.rl.auto_open.stages import StageSpec  # noqa: E402
 from gr00t.rl.auto_open.target_noise import (  # noqa: E402
     EpisodeTargetNoise,
     SemanticTargetNoiseConfig,
@@ -79,14 +78,6 @@ class Stage(IntEnum):
     PASS_THROUGH_DOORWAY = 17
     SUCCESS = 18
     FAILURE = 19
-
-
-@dataclass(frozen=True)
-class StageSpec:
-    control: str
-    acceptance: str
-    budget_steps: Optional[int]
-    successors: Tuple[Stage, ...]
 
 
 # This is the executable AutoOpen stage graph. DoorController derives timeout
@@ -257,29 +248,10 @@ BASE_HOLD_STAGES = frozenset(
     }
 )
 
-CENTER_HANDLE_CHANNEL_DESIGN_ERROR = 0.008
 GRASP_FIXED_JAW_BALANCE_LIMIT = 0.030
-GRASP_FIXED_JAW_DESIGN_GAP = 0.019
 THROUGH_ENTRY_STABILITY_FRAMES = 10
 THROUGH_ENTRY_UPRIGHT_COS = math.cos(math.radians(10.0))
 PUSH_RETRACT_COMMAND_HOLD_FRAMES = 5
-
-
-def _solve_center_vertical_shift(channel_error, fixed_jaw_gap):
-    """Closest safe vertical shift satisfying channel and grasp travel limits."""
-    error = float(channel_error)
-    gap = max(float(fixed_jaw_gap), 0.0)
-    needed = max(abs(error) - CENTER_HANDLE_CHANNEL_DESIGN_ERROR, 0.0)
-    available = max(GRASP_FIXED_JAW_DESIGN_GAP - gap, 0.0)
-    magnitude = min(needed, available)
-    shift = -math.copysign(magnitude, error) if magnitude > 0.0 else 0.0
-    residual = error + shift
-    return {
-        "shift_m": shift,
-        "predicted_channel_error_m": residual,
-        "predicted_fixed_jaw_gap_m": gap + magnitude,
-        "acceptance_feasible": abs(residual) <= 0.010,
-    }
 
 
 class DoorController:
@@ -330,6 +302,7 @@ class DoorController:
         self.grasp_semantic_position_delta_world = np.zeros(3, dtype=np.float32)
         self.stage = Stage.APPROACH_HANDLE
         self.stage_steps = 0
+        self.stage_specs = STAGE_SPECS
         self.stage_limits = {
             stage: spec.budget_steps
             for stage, spec in STAGE_SPECS.items()
@@ -623,6 +596,9 @@ class DoorController:
 
 
 def main():
+    from gr00t.rl.batch_workflow import bind_rank_parent_lifetime
+
+    bind_rank_parent_lifetime()
     args = _parser().parse_args()
     try:
         args.target_noise_config = SemanticTargetNoiseConfig.from_assignments(args.target_noise)
@@ -630,6 +606,8 @@ def main():
         raise SystemExit(str(exc)) from exc
     if args.max_steps < 1:
         raise SystemExit("--max_steps must be positive")
+    if args.task_kind != "door":
+        args.enable_doorman_scene = False
     _default_paths(args)
     for label, path in (
         ("checkpoint", args.ckpt_path),
@@ -679,8 +657,18 @@ def main():
             f"Cannot write output directory {args.output_dir}: permission denied. "
             f"Use a writable path such as {suggested} or /tmp/doorman_dataset."
         ) from exc
+    if args.task_kind != "door":
+        from gr00t.rl.pick.scene import prepare_shared_rank
+
+        if not prepare_shared_rank(args):
+            return
     simulation_app = launch_app(args)
     try:
+        if args.task_kind != "door":
+            from gr00t.rl.pick.scene import run_shared_rank
+
+            run_shared_rank(args)
+            return
         if args.replay_source_dataset_dir is not None:
             from gr00t.rl.auto_open.replay import run_trajectory_replay
 

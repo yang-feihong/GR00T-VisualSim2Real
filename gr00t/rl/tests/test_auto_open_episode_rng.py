@@ -2,6 +2,7 @@ import sys
 from pathlib import Path
 
 import torch
+import pytest
 
 LOWLEVEL_ROOT = Path(__file__).resolve().parents[1] / "third_party" / "visual_wholebody_lowlevel"
 sys.path.insert(0, str(LOWLEVEL_ROOT))
@@ -10,7 +11,7 @@ from legged_gym.envs.manip_loco.training_doorman_scene import (
     episode_door_side,
 )
 from legged_gym.utils.episode_rng import episode_uniform_rows, stream_seed
-from legged_gym.utils.episode_rng import canonical_env_origins
+from legged_gym.utils.episode_rng import canonical_env_origins, canonical_env_origins_for_seeds
 
 
 def test_episode_uniform_rows_do_not_depend_on_batch_size():
@@ -72,3 +73,31 @@ def test_canonical_origins_are_stable_across_overlapping_shards():
     first = canonical_env_origins(1700, 1000, 3.0)
     second = canonical_env_origins(2200, 1000, 3.0)
     assert torch.equal(first[500:], second[:500])
+
+
+def test_large_seeds_have_bounded_unique_batch_independent_origins():
+    for start in (1000400, 1001130, 2000000000):
+        seeds = list(range(start, start + 200))
+        origins = canonical_env_origins_for_seeds(seeds, 8.0)
+        assert origins[:, :2].abs().max() <= 256.0
+        assert torch.unique(origins, dim=0).shape[0] == 200
+        assert torch.equal(origins, canonical_env_origins(start, 200, 8.0))
+        assert torch.equal(origins[::2], canonical_env_origins_for_seeds(seeds[::2], 8.0))
+        assert torch.equal(origins[35], canonical_env_origins(seeds[35], 1, 8.0)[0])
+
+
+def test_origin_wrapping_does_not_wrap_randomization_seed():
+    seed = 1000400
+    assert torch.equal(
+        canonical_env_origins(seed, 1, 8.0),
+        canonical_env_origins(seed + 2048, 1, 8.0),
+    )
+    for stream in ("robot_init", "door_physics", "door_visual"):
+        assert stream_seed(seed, stream) != stream_seed(seed + 2048, stream)
+
+
+def test_colliding_origin_aliases_are_rejected_within_one_batch():
+    with pytest.raises(ValueError, match="overlapping"):
+        canonical_env_origins_for_seeds([1000400, 1002448], 8.0)
+    with pytest.raises(ValueError, match="overlapping"):
+        canonical_env_origins(1000400, 2049, 8.0)

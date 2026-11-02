@@ -89,6 +89,50 @@ def update_robot_stability(
     return next_steps >= required, next_steps, stable
 
 
+class TensorJointStabilityWindow:
+    """Joint-angle range over complete control-rate windows, without dof_vel spikes."""
+
+    def __init__(self, num_envs, joint_count, device, *, window_size=15, max_span_rad=0.002):
+        self.window_size, self.max_span_rad = window_size, max_span_rad
+        self.positions = torch.zeros(num_envs, window_size, joint_count, device=device)
+        self.count = torch.zeros(num_envs, dtype=torch.int32, device=device)
+
+    def clear(self, rows):
+        self.count[rows] = 0
+
+    def update(self, positions, rows):
+        first = self.count[rows] == 0
+        self.positions[rows[first]] = positions[rows[first], None]
+        self.positions[rows] = torch.roll(self.positions[rows], -1, dims=1)
+        self.positions[rows, -1] = positions[rows]
+        self.count[rows] = (self.count[rows] + 1).clamp_max(self.window_size)
+        span = (self.positions[rows].amax(1) - self.positions[rows].amin(1)).amax(-1)
+        return (self.count[rows] >= self.window_size) & (span < self.max_span_rad), span
+
+
+class TensorContactWindow:
+    """Target contact recency, independent of task stages and instantaneous solver zeros."""
+
+    def __init__(self, num_envs, count, device, *, memory_frames=5, min_force_n=0.3):
+        self.memory_frames, self.min_force_n = memory_frames, min_force_n
+        self.clock = torch.zeros((), dtype=torch.int32, device=device)
+        self.last_seen = torch.full((num_envs, count), -1000000, dtype=torch.int32, device=device)
+        self.last_force = torch.zeros(num_envs, count, device=device)
+        self.last_points = torch.full((num_envs, count, 3), torch.nan, device=device)
+
+    def update(self, forces, points=None):
+        self.clock += 1
+        magnitudes = forces.norm(dim=-1)
+        present = magnitudes > self.min_force_n
+        if points is not None:
+            present &= torch.isfinite(points).all(-1)
+            self.last_points = torch.where(present[..., None], points, self.last_points)
+        self.last_seen = torch.where(present, self.clock, self.last_seen)
+        self.last_force = torch.where(present, magnitudes, self.last_force)
+        age = self.clock - self.last_seen
+        return age <= self.memory_frames, self.last_force, age
+
+
 class TensorStabilityWindow:
     """Device-only equivalent of the legacy 15-frame EE stability deque."""
 
@@ -319,15 +363,39 @@ class StageAcceptanceMixin:
                 )
         return per_env
 
-    def acceptance_diagnostics(self, env_id: int, stage) -> dict:
+    def acceptance_diagnostics_batch(self, stages):
+        """Export all final reports through one packed host boundary, without scalar GPU reads."""
+        from gr00t.rl.auto_open.tensor_metadata import to_host
+
+        snapshot = to_host({"entries": self._acceptance, "visits": self.stage_visit})
+        stages = tuple(stages)
+        return [
+            {
+                stage.name: self.acceptance_diagnostics(row, stage, _snapshot=snapshot)
+                for stage in stages
+            }
+            for row in range(self.num_envs)
+        ]
+
+    def acceptance_diagnostics(self, env_id: int, stage, *, _snapshot=None) -> dict:
         """Return the uniform per-condition report for one stage visit."""
+        entries = self._acceptance if _snapshot is None else _snapshot["entries"]
+        visits = self.stage_visit if _snapshot is None else _snapshot["visits"]
+
+        def scalar(value):
+            return value.item() if torch.is_tensor(value) else value
+
         result = {}
-        for (stage_id, name), entry in self._acceptance.items():
+        for (stage_id, name), entry in entries.items():
+
+            def value(field):
+                return scalar(entry[field][env_id])
+
             if stage_id != int(stage):
                 continue
-            observed = int(entry["observed_stage_step"][env_id].item()) >= 0 and int(
-                entry["observed_stage_visit"][env_id].item()
-            ) == int(self.stage_visit[env_id, stage_id].item())
+            observed = int(value("observed_stage_step")) >= 0 and int(
+                value("observed_stage_visit")
+            ) == int(scalar(visits[env_id][stage_id]))
             if not observed:
                 result[name] = {
                     "observed": False,
@@ -341,32 +409,30 @@ class StageAcceptanceMixin:
                     "window_satisfied": False,
                 }
                 continue
-            min_failed = float(entry["min_failed_value"][env_id].item())
-            max_failed = float(entry["max_failed_value"][env_id].item())
+            min_failed = float(value("min_failed_value"))
+            max_failed = float(value("max_failed_value"))
             result[name] = {
                 "observed": True,
-                "current": bool(entry["current"][env_id].item()),
-                "value": float(entry["value"][env_id].item()),
+                "current": bool(value("current")),
+                "value": float(value("value")),
                 "comparison": entry["comparison"],
-                "threshold": float(entry["threshold"][env_id].item()),
-                "min_value": float(entry["min_value"][env_id].item()),
-                "max_value": float(entry["max_value"][env_id].item()),
+                "threshold": float(value("threshold")),
+                "min_value": float(value("min_value")),
+                "max_value": float(value("max_value")),
                 "min_failed_value": min_failed if math.isfinite(min_failed) else None,
                 "max_failed_value": max_failed if math.isfinite(max_failed) else None,
-                "min_value_step": int(entry["min_value_step"][env_id].item()),
-                "max_value_step": int(entry["max_value_step"][env_id].item()),
-                "min_failed_value_step": int(entry["min_failed_value_step"][env_id].item()),
-                "max_failed_value_step": int(entry["max_failed_value_step"][env_id].item()),
-                "max_failed_streak": int(entry["max_failed_streak"][env_id].item()),
-                "max_failed_streak_end_step": int(
-                    entry["max_failed_streak_end_step"][env_id].item()
-                ),
-                "true_frames": int(entry["true_frames"][env_id].item()),
-                "current_streak": int(entry["streak"][env_id].item()),
-                "max_streak": int(entry["max_streak"][env_id].item()),
-                "sole_blocker_frames": int(entry["sole_blocker_frames"][env_id].item()),
+                "min_value_step": int(value("min_value_step")),
+                "max_value_step": int(value("max_value_step")),
+                "min_failed_value_step": int(value("min_failed_value_step")),
+                "max_failed_value_step": int(value("max_failed_value_step")),
+                "max_failed_streak": int(value("max_failed_streak")),
+                "max_failed_streak_end_step": int(value("max_failed_streak_end_step")),
+                "true_frames": int(value("true_frames")),
+                "current_streak": int(value("streak")),
+                "max_streak": int(value("max_streak")),
+                "sole_blocker_frames": int(value("sole_blocker_frames")),
             }
             if name == "all_conditions":
-                required = int(entry["threshold"][env_id].item())
+                required = int(value("threshold"))
                 result[name]["window_satisfied"] = result[name]["max_streak"] >= required
         return result

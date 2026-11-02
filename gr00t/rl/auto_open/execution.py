@@ -91,8 +91,10 @@ class StageExecutionMixin:
         )
         buffers.arm_joint_mode[rows] = False
 
-    def arm_trajectory(self, rows, path, buffers, *, advance=True):
+    def arm_trajectory(self, rows, path, buffers, *, advance=True, command_offset_world=None):
         position, orientation = path.current(rows, advance=advance)
+        if command_offset_world is not None:
+            position = position + command_offset_world
         self.arm_pose_target(rows, position, orientation, buffers)
 
     def base_target(

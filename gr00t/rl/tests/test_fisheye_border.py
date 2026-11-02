@@ -8,8 +8,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from gr00t.rl.data_collection.fisheye_border import FisheyeBorderAugmenter, STYLES
-
+from gr00t.rl.data_collection.fisheye_border import STYLES, FisheyeBorderAugmenter
 
 SPEC = {
     "projection_type": "opencvFisheye",
@@ -172,6 +171,53 @@ def test_manager_uses_episode_environment_not_reused_render_slot():
     assert manager.camera_spec_for_env("wrist", 7) is a
     manager._episode_specs = {}
     assert manager.camera_spec_for_env("wrist", 71) is a
+
+
+@pytest.mark.parametrize("pool_size", [1, 2, 8])
+def test_camera_batch_never_reconfigures_a_shared_slot_before_reading_images(pool_size):
+    path = Path(__file__).resolve().parents[1] / (
+        "third_party/visual_wholebody_lowlevel/legged_gym/scripts/rgb_camera_debug.py"
+    )
+    module_spec = importlib.util.spec_from_file_location("batch_camera_manager", path)
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    manager = module.SimRgbCameraManager.__new__(module.SimRgbCameraManager)
+    manager.enabled = True
+    rows = [0, 2, 1, 3, 5]
+    manager._episode_specs = {
+        row: [{**SPEC, "name": "wrist", "cx": 100 + row}] for row in rows
+    }
+    manager._configured_env_by_slot = {}
+    active, calls = {}, []
+
+    def configure(specs, env_id):
+        active[env_id % pool_size] = (env_id, specs[0]["cx"])
+
+    def render(env_ids, rig_names):
+        assert rig_names == ["wrist"]
+        assert len({row % pool_size for row in env_ids}) == len(env_ids)
+        calls.append(list(env_ids))
+        images = {}
+        for row in env_ids:
+            owner, cx = active[row % pool_size]
+            assert owner == row
+            images[row] = {"wrist": [np.full((2, 2, 3), cx, np.uint8)]}
+        return images
+
+    manager.env = SimpleNamespace(
+        num_envs=6,
+        _rgb_camera_rigs={"wrist": {"sidecar_pool_size": pool_size}},
+        configure_rgb_camera_specs=configure,
+        render_stereo_rgb_camera_rigs_batch=render,
+    )
+    for _ in range(2):
+        images = manager.render_images_batch(rows, rig_names=["wrist"])
+        assert set(images) == set(rows)
+        for row in rows:
+            assert (images[row]["wrist"][0] == 100 + row).all()
+    assert max(map(len, calls)) <= pool_size
+    assert len(calls) == 2 * len({row // pool_size for row in rows})
+    assert manager.render_images_batch([], rig_names=["wrist"]) == {}
 
 
 @pytest.mark.parametrize("mode", ["dual", "six"])

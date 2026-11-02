@@ -1,0 +1,572 @@
+{
+  "schema": "reviewed_pick_host_boundaries_v1",
+  "entries": [
+    {
+      "file": "auto_open/acceptance.py",
+      "scope": "acceptance_frame_rows",
+      "operation": "tolist",
+      "count": 8,
+      "reason": "debug_trace_or_legacy_scalar_diagnostic_accessor_not_control"
+    },
+    {
+      "file": "auto_open/acceptance.py",
+      "scope": "acceptance_frame_rows",
+      "operation": "cpu",
+      "count": 8,
+      "reason": "debug_trace_or_legacy_scalar_diagnostic_accessor_not_control"
+    },
+    {
+      "file": "auto_open/acceptance.py",
+      "scope": "acceptance_diagnostics.scalar",
+      "operation": "item",
+      "count": 1,
+      "reason": "debug_trace_or_legacy_scalar_diagnostic_accessor_not_control"
+    },
+    {
+      "file": "auto_open/tensor_metadata.py",
+      "scope": "to_host",
+      "operation": "cpu",
+      "count": 1,
+      "reason": "one_bulk_final_metadata_transfer_per_dtype"
+    },
+    {
+      "file": "auto_open/tensor_metadata.py",
+      "scope": "to_host",
+      "operation": "tolist",
+      "count": 1,
+      "reason": "one_bulk_final_metadata_transfer_per_dtype"
+    },
+    {
+      "file": "pick/asset_library.py",
+      "scope": "variant_parameters",
+      "operation": "tolist",
+      "count": 3,
+      "reason": "native_usd_asset_input_and_variant_baking"
+    },
+    {
+      "file": "pick/asset_library.py",
+      "scope": "materialize_variant",
+      "operation": "tolist",
+      "count": 3,
+      "reason": "native_usd_asset_input_and_variant_baking"
+    },
+    {
+      "file": "pick/asset_library.py",
+      "scope": "episode_asset_pool",
+      "operation": "tolist",
+      "count": 2,
+      "reason": "native_usd_asset_input_and_variant_baking"
+    },
+    {
+      "file": "pick/assets.py",
+      "scope": "prepare_mesh_asset",
+      "operation": "tolist",
+      "count": 4,
+      "reason": "native_asset_import"
+    },
+    {
+      "file": "pick/basket_carry.py",
+      "scope": "plan_basket_carry_bank",
+      "operation": "tolist",
+      "count": 7,
+      "reason": "offline_single_environment_inspection_not_stage_dispatch"
+    },
+    {
+      "file": "pick/basket_nudge.py",
+      "scope": "safe_inverse_paths",
+      "operation": "tolist",
+      "count": 13,
+      "reason": "offline_single_environment_inspection_not_stage_dispatch"
+    },
+    {
+      "file": "pick/basket_nudge.py",
+      "scope": "plan_clear_for_nudge",
+      "operation": "tolist",
+      "count": 8,
+      "reason": "offline_single_environment_inspection_not_stage_dispatch"
+    },
+    {
+      "file": "pick/basket_nudge.py",
+      "scope": "shifted_grasp_counts",
+      "operation": "tolist",
+      "count": 2,
+      "reason": "offline_single_environment_inspection_not_stage_dispatch"
+    },
+    {
+      "file": "pick/basket_nudge.py",
+      "scope": "plan_closed_nudge",
+      "operation": "tolist",
+      "count": 15,
+      "reason": "offline_single_environment_inspection_not_stage_dispatch"
+    },
+    {
+      "file": "pick/collection.py",
+      "scope": "prepare_finish",
+      "operation": "cpu",
+      "count": 7,
+      "reason": "bulk_raw_record_output_and_cpu_shard_formatting"
+    },
+    {
+      "file": "pick/collection.py",
+      "scope": "finish",
+      "operation": "tolist",
+      "count": 1,
+      "reason": "bulk_raw_record_output_and_cpu_shard_formatting"
+    },
+    {
+      "file": "pick/contact_geometry_audit.py",
+      "scope": "cartesian_transit_audit",
+      "operation": "tolist",
+      "count": 10,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/contact_geometry_audit.py",
+      "scope": "cartesian_transit_audit",
+      "operation": "cpu",
+      "count": 2,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/contact_geometry_audit.py",
+      "scope": "carry_force_audit",
+      "operation": "tolist",
+      "count": 21,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/contact_geometry_audit.py",
+      "scope": "audit",
+      "operation": "tolist",
+      "count": 4,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/dataset.py",
+      "scope": "write_pick_dataset",
+      "operation": "numpy",
+      "count": 4,
+      "reason": "parquet_output_and_post_capture_data_validation"
+    },
+    {
+      "file": "pick/environment.py",
+      "scope": "_update_rgb_camera_world_poses",
+      "operation": "numpy",
+      "count": 2,
+      "reason": "native_numpy_camera_pose_api"
+    },
+    {
+      "file": "pick/environment.py",
+      "scope": "_update_rgb_camera_world_poses",
+      "operation": "cpu",
+      "count": 2,
+      "reason": "native_numpy_camera_pose_api"
+    },
+    {
+      "file": "pick/gaze.py",
+      "scope": "plan_approach_gaze",
+      "operation": "tolist",
+      "count": 1,
+      "reason": "offline_single_environment_inspection_not_stage_dispatch"
+    },
+    {
+      "file": "pick/gaze.py",
+      "scope": "plan_approach_gaze",
+      "operation": "cpu",
+      "count": 1,
+      "reason": "offline_single_environment_inspection_not_stage_dispatch"
+    },
+    {
+      "file": "pick/grasp_quality.py",
+      "scope": "main",
+      "operation": "tolist",
+      "count": 2,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/grasp_quality.py",
+      "scope": "main",
+      "operation": "cpu",
+      "count": 2,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/inspect_run.py",
+      "scope": "inspect",
+      "operation": "tolist",
+      "count": 18,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/inspect_run.py",
+      "scope": "recorded_stage_metrics",
+      "operation": "tolist",
+      "count": 9,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/inspect_run.py",
+      "scope": "inspect_force_history",
+      "operation": "tolist",
+      "count": 14,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/inspect_run.py",
+      "scope": "inspect_trunk_transform",
+      "operation": "tolist",
+      "count": 11,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/inspect_run.py",
+      "scope": "terminal_inverse_preview",
+      "operation": "tolist",
+      "count": 6,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/inspect_run.py",
+      "scope": "inspect_goal_bounds",
+      "operation": "tolist",
+      "count": 6,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/inspect_run.py",
+      "scope": "inspect_floor_tracking",
+      "operation": "tolist",
+      "count": 2,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/inspect_run.py",
+      "scope": "compare_recorded_runs",
+      "operation": "tolist",
+      "count": 3,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/planning.py",
+      "scope": "retime_grasp_approach",
+      "operation": "tolist",
+      "count": 1,
+      "reason": "offline_single_environment_inspection_not_stage_dispatch"
+    },
+    {
+      "file": "pick/planning.py",
+      "scope": "plan_carry_path",
+      "operation": "item",
+      "count": 1,
+      "reason": "offline_single_environment_inspection_not_stage_dispatch"
+    },
+    {
+      "file": "pick/planning.py",
+      "scope": "plan_carry_path",
+      "operation": "tolist",
+      "count": 1,
+      "reason": "offline_single_environment_inspection_not_stage_dispatch"
+    },
+    {
+      "file": "pick/planning.py",
+      "scope": "plan_carry_path",
+      "operation": "cpu",
+      "count": 1,
+      "reason": "offline_single_environment_inspection_not_stage_dispatch"
+    },
+    {
+      "file": "pick/planning.py",
+      "scope": "plan_grasp",
+      "operation": "tolist",
+      "count": 45,
+      "reason": "offline_single_environment_inspection_not_stage_dispatch"
+    },
+    {
+      "file": "pick/planning.py",
+      "scope": "plan_grasp",
+      "operation": "cpu",
+      "count": 44,
+      "reason": "offline_single_environment_inspection_not_stage_dispatch"
+    },
+    {
+      "file": "pick/planning.py",
+      "scope": "plan_grasp",
+      "operation": "item",
+      "count": 10,
+      "reason": "offline_single_environment_inspection_not_stage_dispatch"
+    },
+    {
+      "file": "pick/probe_approach.py",
+      "scope": "free_roll_reach",
+      "operation": "tolist",
+      "count": 4,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/probe_approach.py",
+      "scope": "main",
+      "operation": "item",
+      "count": 1,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/probe_approach.py",
+      "scope": "main",
+      "operation": "tolist",
+      "count": 6,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/probe_pocket.py",
+      "scope": "main",
+      "operation": "tolist",
+      "count": 8,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/probe_pocket.py",
+      "scope": "main",
+      "operation": "cpu",
+      "count": 8,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/probe_policy.py",
+      "scope": "main",
+      "operation": "tolist",
+      "count": 18,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/probe_policy.py",
+      "scope": "main",
+      "operation": "cpu",
+      "count": 18,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/reach_calibration.py",
+      "scope": "export_robust_measured_commands",
+      "operation": "tolist",
+      "count": 2,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/probe_tracking.py",
+      "scope": "main",
+      "operation": "item",
+      "count": 1,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/probe_tracking.py",
+      "scope": "main",
+      "operation": "tolist",
+      "count": 6,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/probe_tracking.py",
+      "scope": "main",
+      "operation": "cpu",
+      "count": 4,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/probe_workspace.py",
+      "scope": "probe_recorded_wrist_route",
+      "operation": "tolist",
+      "count": 2,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/probe_workspace.py",
+      "scope": "probe_recorded_states",
+      "operation": "tolist",
+      "count": 8,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/probe_workspace.py",
+      "scope": "probe_fresh_station_bank",
+      "operation": "tolist",
+      "count": 11,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/probe_workspace.py",
+      "scope": "probe_recorded_grasp_bank",
+      "operation": "tolist",
+      "count": 7,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/probe_workspace.py",
+      "scope": "probe_recorded_station",
+      "operation": "item",
+      "count": 1,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/probe_workspace.py",
+      "scope": "probe_recorded_station",
+      "operation": "tolist",
+      "count": 7,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/probe_workspace.py",
+      "scope": "probe_recorded_station",
+      "operation": "cpu",
+      "count": 5,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/probe_workspace.py",
+      "scope": "probe_recorded_command",
+      "operation": "tolist",
+      "count": 10,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/probe_workspace.py",
+      "scope": "probe_recorded_command",
+      "operation": "cpu",
+      "count": 2,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/probe_workspace.py",
+      "scope": "main",
+      "operation": "tolist",
+      "count": 2,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/probe_workspace.py",
+      "scope": "main",
+      "operation": "cpu",
+      "count": 2,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/probe_workspace.py",
+      "scope": "main",
+      "operation": "item",
+      "count": 1,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/reach_calibration.py",
+      "scope": "export_measured_commands",
+      "operation": "tolist",
+      "count": 2,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/reach_calibration.py",
+      "scope": "measured_grasp_matches",
+      "operation": "tolist",
+      "count": 10,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/reach_calibration.py",
+      "scope": "fit",
+      "operation": "cpu",
+      "count": 7,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/reach_calibration.py",
+      "scope": "fit",
+      "operation": "tolist",
+      "count": 2,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/reach_calibration.py",
+      "scope": "audit_roots",
+      "operation": "tolist",
+      "count": 2,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/recording.py",
+      "scope": "uniform_camera_streams",
+      "operation": "tolist",
+      "count": 2,
+      "reason": "video_timestamp_and_encoding_output"
+    },
+    {
+      "file": "pick/replay_planning.py",
+      "scope": "main",
+      "operation": "tolist",
+      "count": 4,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/replay_planning.py",
+      "scope": "main",
+      "operation": "cpu",
+      "count": 2,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/scene.py",
+      "scope": "run_shared_rank",
+      "operation": "cpu",
+      "count": 4,
+      "reason": "immutable_model_snapshot_or_image_render_metadata"
+    },
+    {
+      "file": "pick/scene.py",
+      "scope": "run_shared_rank.capture_before",
+      "operation": "tolist",
+      "count": 1,
+      "reason": "immutable_model_snapshot_or_image_render_metadata"
+    },
+    {
+      "file": "pick/scene.py",
+      "scope": "run_shared_rank.capture_before",
+      "operation": "cpu",
+      "count": 1,
+      "reason": "immutable_model_snapshot_or_image_render_metadata"
+    },
+    {
+      "file": "pick/scene_adapter.py",
+      "scope": "main",
+      "operation": "tolist",
+      "count": 5,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/scene_adapter.py",
+      "scope": "main",
+      "operation": "cpu",
+      "count": 7,
+      "reason": "offline_probe_final_report_and_post_loop_stability_history_export_not_control"
+    },
+    {
+      "file": "pick/supported_asset_audit.py",
+      "scope": "stable_pose_bank",
+      "operation": "tolist",
+      "count": 1,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/supported_asset_audit.py",
+      "scope": "audit_asset",
+      "operation": "tolist",
+      "count": 3,
+      "reason": "offline_probe_and_report"
+    },
+    {
+      "file": "pick/supported_asset_audit.py",
+      "scope": "shape_bank_fingerprint",
+      "operation": "numpy",
+      "count": 1,
+      "reason": "offline_probe_and_report"
+    }
+  ]
+}

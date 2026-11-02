@@ -45,6 +45,7 @@ from gr00t.rl.auto_open.utils import as_numpy as _as_np
 from gr00t.rl.envs.door.b2z1_reset_geometry import (
     b2z1_gripper_pose_and_jacobian,
 )
+from gr00t.rl.task_runtime import BatchedTaskLoop
 from gr00t.rl.third_party.visual_wholebody_lowlevel.legged_gym.utils.batch_invariant_math import (
     fixed_norm,
     fixed_normalize,
@@ -333,23 +334,26 @@ def _run_tensor_fsm_loop(
         "standard_complete_s": 0.0,
         "standard_finalize_s": 0.0,
     }
-    step_counts = torch.zeros(num_envs, dtype=torch.int32, device=env.device)
+    batch_loop = BatchedTaskLoop(
+        runner,
+        episode_seeds,
+        max_steps=args.max_steps,
+        success_stage=Stage.SUCCESS,
+        failure_stage=Stage.FAILURE,
+    )
+    step_counts = batch_loop.step_counts
     max_finger_forces = torch.zeros(num_envs, dtype=torch.float32, device=env.device)
     max_hinge_speeds = torch.zeros(num_envs, dtype=torch.float32, device=env.device)
-    first_actions = torch.full(
-        (num_envs, env.num_actions), torch.nan, dtype=torch.float32, device=env.device
-    )
+    first_actions = batch_loop.first_actions
     loop_started = time.monotonic()
     last_progress_stages = _write_stage_progress(args.output_dir, Stage, fsm, 0, 0.0)
     debug_acceptance_rows = [[] for _ in range(num_envs)]
     debug_event_rows = [[] for _ in range(num_envs)]
 
-    for step in range(args.max_steps):
-        active = (fsm.stage != int(Stage.SUCCESS)) & (fsm.stage != int(Stage.FAILURE))
-        if not bool(torch.any(active).item()):
-            break
-        step_counts[active] = step + 1
+    capture_env_ids, capture_root_states, inverse_input_world = [], None, None
 
+    def prepare_tick(device_state, active):
+        nonlocal max_finger_forces
         planning_start = time.perf_counter()
         contact_rows = fsm.contact_plan_requests()
         retract_rows = fsm.push_retract_requests(device_state)
@@ -358,7 +362,15 @@ def _run_tensor_fsm_loop(
         if len(retract_rows):
             planner.plan_push_retract(fsm, device_state, retract_rows)
         timing["planning_s"] += time.perf_counter() - planning_start
+        forces = device_state.get("finger_contact_forces_w")
+        if forces is not None:
+            force = fixed_norm(forces).amax(dim=-1)
+            max_finger_forces = torch.maximum(max_finger_forces, force)
+            fsm.fail(torch.where(active & (force > 600.0))[0], 2)
+        if args.debug_trace:
+            fsm.begin_acceptance_frame()
 
+    def scene_geometry(device_state):
         grasp_rows = torch.where(
             (fsm.stage == int(Stage.INSERT_AROUND_HANDLE)) | (fsm.stage == int(Stage.GRASP_HANDLE))
         )[0]
@@ -391,30 +403,10 @@ def _run_tensor_fsm_loop(
             )
             timing["panel_clearance_backend_s"] += time.perf_counter() - panel_start
 
-        forces = device_state.get("finger_contact_forces_w")
-        if forces is not None:
-            force = fixed_norm(forces).amax(dim=-1)
-            max_finger_forces = torch.maximum(max_finger_forces, force)
-            unsafe = active & (force > 600.0)
-            fsm.fail(torch.where(unsafe)[0], 2)
+        return {"grasp_geometry": grasp_geometry, "finger_clearance": clearance}
 
-        command_start = time.perf_counter()
-        if args.debug_trace:
-            fsm.begin_acceptance_frame()
-            debug_stage_before = fsm.stage.detach().clone()
-        fsm.command(
-            device_state,
-            buffers,
-            grasp_geometry=grasp_geometry,
-            finger_clearance=clearance,
-        )
-        timing["command_s"] += time.perf_counter() - command_start
-        prepare_start = time.perf_counter()
-        buffers.flush(env)
-        env._clip_teleop_targets()
-        env._update_effective_teleop_inputs(force=True)
-        timing["teleop_prepare_s"] += time.perf_counter() - prepare_start
-
+    def capture_before(step, active, device_state):
+        nonlocal capture_env_ids, capture_root_states, inverse_input_world
         capture_env_ids = []
         capture_state_host = None
         capture_root_states = None
@@ -446,11 +438,8 @@ def _run_tensor_fsm_loop(
                 )
             timing["standard_capture_s"] += time.perf_counter() - standard_capture_start
 
-        physics_start = time.perf_counter()
-        result = runner.step_once()
-        timing["policy_physics_s"] += time.perf_counter() - physics_start
-        if step == 0:
-            first_actions[:] = result["low_level_action"]
+    def capture_after(step, active, result):
+        nonlocal max_hinge_speeds
         if standard_collectors:
             standard_complete_start = time.perf_counter()
             contacts_by_env = standard_collectors[0].contact_audit.end_tick_by_env()
@@ -500,43 +489,8 @@ def _run_tensor_fsm_loop(
         hinge_speed = device_state["door_joint_velocity"][:, fsm.hinge_idx].abs()
         max_hinge_speeds = torch.maximum(max_hinge_speeds, hinge_speed)
 
-        grasp_rows = torch.where(
-            (fsm.stage == int(Stage.INSERT_AROUND_HANDLE)) | (fsm.stage == int(Stage.GRASP_HANDLE))
-        )[0]
-        geometry_start = time.perf_counter()
-        grasp_geometry = (
-            _batched_geometry_metrics_gpu(
-                device_state,
-                geometry_cache,
-                grasp_rows,
-                as_numpy=False,
-            )
-            if len(grasp_rows)
-            else None
-        )
-        timing["geometry_gpu_s"] += time.perf_counter() - geometry_start
-        panel_rows = torch.where(
-            (fsm.stage == int(Stage.MOVE_TO_PANEL_STANDOFF))
-            | (fsm.stage == int(Stage.PUSH_PANEL_OPEN))
-            | (fsm.stage == int(Stage.STOW_ARM_AFTER_PUSH))
-            | (fsm.stage == int(Stage.ADVANCE_TO_NEXT_PUSH_STATION))
-        )[0]
-        clearance = torch.full((num_envs,), torch.nan, dtype=torch.float32, device=env.device)
-        if len(panel_rows):
-            clearance[panel_rows] = _batched_panel_finger_clearance_gpu(
-                device_state,
-                geometry_cache,
-                panel_rows,
-                normal_sign=fsm.panel_contact_normal_sign[panel_rows],
-            )
-
-        advance_start = time.perf_counter()
-        events = fsm.advance(
-            device_state,
-            grasp_geometry=grasp_geometry,
-            finger_clearance=clearance,
-        )
-        timing["advance_s"] += time.perf_counter() - advance_start
+    def report_tick(step, debug_stage_before, events):
+        nonlocal last_progress_stages
         if args.debug_trace:
             frame_rows = fsm.acceptance_frame_rows(step)
             for env_id, rows_for_env in enumerate(frame_rows):
@@ -576,20 +530,19 @@ def _run_tensor_fsm_loop(
                 step + 1,
                 time.monotonic() - loop_started,
             )
-        planning_start = time.perf_counter()
-        planner.plan_pregrasp(fsm, device_state, events["pregrasp_plan"])
-        planner.plan_center(fsm, device_state, events["center_plan"])
-        planner.plan_pose_path(fsm, device_state, events["press_handle_plan"])
-        planner.plan_pose_path(fsm, device_state, events["push_pull_plan"])
-        planner.plan_pose_path(fsm, device_state, events["return_handle_plan"])
-        planner.plan_initial_pull_station(fsm, device_state, events["pull_station_plan"])
-        planner.plan_pull_insert(fsm, device_state, events["pull_insert_plan"])
-        planner.plan_pull_open(fsm, device_state, events["pull_open_plan"])
-        planner.plan_release_open(fsm, device_state, events["release_open_plan"])
-        planner.plan_retreat(fsm, device_state, events["retreat_plan"])
-        planner.plan_restore(fsm, device_state, events["restore_plan"])
-        timing["planning_s"] += time.perf_counter() - planning_start
 
+    for step, device_state, events in batch_loop.run_stages(
+        fsm,
+        planner,
+        device_state,
+        buffers,
+        timing=timing,
+        prepare=prepare_tick,
+        geometry=scene_geometry,
+        capture_before=capture_before,
+        capture_after=capture_after,
+        report=report_tick,
+    ):
         if args.pitch_probe_output:
             planned = fsm.arm_align_path.length > 0
             failed = fsm.stage == int(Stage.FAILURE)

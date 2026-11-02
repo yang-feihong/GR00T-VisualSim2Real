@@ -31,32 +31,6 @@ ROBOT_COLLIDER_SPECS = (
 )
 
 
-def _axial_end_margins(axial_min, axial_max, outer_half_length):
-    """Return jaw clearance from the axle-side and free-end handle tips."""
-    return (
-        float(outer_half_length) + float(axial_min),
-        float(outer_half_length) - float(axial_max),
-    )
-
-
-def _axial_target_correction(
-    axial_min,
-    axial_max,
-    outer_half_length,
-    axle_margin,
-    free_margin,
-):
-    """Translate an axial jaw interval into the requested asymmetric margins."""
-    minimum_shift = -float(outer_half_length) + float(axle_margin) - float(axial_min)
-    maximum_shift = float(outer_half_length) - float(free_margin) - float(axial_max)
-    if minimum_shift > maximum_shift:
-        raise ValueError(
-            "gripper axial span cannot fit requested handle margins: "
-            f"minimum_shift={minimum_shift:.6f}, maximum_shift={maximum_shift:.6f}"
-        )
-    return float(np.clip(0.0, minimum_shift, maximum_shift))
-
-
 def _resolved_door_prim_path(env, env_id):
     """Return the scene-owned door root path for one environment."""
     resolver = getattr(env.door, "prim_path_for_env", None)
@@ -135,26 +109,6 @@ def _quat_axis_angle_np(axis, angle):
         ],
         dtype=np.float32,
     )
-
-
-def _quat_align_vectors_np(source, target, base_quat):
-    """Apply the shortest source->target rotation to ``base_quat``."""
-    source = np.asarray(source, dtype=np.float32)
-    target = np.asarray(target, dtype=np.float32)
-    source /= max(float(np.linalg.norm(source)), 1.0e-8)
-    target /= max(float(np.linalg.norm(target)), 1.0e-8)
-    cross = np.cross(source, target)
-    dot = float(np.clip(np.dot(source, target), -1.0, 1.0))
-    if dot < -0.9999:
-        axis = np.cross(source, np.array([1.0, 0.0, 0.0], dtype=np.float32))
-        if np.linalg.norm(axis) < 1.0e-5:
-            axis = np.cross(source, np.array([0.0, 1.0, 0.0], dtype=np.float32))
-        axis /= np.linalg.norm(axis)
-        delta = np.array([0.0, axis[0], axis[1], axis[2]], dtype=np.float32)
-    else:
-        delta = np.array([1.0 + dot, cross[0], cross[1], cross[2]], dtype=np.float32)
-        delta /= max(float(np.linalg.norm(delta)), 1.0e-8)
-    return _quat_mul_np(delta, base_quat)
 
 
 def _matrix_to_quat_np(matrix):
@@ -904,18 +858,6 @@ def _measure_panel_geometry(self):
         )
     except Exception as exc:
         print(f"[doorman][warn] panel collider introspection unavailable: {exc}", flush=True)
-
-
-def _center_handle_axial_overlap(self, metrics):
-    """Length of handle covered by both inner jaw surfaces."""
-    if not metrics.get("valid") or not self.open_template:
-        return -math.inf
-    pocket_axial_error = float(metrics.get("pocket_axial_error", math.inf))
-    jaw_min = pocket_axial_error + float(self.open_template["common_axial_min"])
-    jaw_max = pocket_axial_error + float(self.open_template["common_axial_max"])
-    overlap_min = max(-float(self.handle_half_length), jaw_min)
-    overlap_max = min(float(self.handle_half_length), jaw_max)
-    return max(0.0, overlap_max - overlap_min)
 
 
 def _physical_handle_grasp_position(self, handle_state):

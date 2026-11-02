@@ -1,0 +1,186 @@
+{
+  "enabled": true,
+  "draw_in_viewer": false,
+  "preview_window": false,
+  "preview_scale": 1,
+  "preview_fps": 12.5,
+  "sensor_update_period_s": 0.08,
+  "defaults": {
+    "mode": "mono",
+    "width": 640,
+    "height": 480,
+    "fps": 12.5,
+    "mono_offset": [
+      0,
+      0,
+      0
+    ],
+    "left_offset": [
+      0,
+      0.03,
+      0
+    ],
+    "right_offset": [
+      0,
+      -0.03,
+      0
+    ],
+    "projection_type": "pinhole",
+    "horizontal_fov": 80,
+    "fx": 265.84349,
+    "fy": 270.51708,
+    "cx": 326.60297,
+    "cy": 249.30456,
+    "skew": 0.0,
+    "distortion_coefficients": [
+      -0.245617,
+      -0.024594,
+      0.128775,
+      -0.052686
+    ]
+  },
+  "cameras": [
+    {
+      "name": "base_0_rgb",
+      "enabled": true,
+      "topic_prefix": "/pick/base",
+      "body_name": "base_link",
+      "position": [
+        0.46,
+        0,
+        0.01
+      ],
+      "rotation": [
+        -1.5707963268,
+        0,
+        0
+      ],
+      "projection_type": "opencvFisheye",
+      "fx": 265.84349,
+      "fy": 270.51708,
+      "cx": 326.60297,
+      "cy": 249.30456,
+      "skew": 0.0,
+      "distortion_coefficients": [
+        -0.245617,
+        -0.024594,
+        0.128775,
+        -0.052686
+      ],
+      "valid_circle_mask": {
+        "enabled": true,
+        "center": [
+          320,
+          240
+        ],
+        "radius": 262,
+        "feather": 2
+      }
+    },
+    {
+      "name": "left_wrist_0_rgb",
+      "enabled": true,
+      "topic_prefix": "/pick/wrist",
+      "body_name": "link06",
+      "position": [
+        0.06,
+        0,
+        0.11
+      ],
+      "rotation": [
+        0,
+        0.2443460953,
+        0
+      ],
+      "projection_type": "opencvFisheye",
+      "fx": 265.84349,
+      "fy": 270.51708,
+      "cx": 326.60297,
+      "cy": 249.30456,
+      "skew": 0.0,
+      "distortion_coefficients": [
+        -0.245617,
+        -0.024594,
+        0.128775,
+        -0.052686
+      ],
+      "valid_circle_mask": {
+        "enabled": true,
+        "center": [
+          320,
+          240
+        ],
+        "radius": 262,
+        "feather": 2
+      }
+    },
+    {
+      "name": "robot_top_diagnostic",
+      "randomize_for_collection": false,
+      "enabled": true,
+      "topic_prefix": "/pick/robot_top",
+      "body_name": "base_link",
+      "position": [
+        0,
+        0,
+        0
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "object_side_diagnostic",
+      "randomize_for_collection": false,
+      "enabled": true,
+      "topic_prefix": "/pick/object_side",
+      "body_name": "base_link",
+      "position": [
+        0,
+        0,
+        0
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "object_top_diagnostic",
+      "randomize_for_collection": false,
+      "enabled": true,
+      "topic_prefix": "/pick/object_top",
+      "body_name": "base_link",
+      "position": [
+        0,
+        0,
+        0
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
+    },
+    {
+      "name": "robot_rear_diagnostic",
+      "randomize_for_collection": false,
+      "enabled": true,
+      "topic_prefix": "/pick/robot_rear",
+      "body_name": "base_link",
+      "position": [
+        0,
+        0,
+        0
+      ],
+      "rotation": [
+        0,
+        0,
+        0
+      ]
+    }
+  ]
+}

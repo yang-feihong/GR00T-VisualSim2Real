@@ -63,6 +63,7 @@ from gr00t.rl.auto_open.pull_station import (
     shoulder_wall_curve,
 )
 from gr00t.rl.auto_open.stage_interfaces import stage_interfaces
+from gr00t.rl.auto_open.stages import TensorStageLifecycle, validate_stage_graph
 from gr00t.rl.third_party.visual_wholebody_lowlevel.legged_gym.utils.batch_invariant_math import (
     fixed_dot,
     fixed_norm,
@@ -142,34 +143,13 @@ def _pull_station_history_record(values):
 
 
 def _pull_cycle_uniform(seeds, cycles, candidate_count):
-    """Stateless uint32 keyed streams, evaluated in int64 on the input device.
+    """Keep the existing pull stream bitwise unchanged through the shared GPU RNG."""
+    from gr00t.rl.auto_open.tensor_random import episode_uniform
 
-    Every multiplication is below 2**63, including before the explicit mask.
-    This replaces NumPy PCG draws; it preserves ranges and batch independence,
-    but deliberately does not claim bitwise compatibility with the old stream.
-    """
-    mask = 0xFFFFFFFF
-
-    def mix(value):
-        value = ((value ^ (value >> 16)) * 0x45D9F3B) & mask
-        value = ((value ^ (value >> 16)) * 0x45D9F3B) & mask
-        return (value ^ (value >> 16)) & mask
-
-    attempts = torch.arange(candidate_count, device=seeds.device, dtype=torch.int64)
-    lanes = torch.arange(4, device=seeds.device, dtype=torch.int64)
-    seed_key = mix(seeds & mask) ^ mix(((seeds >> 32) & mask) ^ 0x243F6A88)
-    cycle_key = mix((cycles & mask) ^ 0x6A09E667) ^ mix(((cycles >> 32) & mask) ^ 0x3C6EF372)
-    key = mix(
-        seed_key[:, None, None]
-        ^ cycle_key[:, None, None]
-        ^ mix(attempts[None, :, None] ^ 0x510E527F)
-        ^ mix(lanes[None, None, :] ^ 0x1F83D9AB)
-    )
-    # Use the upper 24 bits so conversion to float32 cannot round up to 1.
-    return (key >> 8).to(torch.float32) * (1.0 / 16777216.0)
+    return episode_uniform(seeds, cycles, candidate_count)
 
 
-class TensorDoorFSM(StageExecutionMixin, StageAcceptanceMixin):
+class TensorDoorFSM(TensorStageLifecycle, StageExecutionMixin, StageAcceptanceMixin):
     """Batched AutoOpen controller whose mutable per-env state is on device."""
 
     def __init__(
@@ -193,6 +173,9 @@ class TensorDoorFSM(StageExecutionMixin, StageAcceptanceMixin):
         self.env = env
         self.pull_door = bool(pull_door)
         self.interfaces = stage_interfaces(stage_enum, pull=self.pull_door)
+        self.stage_specs = getattr(controllers[0], "stage_specs", None)
+        if self.stage_specs is not None:
+            validate_stage_graph(stage_enum, self.stage_specs, self.interfaces)
         self.device = env.device
         self.num_envs = len(controllers)
         device = self.device
@@ -641,42 +624,6 @@ class TensorDoorFSM(StageExecutionMixin, StageAcceptanceMixin):
             return self.control_joint_velocity[rows, joint_ids].abs()
         # Focused unit fixtures may bypass __init__; keep observation passive.
         return torch.zeros_like(state["dof_pos"][rows, joint_ids])
-
-    def mask(self, stage) -> torch.Tensor:
-        return self.stage == int(stage)
-
-    def transition(self, rows: torch.Tensor, stage) -> None:
-        self.stage[rows] = int(stage)
-        self.stage_steps[rows] = 0
-        if hasattr(self, "stage_visit"):
-            self.stage_visit[rows, int(stage)] += 1
-        for (stage_id, _), entry in getattr(self, "_acceptance", {}).items():
-            if stage_id != int(stage):
-                continue
-            entry["current"][rows] = False
-            entry["true_frames"][rows] = 0
-            entry["streak"][rows] = 0
-            entry["max_streak"][rows] = 0
-            entry["sole_blocker_frames"][rows] = 0
-            entry["value"][rows] = torch.nan
-            entry["min_value"][rows] = torch.inf
-            entry["max_value"][rows] = -torch.inf
-            entry["min_failed_value"][rows] = torch.inf
-            entry["max_failed_value"][rows] = -torch.inf
-            entry["min_value_step"][rows] = -1
-            entry["max_value_step"][rows] = -1
-            entry["min_failed_value_step"][rows] = -1
-            entry["max_failed_value_step"][rows] = -1
-            entry["failed_streak"][rows] = 0
-            entry["max_failed_streak"][rows] = 0
-            entry["max_failed_streak_end_step"][rows] = -1
-
-    def fail(self, rows: torch.Tensor, code: int) -> None:
-        if not len(rows):
-            return
-        self.failure_from_stage[rows] = self.stage[rows].to(torch.int16)
-        self.failure_code[rows] = int(code)
-        self.stage[rows] = int(self.Stage.FAILURE)
 
     def command_approach_handle(
         self, state: dict[str, torch.Tensor], buffers: TensorCommandBuffers

@@ -372,6 +372,13 @@ class AutoOpenStandardEpisodeCollector:
 
     def _append_debug_post_state_audit(self, state, state_frame_index):
         """Record the exact t[k+1] state used by FSM acceptance after action k."""
+        for key in (
+            "lowlevel_policy_observation", "lowlevel_policy_action",
+            "physics_substep_dof_pos", "physics_substep_dof_vel",
+            "physics_substep_torque", "physics_substep_position_target",
+        ):
+            if key in state:
+                self.audit[key].append(_numpy(state[key])[0].reshape(-1).copy())
         root = _numpy(state["root_states"])[0]
         dof_pos = _numpy(state["dof_pos"])[0]
         dof_vel = _numpy(state["dof_vel"])[0]

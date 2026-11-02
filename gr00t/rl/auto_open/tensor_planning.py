@@ -17,11 +17,29 @@ from gr00t.rl.auto_open.motion_math import _yaw_from_wxyz
 from gr00t.rl.auto_open.panel_motion import PullPanelConfig
 from gr00t.rl.auto_open.pose_planning import PosePlanningMixin, best_feasible, first_feasible
 from gr00t.rl.auto_open.pull_entry_gpu import PullEntryGPU, quat_rotate
+from gr00t.rl.auto_open.stages import StagePlanningEvents
 from gr00t.rl.auto_open.tensor_stage_planning import GPUStagePlanningMixin
 
 
-class TensorPlanningCoordinator(GPUStagePlanningMixin, PosePlanningMixin):
+class TensorPlanningCoordinator(StagePlanningEvents, GPUStagePlanningMixin, PosePlanningMixin):
     """Generate, solve, and select whole path banks without per-env dispatch."""
+
+    planning_events = {
+        "pregrasp_plan": "plan_pregrasp",
+        "center_plan": "plan_center",
+        "press_handle_plan": "plan_pose_path",
+        "push_pull_plan": "plan_pose_path",
+        "return_handle_plan": "plan_pose_path",
+        "pull_station_plan": "plan_initial_pull_station",
+        "pull_insert_plan": "plan_pull_insert",
+        "pull_open_plan": "plan_pull_open",
+        "release_open_plan": "plan_release_open",
+        "retreat_plan": "plan_retreat",
+        "restore_plan": "plan_restore",
+        # These requests are consumed before command publication on the next tick.
+        "contact_plan": None,
+        "contact_replan": None,
+    }
 
     def __init__(self, controllers, stage_enum):
         self.controllers = controllers

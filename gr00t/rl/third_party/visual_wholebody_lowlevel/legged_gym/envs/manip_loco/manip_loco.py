@@ -8,6 +8,7 @@ from .gripper_control import advance_gripper_actuator_targets
 from typing import Tuple
 from legged_gym.utils.math import orientation_error
 from legged_gym.utils.constrained_ik import batched_constrained_dls_delta
+from legged_gym.utils.trunk_control_filter import TrunkControlFilter
 from legged_gym.utils.batch_invariant_math import (
     fixed_mean,
     fixed_norm,
@@ -179,6 +180,7 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         )
         self.goal_height_follow_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         self.goal_height_follow_override = None
+        self._trunk_control_filter = TrunkControlFilter()
 
         ranges_cfg = self.cfg.goal_ee.ranges
         self.goal_ee_ranges = {
@@ -683,14 +685,18 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         self._clip_teleop_targets()
         self._update_effective_teleop_inputs(force=True)
 
+    def get_gripper_target_contact_sensors(self):
+        """Task hook for the two target-filtered jaw contact sensors."""
+        return getattr(self, "handle_contact_sensors", ())
+
     def _update_gripper_actuator_targets(self):
         """Execute semantic open/close commands with contact-aware holding."""
         finger_forces = torch.zeros(
             self.num_envs, 2, dtype=self.dof_pos.dtype, device=self.device
         )
-        handle_sensors = list(getattr(self, "handle_contact_sensors", []))
-        if len(handle_sensors) == 2:
-            for finger_idx, sensor in enumerate(handle_sensors):
+        target_sensors = list(self.get_gripper_target_contact_sensors())
+        if len(target_sensors) == 2:
+            for finger_idx, sensor in enumerate(target_sensors):
                 force_matrix = getattr(sensor.data, "force_matrix_w", None)
                 if force_matrix is None or force_matrix.shape[1:3] != (1, 1):
                     break
@@ -702,6 +708,7 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
                 self.gripper_actuator_targets,
                 self.gripper_contact_hold_active,
                 finger_forces,
+                **getattr(self, "gripper_control_options", {}),
             )
         )
 
@@ -1057,6 +1064,7 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
 
     def _reset_task_specific_buffers_on_reset(self, env_ids: torch.Tensor):
         """ManipLoco-specific reset hook."""
+        self._trunk_control_filter.reset(env_ids)
         self._resample_goal_height_reference(env_ids, is_init=True)
         self._resample_ee_goal(env_ids, is_init=True)
         self.teleop_arm_joint_limited_targets[env_ids] = self.dof_pos[env_ids][
@@ -1496,6 +1504,20 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         return u.squeeze(-1)
 
 
+    def _get_ik_control_goal(self):
+        goal_position, goal_quat = self.curr_ee_goal_cart_world, self.ee_goal_orn_quat
+        if not self.teleop_mode:
+            return goal_position, goal_quat
+        ground_z = self.get_invariant_goal_reference_origin()[:, 2]
+        position, quat = self._trunk_control_filter.control_target(
+            self.global_steps * float(self.dt), self.robot.data.root_pos_w,
+            self.base_quat, ground_z, goal_position, goal_quat,
+        )
+        if self.uses_goal_height_reference_mask:
+            position = torch.where(self.goal_height_follow_mask[:, None], goal_position, position)
+            quat = torch.where(self.goal_height_follow_mask[:, None], goal_quat, quat)
+        return position, quat
+
     def _get_arm_pos_targets(self) -> torch.Tensor:
         """Arm target generation.
 
@@ -1508,9 +1530,12 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
         if self.ee_pos is None or self.ee_orn is None or self.ee_j_eef is None:
             return self.target_pos[:, self.arm_joint_ids]
 
-        dpos = self.curr_ee_goal_cart_world - self.ee_pos
+        control_goal = self._get_ik_control_goal()
+        if self.teleop_mode and torch.all(self.teleop_arm_joint_control_mask):
+            return self.teleop_arm_joint_pos_targets.clone()
+        dpos = control_goal[0] - self.ee_pos
         ee_orn_norm = fixed_normalize(self.ee_orn, eps=1e-8)
-        drot = orientation_error(self.ee_goal_orn_quat, ee_orn_norm)
+        drot = orientation_error(control_goal[1], ee_orn_norm)
         if self.teleop_mode:
             orientation_gain = float(
                 getattr(self.cfg.goal_ee, "teleop_ik_orientation_gain", 1.0)
@@ -1650,11 +1675,19 @@ class ManipLocoIsaacLab(LeggedRobotIsaacLab):
 
         section_start = time.perf_counter()
         self.robot.set_joint_position_target(pos_targets)
+        self._capture_debug_physics_substep(pos_targets)
         self._profile_record("set_position", time.perf_counter() - section_start)
         
         if self.teleop_mode and self.teleop_debug and int(self.global_steps) % 5 == 0:
             self._draw_ee_goal_curr()        
         self._profile_record("apply_total", time.perf_counter() - profile_start)
+
+    def _capture_debug_physics_substep(self, position_target):
+        trace = getattr(self, "debug_physics_substeps", None)
+        if trace is not None:
+            trace.append(tuple(value.detach().clone() for value in (
+                self.dof_pos, self.dof_vel, self.torques, position_target
+            )))
 
     def _draw_points(self, points_w: torch.Tensor, colors, size: float = 12.0):
         """Draw world-frame points with IsaacSim debug draw."""

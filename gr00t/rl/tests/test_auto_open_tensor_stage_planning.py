@@ -186,20 +186,11 @@ def test_retract_draws_bounds_uniform_volume_and_batch_invariance(device):
 
 @pytest.mark.parametrize("device", DEVICES)
 def test_alignment_opposite_parallel_and_oblique_match_reference(device):
-    from gr00t.rl.auto_open.geometry import _quat_align_vectors_np
-
     source = torch.tensor([[1.0, 0, 0], [0.0, 1, 0], [1.0, 1, 0]], device=device)
     target = torch.tensor([[-1.0, 0, 0], [0.0, 1, 0], [0.0, 0, 1]], device=device)
     q = torch.tensor([[1.0, 0, 0, 0]], device=device).expand(3, -1)
     actual = align_vectors(source, target, q)
-    expected = np.stack(
-        [
-            _quat_align_vectors_np(s, t, b)
-            for s, t, b in zip(
-                source.cpu().numpy().copy(), target.cpu().numpy().copy(), q.cpu().numpy()
-            )
-        ]
-    )
+    expected = np.array([[0, 0, 0, 1], [1, 0, 0, 0], [np.sqrt(0.5), 0.5, -0.5, 0]])
     np.testing.assert_allclose(actual.cpu(), expected, atol=2.0e-7)
 
 

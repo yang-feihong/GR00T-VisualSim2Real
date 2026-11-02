@@ -85,6 +85,8 @@ def _fast_gait_update(*args):
 class LeggedRobotIsaacLab(DirectRLEnv):
     """IsaacLab DirectRLEnv implementation of the legged robot simulator layer."""
     cfg: LeggedRobotIsaacLabCfg
+    copy_environment_source = False
+    reset_policy_history_on_reset = False
 
     def __init__(self, cfg: LeggedRobotIsaacLabCfg, render_mode: str | None = None, **kwargs):
         self._rgb_camera_rigs = {}
@@ -521,7 +523,7 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         if self.cfg.enable_doorman_scene:
             self._terrain.env_origins.copy_(self._canonical_doorman_env_origins)
         self._init_terrain_height_samples()
-        self.scene.clone_environments(copy_from_source=False)
+        self.scene.clone_environments(copy_from_source=self.copy_environment_source)
         if self.cfg.doorman_door_groups:
             grouped_stage = sim_utils.get_current_stage()
             from gr00t.rl.isaac_utils.playground.env_rand.door import (
@@ -560,7 +562,7 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         if not self.cfg.enable_doorman_scene:
             return
 
-        from pxr import Gf, UsdGeom
+        from gr00t.rl.task_runtime import place_environment_origins
 
         episode_seeds = getattr(self.cfg, "doorman_episode_seeds", None)
         if episode_seeds is None:
@@ -578,30 +580,7 @@ class LeggedRobotIsaacLab(DirectRLEnv):
                 device=self.device,
                 dtype=torch.float32,
             )
-        stage = sim_utils.get_current_stage()
-        for env_id, origin in enumerate(origins.cpu().tolist()):
-            prim_path = self.scene.env_prim_paths[env_id]
-            prim = stage.GetPrimAtPath(prim_path)
-            if not prim.IsValid():
-                raise RuntimeError(f"Missing environment prim {prim_path}")
-            xformable = UsdGeom.Xformable(prim)
-            translate_ops = [
-                op
-                for op in xformable.GetOrderedXformOps()
-                if op.GetOpType() == UsdGeom.XformOp.TypeTranslate
-            ]
-            translate_op = (
-                translate_ops[0]
-                if translate_ops
-                else xformable.AddTranslateOp(UsdGeom.XformOp.PrecisionDouble)
-            )
-            translate_op.Set(Gf.Vec3d(*origin))
-
-        # InteractiveScene cloned empty Xforms before task assets were spawned.
-        # Keep its cache and origin bookkeeping aligned for the later asset clone.
-        origin_rows = origins.cpu().tolist()
-        self.scene.cloner._positions = origin_rows
-        self.scene._default_env_origins = origins.clone()
+        place_environment_origins(self.scene, origins)
         self._canonical_doorman_env_origins = origins
 
     def _setup_imported_scene(self):
@@ -2547,6 +2526,7 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         return 1.0 - swing_duration
 
     def _reset_gait_state(self, env_ids):
+        self._idle_gait_cache = None
         self.gait_frequencies[env_ids] = 0.0
         self.gait_transition_active[env_ids] = False
         self.gait_transition_elapsed_s[env_ids] = 0.0
@@ -2757,6 +2737,22 @@ class LeggedRobotIsaacLab(DirectRLEnv):
             | (torch.abs(self.commands[:, :3] - self.gait_frequency_commands) > 1e-6),
             dim=1,
         )
+        idle_cache = getattr(self, "_idle_gait_cache", None)
+        signature = (
+            gait_pattern, tuple(self.cfg.asset.policy_foot_names), self.cfg.rewards.kappa_gait_probs
+        )
+        if idle_cache is not None and idle_cache[0] == signature:
+            idle = (
+                ~command_changed
+                & ~self.gait_transition_active
+                & (self.gait_requested_frequencies == 0)
+                & (self.gait_frequencies == 0)
+                & (self.gait_indices == idle_cache[1])
+                & (self.gait_stance_durations == idle_cache[2])
+            )
+            if torch.all(idle):
+                self._profile_record("gait", time.perf_counter() - profile_start)
+                return
         if torch.any(command_changed):
             requested_frequencies = self._get_gait_frequency_targets()
             self.gait_requested_frequencies[command_changed] = requested_frequencies[command_changed]
@@ -2852,6 +2848,9 @@ class LeggedRobotIsaacLab(DirectRLEnv):
             self._set_fixed_trot_stopped_state(
                 torch.nonzero(fixed_trot_stopped, as_tuple=False).flatten()
             )
+        self._idle_gait_cache = (
+            signature, self.gait_indices.clone(), self.gait_stance_durations.clone()
+        )
         self._profile_record("gait", time.perf_counter() - profile_start)
 
     def _get_gait_frequency_targets(self):
@@ -3052,6 +3051,15 @@ class LeggedRobotIsaacLab(DirectRLEnv):
         """
         return
 
+    def _reset_policy_history(self, env_ids):
+        """A scene reset must not inherit actions or observations from its previous warm-up."""
+        if not self.reset_policy_history_on_reset:
+            return
+        for name in (
+            "actions", "last_actions", "action_history_buf", "obs_history_buf", "last_dof_vel"
+        ):
+            getattr(self, name)[env_ids] = 0
+
     def _reset_idx(self, env_ids: torch.Tensor | None):
         if env_ids is None:
             env_ids = torch.arange(self.num_envs, device=self.device)
@@ -3065,6 +3073,7 @@ class LeggedRobotIsaacLab(DirectRLEnv):
                 self.extras["episode"][f"metric_{name}"] = torch.mean(values[env_ids]) / denom
                 values[env_ids] = 0.0
         super()._reset_idx(env_ids)
+        self._reset_policy_history(env_ids)
         joint_pos = self.default_dof_pos[env_ids].clone()
         joint_vel = torch.zeros_like(joint_pos)
         if self.cfg.enable_doorman_scene and self.cfg.doorman_randomize_robot_init:

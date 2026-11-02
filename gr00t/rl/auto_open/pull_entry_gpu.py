@@ -63,13 +63,6 @@ def _nlerp(a, b, t):
     return F.normalize(a + t[..., None] * (b - a), dim=-1)
 
 
-def _axes(points):
-    """Edge normals of an ordered convex polygon, including zero padding."""
-    delta = points.roll(-1, dims=-2) - points
-    normal = torch.stack((-delta[..., 1], delta[..., 0]), -1)
-    return F.normalize(normal, dim=-1, eps=1e-12)
-
-
 def _halfspaces(offset, rectangle):
     return _polygon_halfspaces(_minkowski_polygon(_ordered(offset), _ordered(rectangle)))
 

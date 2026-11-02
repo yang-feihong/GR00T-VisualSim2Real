@@ -8,6 +8,7 @@ import torch
 
 
 AUTO_OPEN_CANONICAL_ENV_SEED_ANCHOR = 1700
+AUTO_OPEN_CANONICAL_ENV_LATTICE_SIZE = 4096
 AUTO_OPEN_POLICY_BLOCK_SIZE = 256
 
 
@@ -32,7 +33,7 @@ def canonical_env_origins(
     device="cpu",
     dtype=torch.float32,
 ) -> torch.Tensor:
-    """Map every integer episode seed to a unique, batch-independent lattice point."""
+    """Map seeds to bounded, batch-independent origins without changing RNG seeds."""
     num_envs = int(num_envs)
     if num_envs < 1:
         raise ValueError("num_envs must be positive")
@@ -55,7 +56,9 @@ def canonical_env_origins(
     for episode_seed in range(int(base_seed), int(base_seed) + num_envs):
         delta = episode_seed - AUTO_OPEN_CANONICAL_ENV_SEED_ANCHOR
         spiral_index = 2 * delta if delta >= 0 else -2 * delta - 1
-        coordinates.append(spiral_xy(spiral_index))
+        coordinates.append(spiral_xy(spiral_index % AUTO_OPEN_CANONICAL_ENV_LATTICE_SIZE))
+    if len(set(coordinates)) != len(coordinates):
+        raise ValueError("Episode seeds map to overlapping bounded environment origins")
     origins = torch.zeros((num_envs, 3), dtype=torch.float64)
     origins[:, :2] = torch.tensor(coordinates, dtype=torch.float64) * float(env_spacing)
     return origins.to(device=device, dtype=dtype)
@@ -91,7 +94,9 @@ def canonical_env_origins_for_seeds(
     for episode_seed in seeds:
         delta = episode_seed - AUTO_OPEN_CANONICAL_ENV_SEED_ANCHOR
         spiral_index = 2 * delta if delta >= 0 else -2 * delta - 1
-        coordinates.append(spiral_xy(spiral_index))
+        coordinates.append(spiral_xy(spiral_index % AUTO_OPEN_CANONICAL_ENV_LATTICE_SIZE))
+    if len(set(coordinates)) != len(coordinates):
+        raise ValueError("Episode seeds map to overlapping bounded environment origins")
     origins = torch.zeros((len(seeds), 3), dtype=torch.float64)
     origins[:, :2] = torch.tensor(coordinates, dtype=torch.float64) * float(env_spacing)
     return origins.to(device=device, dtype=dtype)

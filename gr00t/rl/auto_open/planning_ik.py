@@ -46,9 +46,10 @@ class _CandidateIKGraph:
             target.copy_(value)
         self.graph.replay()
         outputs = tuple(value.clone() for value in self.outputs)
+        torch._assert_async(
+            ~self.status, "candidate IK linear solve failed during CUDA graph replay"
+        )
         self.done.record(stream)
-        if bool(self.status.item()):
-            raise RuntimeError("candidate IK linear solve failed during CUDA graph replay")
         return outputs
 
 

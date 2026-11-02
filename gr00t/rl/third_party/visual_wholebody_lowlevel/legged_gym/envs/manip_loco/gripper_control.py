@@ -15,6 +15,12 @@ def advance_gripper_actuator_targets(
     free_command_lead: float = 0.080,
     contact_close_step: float = 0.008,
     contact_command_lead: float = 0.024,
+    retain_contact_preload: bool = False,
+    hold_contact_force_threshold: float | None = None,
+    prevent_reopening_while_closing: bool = False,
+    maintain_contact_preload: bool = False,
+    hold_command_lead: float | None = None,
+    bound_contact_preload: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Advance physical jaw targets while preserving semantic commands.
 
@@ -32,6 +38,7 @@ def advance_gripper_actuator_targets(
         raise ValueError("finger_forces must have shape (num_envs, 2)")
 
     next_targets = actuator_targets.clone()
+    preload_lead = contact_command_lead if hold_command_lead is None else hold_command_lead
     next_hold = hold_active.clone()
     closing = torch.all(semantic_targets >= -1.0e-4, dim=1)
     opening = ~closing
@@ -43,11 +50,30 @@ def advance_gripper_actuator_targets(
     unilateral = torch.any(contacts, dim=1) & ~bilateral
 
     newly_latched = closing & bilateral & ~next_hold
-    next_targets[newly_latched] = actual_positions[newly_latched]
+    if retain_contact_preload:
+        retained = torch.minimum(
+            next_targets[newly_latched], actual_positions[newly_latched] + preload_lead
+        )
+        next_targets[newly_latched] = torch.maximum(actual_positions[newly_latched], retained)
+    else:
+        next_targets[newly_latched] = actual_positions[newly_latched]
     next_hold[newly_latched] = True
 
-    lost_contact = closing & next_hold & ~bilateral
+    holding_contact = (
+        bilateral
+        if hold_contact_force_threshold is None
+        else torch.all(finger_forces >= hold_contact_force_threshold, dim=1)
+    )
+    lost_contact = closing & next_hold & ~holding_contact
     next_hold[lost_contact] = False
+    if maintain_contact_preload:
+        held = closing & next_hold
+        preloaded = torch.minimum(actual_positions + preload_lead, semantic_targets)
+        next_targets[held] = (
+            preloaded[held]
+            if bound_contact_preload
+            else torch.maximum(next_targets[held], preloaded[held])
+        )
 
     free_closing = closing & ~next_hold
     if torch.any(free_closing):
@@ -65,4 +91,8 @@ def advance_gripper_actuator_targets(
         advanced = torch.minimum(advanced, semantic_targets)
         next_targets[free_closing] = advanced[free_closing]
 
+    if prevent_reopening_while_closing:
+        next_targets = torch.where(
+            closing[:, None], torch.maximum(next_targets, actuator_targets), next_targets
+        )
     return next_targets, next_hold

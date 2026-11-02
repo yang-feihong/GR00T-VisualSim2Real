@@ -82,13 +82,17 @@ class ManipLoco_Policy:
             print(f"[rgb_camera][warn] RGB camera manager unavailable: {exc}")
 
     def _policy_actions(self, observations):
-        """Run DoorMan inference with one batch shape across all workflows."""
+        """Run seeded collection inference with one batch shape across all tasks."""
         observations = observations.detach()
         real_batch = int(observations.shape[0])
-        if not bool(self.env_cfg.enable_doorman_scene):
+        configured_seeds = getattr(self.env_cfg, "doorman_episode_seeds", None)
+        if not bool(self.env_cfg.enable_doorman_scene) and configured_seeds is None:
             return self.policy(observations, hist_encoding=True)
 
-        explicit_seeds = getattr(self.args, "episode_seeds", None)
+        # Scene admission may remove rejected rows from the requested seed list.
+        explicit_seeds = configured_seeds
+        if explicit_seeds is None:
+            explicit_seeds = getattr(self.args, "episode_seeds", None)
         if explicit_seeds is None:
             episode_seeds = torch.arange(
                 int(self.args.seed),
@@ -481,10 +485,13 @@ class ManipLoco_Policy:
 
     def step_once(self, sleep=False):
         """Run one low-level policy/simulation step and return its action/state."""
+        trace = bool(getattr(self.args, "debug_trace", False))
+        policy_observation = self.obs.detach().clone() if trace else None
         if self.timestamp == 0:
             print("[doorman] first low-level policy inference...", flush=True)
         with torch.no_grad():
             actions = self._policy_actions(self.obs)
+        policy_action = actions.detach().clone() if trace else None
         if self.timestamp == 0:
             print(
                 f"[doorman] first policy action shape={tuple(actions.shape)} "
@@ -492,6 +499,7 @@ class ManipLoco_Policy:
                 flush=True,
             )
             print("[doorman] first Isaac Lab simulation step...", flush=True)
+        self.env.debug_physics_substeps = [] if trace else None
         self.obs, *_ = self.env.step(actions.detach())
         if self.timestamp == 0:
             print("[doorman] first simulation step complete", flush=True)
@@ -504,6 +512,18 @@ class ManipLoco_Policy:
             "rgb_frames": rgb_frames,
             "rgb": next(iter(rgb_frames.values()), None),
         }
+        if trace:
+            # Inputs/outputs of action k accompany the post-step state k+1.
+            result["state"]["lowlevel_policy_observation"] = policy_observation
+            result["state"]["lowlevel_policy_action"] = policy_action
+            if self.env.debug_physics_substeps:
+                for index, key in enumerate((
+                    "physics_substep_dof_pos", "physics_substep_dof_vel",
+                    "physics_substep_torque", "physics_substep_position_target",
+                )):
+                    result["state"][key] = torch.stack(
+                        [values[index] for values in self.env.debug_physics_substeps], dim=1
+                    )
         self.timestamp += 1
         if sleep:
             time.sleep(float(self.env.dt))

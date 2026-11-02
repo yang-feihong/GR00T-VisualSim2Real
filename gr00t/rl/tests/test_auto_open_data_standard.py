@@ -78,6 +78,9 @@ def test_camera_modes_share_one_dynamic_image_contract():
 
 def test_six_camera_debug_mosaic_is_published_per_seed(tmp_path):
     root = tmp_path / "debug"
+    meta = root / "shards/episode-seed1700/meta"
+    meta.mkdir(parents=True)
+    (meta / "info.json").write_text(json.dumps({"task_type": "door"}))
     video_root = root / "shards/episode-seed1700/quarantine/videos"
     streams = camera_streams_for_mode("six")
     for index, stream in enumerate(streams.values()):

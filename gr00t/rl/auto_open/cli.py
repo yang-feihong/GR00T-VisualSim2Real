@@ -26,6 +26,15 @@ DEFAULT_ARM_RETRACT_ROTATION_NOISE_DEG = 1.0
 
 def _parser() -> argparse.ArgumentParser:
     parser = build_common_arg_parser()
+    parser.add_argument(
+        "--task_kind", choices=("door", "pick_external", "pick_basket"), default="door"
+    )
+    parser.add_argument("--pick_episode_manifest", type=Path)
+    parser.add_argument("--pick_scenes_root", type=Path, default=Path("/datasets/vlnverse_scenes"))
+    parser.add_argument("--pick_support", default="any")
+    parser.add_argument("--pick_scene_id")
+    parser.add_argument("--pick_asset")
+    parser.add_argument("--pick_geometry_backend", choices=("native", "packet"), default="native")
     add_app_launcher_args(parser)
     parser.set_defaults(
         num_envs=1,
@@ -238,6 +247,16 @@ def _resolve_runtime_camera_config(
 
     nominal_camera_config = Path(nominal_camera_config)
     nominal_config = json.loads(nominal_camera_config.read_text(encoding="utf-8"))
+    if getattr(args, "task_kind", "door") != "door":
+        from gr00t.rl.data_collection.auto_open_standard import camera_streams_for_mode
+
+        names = camera_streams_for_mode(args.collection_camera_mode, task_kind=args.task_kind)
+        nominal_config["cameras"] = [
+            camera for camera in nominal_config["cameras"] if camera["name"] in names
+        ]
+        nominal_config["sensor_update_period_s"] = 0.02
+        for camera in nominal_config["cameras"]:
+            camera["fps"] = 50
     seeds = (
         [int(seed) for seed in args.episode_seeds]
         if args.episode_seeds is not None
@@ -309,6 +328,8 @@ def _default_paths(args):
                 else "rgb_cameras.json"
             )
         )
+        if getattr(args, "task_kind", "door") != "door":
+            nominal_camera_config = SCRIPT_ROOT / "pick/cameras.json"
         _resolve_runtime_camera_config(
             args,
             nominal_camera_config,

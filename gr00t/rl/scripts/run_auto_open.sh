@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export AUTO_OPEN_ENTRY_STARTED_NS="${AUTO_OPEN_ENTRY_STARTED_NS:-$(date +%s%N)}"
 
-# Sole AutoOpen entry: canonical no-camera collection, strict selection, then
-# camera-only trajectory replay into an official dataset release.
+# Shared door/pick entry: canonical, debug, and official collection.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 ENTRY="${REPO_ROOT}/gr00t/rl/scripts/doorman_auto_open.py"
@@ -20,15 +20,21 @@ if [[ ! -d /workspace/isaaclab ]]; then
     : >"${HOST_LEASE}"
     HOST_OWNER_PID="$$"
     HOST_DOCKER_PID=""
+    HEARTBEAT_PID=""
     host_cleanup() {
         trap - HUP INT TERM EXIT
         rm -f "${HOST_LEASE}"
+        if [[ -n "${HEARTBEAT_PID}" ]]; then
+            kill "${HEARTBEAT_PID}" 2>/dev/null || true
+            wait "${HEARTBEAT_PID}" 2>/dev/null || true
+        fi
         if [[ -n "${HOST_DOCKER_PID}" ]]; then
             kill "${HOST_DOCKER_PID}" 2>/dev/null || true
             wait "${HOST_DOCKER_PID}" 2>/dev/null || true
         fi
     }
-    trap host_cleanup HUP INT TERM EXIT
+    trap host_cleanup EXIT
+    trap 'exit 130' HUP INT TERM
     (
         while kill -0 "${HOST_OWNER_PID}" 2>/dev/null; do
             touch "${HOST_LEASE}"
@@ -38,13 +44,15 @@ if [[ ! -d /workspace/isaaclab ]]; then
     ) &
     HEARTBEAT_PID="$!"
     docker_args=(exec -e "AUTO_OPEN_LAUNCH_LEASE=${CONTAINER_LEASE}")
-    for name in SEED_START SEED_END AUTO_OPEN_MODE DOOR_MOTION GPU_IDS \
-        STOP_AFTER_STAGE MAX_STEPS REPLAY_RENDER_BATCH_SIZE PULL_PANEL_CONTACT_BASELINE; do
+    for name in SEED_START SEED_END DEBUG_SEEDS AUTO_OPEN_MODE AUTO_OPEN_TASK AUTO_OPEN_ENTRY_STARTED_NS DOOR_MOTION GPU_IDS \
+        STOP_AFTER_STAGE MAX_STEPS REPLAY_RENDER_BATCH_SIZE PULL_PANEL_CONTACT_BASELINE \
+        RANK_AFFINITY_MANIFEST PICK_EPISODE_MANIFEST \
+        PICK_GEOMETRY_BACKEND USDC_USE_PREAD; do
         if [[ -v "${name}" ]]; then
             docker_args+=(-e "${name}=${!name}")
         fi
     done
-    docker_args+=("${CONTAINER_NAME}" bash "/workspace/GR00T-VisualSim2Real/gr00t/rl/scripts/run_auto_open.sh")
+    docker_args+=("${CONTAINER_NAME}" bash "/workspace/GR00T-VisualSim2Real/gr00t/rl/scripts/run_auto_open.sh" "$@")
     docker "${docker_args[@]}" &
     HOST_DOCKER_PID="$!"
     status=0
@@ -61,26 +69,56 @@ fi
 # launcher's own checkout first so an isolated worktree cannot mix modules
 # from two source trees.
 export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+cd "${REPO_ROOT}"
+AUTO_OPEN_TASK="${AUTO_OPEN_TASK:-door}"
+if [[ "${1:-}" == --pick-tool ]]; then
+    USD_LIB="/workspace/isaaclab/_isaac_sim/extscache/omni.usd.libs-1.0.1+69cbf6ad.lx64.r.cp311"
+    export PYTHONPATH="${REPO_ROOT}/gr00t/rl/third_party/visual_wholebody_lowlevel:${USD_LIB}:${PYTHONPATH}"
+    export LD_LIBRARY_PATH="${USD_LIB}/bin:${LD_LIBRARY_PATH:-}"
+    export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+    exec /workspace/isaaclab/_isaac_sim/python.sh -m gr00t.rl.pick.entry "$@"
+fi
 GPU_IDS_CSV="${GPU_IDS:-0,1,2,3}"
 REPLAY_RENDER_BATCH_SIZE="${REPLAY_RENDER_BATCH_SIZE:-8}"
 AUTO_OPEN_MODE="${AUTO_OPEN_MODE:-official}"
 DOOR_MOTION="${DOOR_MOTION:-push}"
+if [[ "${AUTO_OPEN_TASK}" != door && "${AUTO_OPEN_TASK}" != pick_external && "${AUTO_OPEN_TASK}" != pick_basket ]]; then
+    echo "AUTO_OPEN_TASK must be door, pick_external, or pick_basket." >&2
+    exit 2
+fi
+if [[ "${AUTO_OPEN_TASK}" != door ]]; then
+    # Heterogeneous room layers can exceed Linux's per-process mmap count.
+    export USDC_USE_PREAD="${USDC_USE_PREAD:-1}"
+    echo "[workflow] USD asset I/O: USDC_USE_PREAD=${USDC_USE_PREAD}"
+fi
+FULL_TERMINAL_STAGE=PASS_THROUGH_DOORWAY
+TASK_LABEL="${DOOR_MOTION}"
+if [[ "${AUTO_OPEN_TASK}" != door ]]; then
+    FULL_TERMINAL_STAGE=SUCCESS
+    TASK_LABEL="${AUTO_OPEN_TASK}"
+fi
 PULL_PANEL_CONTACT_BASELINE="${PULL_PANEL_CONTACT_BASELINE:-trunk_front_minus10}"
-if [[ "${DOOR_MOTION}" == pull ]]; then
+if [[ "${AUTO_OPEN_TASK}" != door ]]; then
+    MAX_STEPS="${MAX_STEPS:-5000}"
+elif [[ "${DOOR_MOTION}" == pull ]]; then
     MAX_STEPS="${MAX_STEPS:-16000}"
 else
     MAX_STEPS="${MAX_STEPS:-4000}"
 fi
 if [[ -z "${STOP_AFTER_STAGE:-}" ]]; then
-    STOP_AFTER_STAGE=PASS_THROUGH_DOORWAY
+    STOP_AFTER_STAGE="${FULL_TERMINAL_STAGE}"
 fi
 FORMAL_DATA_ROOT="${REPO_ROOT}/datasets/auto_open"
+if [[ "${AUTO_OPEN_TASK}" != door ]]; then FORMAL_DATA_ROOT="${REPO_ROOT}/datasets/pick"; fi
 RELEASE_VERSION="v1"
 RELEASE_STAMP="$(date +%Y%m%dT%H%M%S)"
 
 source_fingerprint() {
     find \
         "${REPO_ROOT}/gr00t/rl/auto_open" \
+        "${REPO_ROOT}/gr00t/rl/task_runtime.py" \
+        "${REPO_ROOT}/gr00t/rl/batch_workflow.py" \
+        "${REPO_ROOT}/gr00t/rl/pick" \
         "${REPO_ROOT}/gr00t/rl/data_collection" \
         "${REPO_ROOT}/gr00t/rl/isaac_utils/playground/env_rand/door.py" \
         "${REPO_ROOT}/gr00t/rl/scripts/doorman_auto_open.py" \
@@ -132,10 +170,14 @@ if [[ "${DOOR_MOTION}" != push && "${DOOR_MOTION}" != pull ]]; then
     echo "DOOR_MOTION must be push or pull." >&2
     exit 2
 fi
-if [[ "${STOP_AFTER_STAGE}" != PASS_THROUGH_DOORWAY && "${STOP_AFTER_STAGE}" != STOW_ARM_AND_CLOSE_GRIPPER \
+if [[ "${AUTO_OPEN_TASK}" == door && "${STOP_AFTER_STAGE}" != PASS_THROUGH_DOORWAY && "${STOP_AFTER_STAGE}" != STOW_ARM_AND_CLOSE_GRIPPER \
       && "${STOP_AFTER_STAGE}" != MOVE_TO_GAP_STATION && "${STOP_AFTER_STAGE}" != INSERT_INTO_DOOR_GAP \
       && "${STOP_AFTER_STAGE}" != PRY_DOOR_OPEN && "${STOP_AFTER_STAGE}" != FOLLOW_WALL_TO_PANEL ]]; then
     echo "STOP_AFTER_STAGE must be PASS_THROUGH_DOORWAY, STOW_ARM_AND_CLOSE_GRIPPER, MOVE_TO_GAP_STATION, INSERT_INTO_DOOR_GAP, PRY_DOOR_OPEN, or FOLLOW_WALL_TO_PANEL." >&2
+    exit 2
+fi
+if [[ "${AUTO_OPEN_TASK}" != door && "${STOP_AFTER_STAGE}" != SUCCESS ]]; then
+    echo "Pick collection requires STOP_AFTER_STAGE=SUCCESS." >&2
     exit 2
 fi
 if [[ "${DOOR_MOTION}" == push && ( "${STOP_AFTER_STAGE}" == MOVE_TO_GAP_STATION \
@@ -145,7 +187,7 @@ if [[ "${DOOR_MOTION}" == push && ( "${STOP_AFTER_STAGE}" == MOVE_TO_GAP_STATION
     echo "Gap-station, gap-insertion, prying, and wall-following terminal stages require DOOR_MOTION=pull." >&2
     exit 2
 fi
-if [[ "${AUTO_OPEN_MODE}" == official && "${STOP_AFTER_STAGE}" != PASS_THROUGH_DOORWAY ]]; then
+if [[ "${AUTO_OPEN_MODE}" == official && "${STOP_AFTER_STAGE}" != "${FULL_TERMINAL_STAGE}" ]]; then
     echo "Partial workflows cannot be published as official datasets; use canonical or debug." >&2
     exit 2
 fi
@@ -168,11 +210,28 @@ for gpu_id in "${GPU_IDS_ARRAY[@]}"; do
 done
 
 declare -a ALL_SEEDS=()
-for ((seed=SEED_START; seed<=SEED_END; seed++)); do
-    ALL_SEEDS+=("${seed}")
-done
-
 range_tag="seeds${SEED_START}-${SEED_END}"
+if [[ -n "${DEBUG_SEEDS:-}" ]]; then
+    if [[ "${AUTO_OPEN_MODE}" != debug || ! "${DEBUG_SEEDS}" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+        echo "DEBUG_SEEDS requires debug mode and comma-separated non-negative integers." >&2
+        exit 2
+    fi
+    IFS=',' read -r -a ALL_SEEDS <<< "${DEBUG_SEEDS}"
+    declare -A seen_debug_seeds=()
+    for seed in "${ALL_SEEDS[@]}"; do
+        seed=$((10#${seed}))
+        if (( seed < SEED_START || seed > SEED_END )) || [[ -v "seen_debug_seeds[${seed}]" ]]; then
+            echo "DEBUG_SEEDS must be unique and within SEED_START..SEED_END." >&2
+            exit 2
+        fi
+        seen_debug_seeds[${seed}]=1
+    done
+    range_tag+="_selected${#ALL_SEEDS[@]}"
+else
+    for ((seed=SEED_START; seed<=SEED_END; seed++)); do
+        ALL_SEEDS+=("${seed}")
+    done
+fi
 SOURCE_FINGERPRINT="$(source_fingerprint)"
 mkdir -p "${FORMAL_DATA_ROOT}/canonical" "${FORMAL_DATA_ROOT}/debug" \
     "${FORMAL_DATA_ROOT}/releases" "${FORMAL_DATA_ROOT}/work"
@@ -197,11 +256,12 @@ cleanup() {
     for pid in "${ACTIVE_PIDS[@]:-}"; do
         kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "${pid}" 2>/dev/null || true
     done
-    deadline=$((SECONDS + 5))
+    # The rank supervisor needs up to 10 seconds to kill TERM-ignoring workers.
+    deadline=$((SECONDS + 20))
     while (( SECONDS < deadline )); do
         any_alive=false
         for pid in "${ACTIVE_PIDS[@]:-}"; do
-            if kill -0 "${pid}" 2>/dev/null; then
+            if kill -0 "${pid}" 2>/dev/null || kill -0 -- "-${pid}" 2>/dev/null; then
                 any_alive=true
                 break
             fi
@@ -258,10 +318,16 @@ run_phase() {
         --max_steps "${MAX_STEPS}"
         --summary_only
         --collection_camera_mode "${camera_mode}"
+        --task_kind "${AUTO_OPEN_TASK}"
         --doorman_door_open_io "${DOOR_OPEN_IO}"
-        --terminal_stage "${STOP_AFTER_STAGE}"
         --pull_panel_contact_baseline "${PULL_PANEL_CONTACT_BASELINE}"
+        --pick_geometry_backend "${PICK_GEOMETRY_BACKEND:-native}"
     )
+    if [[ "${AUTO_OPEN_TASK}" == door ]]; then
+        common_args+=(--terminal_stage "${STOP_AFTER_STAGE}")
+    elif [[ -n "${PICK_EPISODE_MANIFEST:-}" ]]; then
+        common_args+=(--pick_episode_manifest "${PICK_EPISODE_MANIFEST}")
+    fi
     if [[ "${AUTO_OPEN_MODE}" == debug ]]; then
         common_args+=(--debug_trace)
     fi
@@ -284,94 +350,29 @@ run_phase() {
     fi
 
     phase_start="$(date +%s)"
-    rank_count="${#GPU_IDS_ARRAY[@]}"
-    if (( rank_count > ${#phase_seeds[@]} )); then
-        rank_count="${#phase_seeds[@]}"
+    local -a supervisor_args=()
+    if [[ "${camera_mode}" == dual ]]; then supervisor_args+=(--replay); fi
+    if [[ -n "${RANK_AFFINITY_MANIFEST:-}" ]]; then
+        supervisor_args+=(--affinity-manifest "${RANK_AFFINITY_MANIFEST}")
     fi
-    ACTIVE_PIDS=()
-    cd "${REPO_ROOT}"
-    for ((rank=0; rank<rank_count; rank++)); do
-        gpu_id="${GPU_IDS_ARRAY[rank]}"
-        rank_seeds=()
-        for ((offset=rank; offset<${#phase_seeds[@]}; offset+=rank_count)); do
-            rank_seeds+=("${phase_seeds[offset]}")
-        done
-        setsid --wait env CUDA_VISIBLE_DEVICES="${gpu_id}" python "${ENTRY}" \
-            "${common_args[@]}" "${collection_args[@]}" \
-            --seed "${rank_seeds[0]}" --episode_seeds "${rank_seeds[@]}" \
-            --batched_envs "${#rank_seeds[@]}" \
-            --standard_dataset_dir "${dataset_root}/shards" \
-            --output_dir "${dataset_root}/logs/rank${rank}-control" \
-            >"${dataset_root}/logs/rank${rank}.console.log" 2>&1 &
-        ACTIVE_PIDS+=("$!")
-    done
-
-    (
-        last_snapshot=""
-        while true; do
-            any_alive=false
-            for pid in "${ACTIVE_PIDS[@]}"; do
-                if kill -0 "${pid}" 2>/dev/null; then
-                    any_alive=true
-                    break
-                fi
-            done
-            snapshot="$(
-                for ((progress_rank=0; progress_rank<rank_count; progress_rank++)); do
-                    progress_file="${dataset_root}/logs/rank${progress_rank}-control/progress.txt"
-                    if [[ -s "${progress_file}" ]]; then
-                        sed "s/^/[rank${progress_rank}] /" "${progress_file}"
-                    fi
-                done
-            )"
-            if [[ -n "${snapshot}" && "${snapshot}" != "${last_snapshot}" ]]; then
-                echo "[workflow][progress] wall_s=$(( $(date +%s) - phase_start ))"
-                printf '%s\n' "${snapshot}"
-                last_snapshot="${snapshot}"
-            fi
-            [[ "${any_alive}" == false ]] && break
-            sleep 2
-        done
-    ) &
-    ACTIVE_MONITOR_PID="$!"
-
-    failures=0
+    setsid --wait python -m gr00t.rl.batch_workflow \
+        --root "${dataset_root}" --entry "${ENTRY}" \
+        --gpu-ids "${GPU_IDS_CSV}" --seeds "${phase_seeds[@]}" \
+        "${supervisor_args[@]}" -- "${common_args[@]}" "${collection_args[@]}" &
+    ACTIVE_PIDS=("$!")
     phase_status=0
-    for rank in "${!ACTIVE_PIDS[@]}"; do
-        if wait "${ACTIVE_PIDS[rank]}"; then
-            if [[ "${camera_mode}" != dual && ! -s "${dataset_root}/logs/rank${rank}-control/summary.json" ]]; then
-                echo "AutoOpen rank=${rank} gpu=${GPU_IDS_ARRAY[rank]} exited 0 without completed summary: ${dataset_root}/logs/rank${rank}-control/summary.json; log=${dataset_root}/logs/rank${rank}.console.log" >&2
-                failures=$((failures + 1))
-                if (( phase_status == 0 )); then phase_status=1; fi
-            fi
-            # A clean process exit must still have finalized every assigned shard.
-            for ((offset=rank; offset<${#phase_seeds[@]}; offset+=rank_count)); do
-                report_path="${dataset_root}/shards/episode-seed${phase_seeds[offset]}/meta/acceptance_report.json"
-                if [[ ! -s "${report_path}" ]]; then
-                    echo "AutoOpen rank=${rank} gpu=${GPU_IDS_ARRAY[rank]} exited 0 without finalized shard: ${report_path}; log=${dataset_root}/logs/rank${rank}.console.log" >&2
-                    failures=$((failures + 1))
-                    if (( phase_status == 0 )); then phase_status=1; fi
-                fi
-            done
-        else
-            rank_status="$?"
-            failures=$((failures + 1))
-            if (( phase_status == 0 )); then phase_status="${rank_status}"; fi
-            echo "AutoOpen rank=${rank} gpu=${GPU_IDS_ARRAY[rank]} pid=${ACTIVE_PIDS[rank]} failed with exit=${rank_status}; log=${dataset_root}/logs/rank${rank}.console.log" >&2
-        fi
-    done
-    wait "${ACTIVE_MONITOR_PID}" 2>/dev/null || true
-    ACTIVE_MONITOR_PID=""
+    wait "${ACTIVE_PIDS[0]}" || phase_status="$?"
     ACTIVE_PIDS=()
-    if (( failures != 0 )); then
-        echo "AutoOpen ${camera_mode} phase failed; aggregation was skipped." >&2
+    if (( phase_status != 0 )); then
+        echo "Collection ${camera_mode} phase failed; aggregation was skipped." >&2
         return "${phase_status}"
     fi
 
     seeds_csv="$(IFS=,; echo "${phase_seeds[*]}")"
     elapsed=$(( $(date +%s) - phase_start ))
     PHASE_OUTPUT_ROOT="${dataset_root}" PHASE_SEEDS_CSV="${seeds_csv}" \
-    PHASE_CAMERAS="${camera_mode}" COLLECTION_WALL_TIME_S="${elapsed}" python - <<'PY' || return "$?"
+    PHASE_CAMERAS="${camera_mode}" PHASE_TASK="${AUTO_OPEN_TASK}" \
+    COLLECTION_WALL_TIME_S="${elapsed}" python - <<'PY' || return "$?"
 import os
 from pathlib import Path
 from gr00t.rl.data_collection.auto_open_writer import aggregate_standard_shards
@@ -387,6 +388,7 @@ aggregate_standard_shards(
     camera_principal_point_noise_px=5.0 if enabled else 0.0,
     camera_distortion_noise_fraction=0.10 if enabled else 0.0,
     collection_wall_time_s=int(os.environ["COLLECTION_WALL_TIME_S"]),
+    task_name="auto_open" if os.environ["PHASE_TASK"] == "door" else os.environ["PHASE_TASK"],
 )
 PY
     echo "AutoOpen ${camera_mode} phase completed: ${dataset_root}/manifest.json"
@@ -400,7 +402,9 @@ if [[ "${AUTO_OPEN_MODE}" == debug ]]; then
     run_phase "${debug_pending_root}" six "" ALL_SEEDS
     debug_result_count="$(SOURCE_FINGERPRINT="${SOURCE_FINGERPRINT}" \
         SEED_START="${SEED_START}" SEED_END="${SEED_END}" \
+        DEBUG_SEEDS="${DEBUG_SEEDS:-}" REQUESTED_DEBUG_EPISODES="${#ALL_SEEDS[@]}" \
         STOP_AFTER_STAGE="${STOP_AFTER_STAGE}" DOOR_MOTION="${DOOR_MOTION}" \
+        AUTO_OPEN_TASK="${AUTO_OPEN_TASK}" FULL_TERMINAL_STAGE="${FULL_TERMINAL_STAGE}" \
         PULL_PANEL_CONTACT_BASELINE="${PULL_PANEL_CONTACT_BASELINE}" \
         python - "${debug_pending_root}" <<'PY'
 import json
@@ -419,14 +423,14 @@ strict_accepted = sorted(
 if len(strict_accepted) != int(report.get("accepted_episodes", -1)):
     raise SystemExit("debug accepted seed extraction disagrees with aggregate report")
 terminal_stage = os.environ["STOP_AFTER_STAGE"]
-if terminal_stage == "PASS_THROUGH_DOORWAY":
+if terminal_stage == os.environ["FULL_TERMINAL_STAGE"]:
     completed = strict_accepted
     result_label = "strict_acceptance"
     seed_file = "accepted_seeds.txt"
 else:
     metadata_paths = sorted(root.glob("logs/rank*-control/seed_*/metadata.json"))
     metadata = [json.loads(path.read_text(encoding="utf-8")) for path in metadata_paths]
-    requested = int(os.environ["SEED_END"]) - int(os.environ["SEED_START"]) + 1
+    requested = int(os.environ["REQUESTED_DEBUG_EPISODES"])
     if len(metadata) != requested:
         raise SystemExit(
             f"partial debug result count {len(metadata)} differs from requested {requested}"
@@ -452,8 +456,13 @@ else:
                 "inclusive": True,
             },
             "source_fingerprint_sha256": os.environ["SOURCE_FINGERPRINT"],
+            "selected_seeds": (
+                [int(value) for value in os.environ["DEBUG_SEEDS"].split(",")]
+                if os.environ["DEBUG_SEEDS"] else None
+            ),
             "requested_episodes": int(report["total_episodes"]),
             "door_motion": os.environ["DOOR_MOTION"],
+            "task_kind": os.environ["AUTO_OPEN_TASK"],
             "pull_panel_contact_baseline": os.environ["PULL_PANEL_CONTACT_BASELINE"],
             "requested_terminal_stage": terminal_stage,
             "result_label": result_label,
@@ -469,12 +478,12 @@ else:
 print(len(completed))
 PY
 )"
-    if [[ "${STOP_AFTER_STAGE}" == PASS_THROUGH_DOORWAY ]]; then
+    if [[ "${STOP_AFTER_STAGE}" == "${FULL_TERMINAL_STAGE}" ]]; then
         debug_result_tag="episodes${debug_result_count}"
     else
         debug_result_tag="terminal_${STOP_AFTER_STAGE,,}_success${debug_result_count}"
     fi
-    debug_name="auto_open_debug_${DOOR_MOTION}_${RELEASE_VERSION}_${range_tag}_${debug_result_tag}_six_camera_${RELEASE_STAMP}"
+    debug_name="auto_open_debug_${TASK_LABEL}_${RELEASE_VERSION}_${range_tag}_${debug_result_tag}_six_camera_${RELEASE_STAMP}"
     debug_root="${FORMAL_DATA_ROOT}/debug/${debug_name}"
     if [[ -e "${debug_root}" ]]; then
         echo "Refusing to overwrite debug dataset: ${debug_root}" >&2
@@ -491,7 +500,7 @@ from gr00t.rl.data_collection.auto_open_writer import write_six_camera_mosaics
 manifest = write_six_camera_mosaics(Path(sys.argv[1]))
 print(f"[workflow] six-camera mosaics completed: {len(manifest)} episodes")
 PY
-    if [[ "${STOP_AFTER_STAGE}" == PASS_THROUGH_DOORWAY ]]; then
+    if [[ "${STOP_AFTER_STAGE}" == "${FULL_TERMINAL_STAGE}" ]]; then
         echo "[workflow] debug strict acceptance: ${debug_result_count}/${#ALL_SEEDS[@]}"
     else
         echo "[workflow] debug ${STOP_AFTER_STAGE} completion: ${debug_result_count}/${#ALL_SEEDS[@]}"
@@ -502,6 +511,9 @@ PY
 fi
 
 canonical_name="auto_open_${RELEASE_VERSION}_${range_tag}_canonical_no_camera_${RELEASE_STAMP}"
+if [[ "${AUTO_OPEN_TASK}" != door ]]; then
+    canonical_name="auto_open_${TASK_LABEL}_${RELEASE_VERSION}_${range_tag}_canonical_no_camera_${RELEASE_STAMP}"
+fi
 canonical_root="${FORMAL_DATA_ROOT}/canonical/${canonical_name}"
 work_root="${FORMAL_DATA_ROOT}/work/${range_tag}_${RELEASE_STAMP}_attempt_$$"
 accepted_seed_file="${work_root}/accepted_seeds.txt"
@@ -517,7 +529,7 @@ else
     echo "[workflow] phase 1/2: canonical no-camera collection (${#ALL_SEEDS[@]} seeds)"
 fi
 run_phase "${canonical_root}" none "" ALL_SEEDS
-if [[ "${STOP_AFTER_STAGE}" != PASS_THROUGH_DOORWAY ]]; then
+if [[ "${STOP_AFTER_STAGE}" != "${FULL_TERMINAL_STAGE}" ]]; then
     python - "${canonical_root}" "${STOP_AFTER_STAGE}" <<'PY'
 import json
 import sys
@@ -563,8 +575,9 @@ Path(sys.argv[1]).write_text(
 )
 PY
 
-python - "${canonical_root}/acceptance_report.json" "${accepted_seed_file}" <<'PY'
+AUTO_OPEN_MODE="${AUTO_OPEN_MODE}" python - "${canonical_root}/acceptance_report.json" "${accepted_seed_file}" <<'PY'
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -576,7 +589,7 @@ accepted = sorted(
 )
 if len(accepted) != int(report.get("accepted_episodes", -1)):
     raise SystemExit("accepted seed extraction disagrees with aggregate report")
-if not accepted:
+if not accepted and os.environ["AUTO_OPEN_MODE"] == "official":
     raise SystemExit("no canonical episode passed strict acceptance")
 Path(sys.argv[2]).write_text(
     "".join(f"{seed}\n" for seed in accepted), encoding="utf-8"
@@ -595,6 +608,9 @@ fi
 
 accepted_count="${#ACCEPTED_SEEDS[@]}"
 release_name="auto_open_${RELEASE_VERSION}_${range_tag}_episodes${accepted_count}_dual_camera_${RELEASE_STAMP}"
+if [[ "${AUTO_OPEN_TASK}" != door ]]; then
+    release_name="auto_open_${TASK_LABEL}_${RELEASE_VERSION}_${range_tag}_episodes${accepted_count}_dual_camera_${RELEASE_STAMP}"
+fi
 pending_root="${work_root}/${release_name}.pending"
 release_root="${FORMAL_DATA_ROOT}/releases/${release_name}"
 echo "[workflow] phase 2/2: dual-camera replay (${accepted_count} accepted seeds)"

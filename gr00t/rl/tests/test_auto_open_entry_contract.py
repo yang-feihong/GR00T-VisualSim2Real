@@ -281,8 +281,10 @@ def test_tensor_fsm_is_the_only_auto_open_execution_path():
     }
     assert "command" not in methods
     assert "advance" not in methods
-    assert "fsm.command(" in runtime_source
-    assert "fsm.advance(" in runtime_source
+    shared = (AUTO_OPEN.parent / "task_runtime.py").read_text()
+    assert "batch_loop.run_stages(" in runtime_source
+    assert "fsm.command(" in shared
+    assert "fsm.advance(" in shared
     assert "controller.command(" not in runtime_source
     assert "controller.advance(" not in runtime_source
     assert "ScalarDoorController" not in source
@@ -319,14 +321,16 @@ def test_one_vectorized_episode_runner_handles_batch_size_one_and_many():
 
 def test_every_fixed_workflow_supplies_vectorized_environment_count():
     launcher = (SCRIPTS / "run_auto_open.sh").read_text(encoding="utf-8")
-    assert launcher.count('python "${ENTRY}"') == 1
-    assert '--batched_envs "${#rank_seeds[@]}"' in launcher
-    assert '--episode_seeds "${rank_seeds[@]}"' in launcher
+    shared = (AUTO_OPEN.parent / "batch_workflow.py").read_text()
+    assert launcher.count("python -m gr00t.rl.batch_workflow") == 1
+    assert '"--batched_envs"' in shared
+    assert '"--episode_seeds"' in shared
+    assert "str(len(seeds))" in shared
 
 
 def test_fixed_launcher_has_one_python_invocation_and_one_common_contract():
     launcher = (SCRIPTS / "run_auto_open.sh").read_text(encoding="utf-8")
-    assert launcher.count('python "${ENTRY}"') == 1
+    assert launcher.count("python -m gr00t.rl.batch_workflow") == 1
     assert launcher.count("common_args=(") == 1
     for option in (
         "--headless",
@@ -413,11 +417,8 @@ def test_runtime_audit_fk_uses_pre_step_device_root_snapshot():
         if isinstance(node, ast.FunctionDef) and node.name == "_run_tensor_fsm_loop"
     )
     calls = [node for node in ast.walk(loop) if isinstance(node, ast.Call)]
-    step = next(
-        node
-        for node in calls
-        if isinstance(node.func, ast.Attribute) and node.func.attr == "step_once"
-    )
+    callbacks = {node.name: node for node in loop.body if isinstance(node, ast.FunctionDef)}
+    assert {"capture_before", "capture_after"} <= callbacks.keys()
     snapshot = next(
         node
         for node in ast.walk(loop)
@@ -428,21 +429,45 @@ def test_runtime_audit_fk_uses_pre_step_device_root_snapshot():
         )
         and isinstance(node.value, ast.Call)
     )
-    assert snapshot.lineno < step.lineno
+    assert snapshot in list(ast.walk(callbacks["capture_before"]))
     assert ast.unparse(snapshot.value) == "device_state['root_states'].detach().clone()"
     for name in ("_target_height_invariant_poses_gpu", "b2z1_gripper_pose_and_jacobian"):
         call = next(
             node for node in calls if isinstance(node.func, ast.Name) and node.func.id == name
         )
-        assert call.lineno > step.lineno
+        assert call in list(ast.walk(callbacks["capture_after"]))
         assert "capture_root_states" in ast.unparse(call.args[0])
+    shared = ast.parse((AUTO_OPEN.parent / "task_runtime.py").read_text())
+    engine = next(
+        node
+        for node in ast.walk(shared)
+        if isinstance(node, ast.FunctionDef) and node.name == "run_stages"
+    )
+    engine_calls = [node for node in ast.walk(engine) if isinstance(node, ast.Call)]
+    before = next(
+        node
+        for node in engine_calls
+        if isinstance(node.func, ast.Name) and node.func.id == "capture_before"
+    )
+    step = next(
+        node
+        for node in engine_calls
+        if isinstance(node.func, ast.Attribute) and node.func.attr == "step"
+    )
+    after = next(
+        node
+        for node in engine_calls
+        if isinstance(node.func, ast.Name) and node.func.id == "capture_after"
+    )
+    assert before.lineno < step.lineno < after.lineno
 
 
 def test_standard_collection_uses_one_vectorized_process_per_gpu():
     launcher = (SCRIPTS / "run_auto_open.sh").read_text(encoding="utf-8")
-    assert 'rank_count="${#GPU_IDS_ARRAY[@]}"' in launcher
-    assert '--episode_seeds "${rank_seeds[@]}"' in launcher
-    assert '--batched_envs "${#rank_seeds[@]}"' in launcher
+    shared = (AUTO_OPEN.parent / "batch_workflow.py").read_text()
+    assert "python -m gr00t.rl.batch_workflow" in launcher
+    assert "BatchIdentity.partition(seeds, gpu_ids, affinity=affinity)" in shared
+    assert '"--episode_seeds"' in shared and '"--batched_envs"' in shared
     assert "STANDARD_WORKERS_PER_GPU" not in launcher
     assert "for ((worker_index=" not in launcher
 
